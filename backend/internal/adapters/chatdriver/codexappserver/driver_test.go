@@ -1421,6 +1421,36 @@ func TestTurnApprovalOverrideInvalidatesStaleNativeEvidence(t *testing.T) {
 	}
 }
 
+func TestFixedReadOnlyTurnsRetainNativeEvidence(t *testing.T) {
+	d, srv := newTestDriver(t)
+	srv.reply("thread/start", `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}`)
+	srv.respondSequence("turn/start",
+		`{"turn":{"id":"turn-1","status":"inProgress","items":[]}}`,
+		`{"turn":{"id":"turn-2","status":"inProgress","items":[]}}`,
+		`{"turn":{"id":"turn-3","status":"inProgress","items":[]}}`,
+	)
+	conv, err := d.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+
+	for turn := 1; turn <= 3; turn++ {
+		if _, err := conv.SendTurn(context.Background(), ports.ChatUserMessage{
+			Text:     "continue",
+			Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeReadOnly},
+		}); err != nil {
+			t.Fatalf("SendTurn %d: %v", turn, err)
+		}
+		evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
+		if !conv.Capabilities().Has(ports.ChatCapabilityPreventiveReadOnly) || evidence.ProofStatus != "PROVEN" {
+			t.Fatalf("turn %d native evidence = %+v, capabilities = %v; want proven preventive read-only", turn, evidence, conv.Capabilities())
+		}
+	}
+}
+
 // A caller that chooses nothing must produce exactly the payload it did before
 // per-turn settings existed: an empty field is not a value the provider has to
 // interpret.

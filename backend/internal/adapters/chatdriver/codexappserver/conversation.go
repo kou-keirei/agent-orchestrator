@@ -326,6 +326,15 @@ func (c *conversation) invalidateNativeEvidence(requested ports.PermissionMode) 
 	c.nativeEvidence.ProofStatus = "UNPROVEN"
 }
 
+func (c *conversation) preservesNativeReadOnlyEvidence(requested ports.PermissionMode) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return requested == ports.PermissionModeReadOnly &&
+		c.preventiveReadOnly &&
+		c.nativeEvidence.RequestedPermission == string(ports.PermissionModeReadOnly) &&
+		c.nativeEvidence.ProofStatus == "PROVEN"
+}
+
 // Events is the normalized stream. It closes when the conversation ends.
 func (c *conversation) Events() <-chan ports.ChatEvent { return c.events }
 
@@ -495,7 +504,9 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	}
 	applyTurnSettings(params, msg.Settings)
 	if msg.Settings.Approval != "" {
-		c.invalidateNativeEvidence(msg.Settings.Approval)
+		if !c.preservesNativeReadOnlyEvidence(msg.Settings.Approval) {
+			c.invalidateNativeEvidence(msg.Settings.Approval)
+		}
 	}
 
 	var resp struct {
