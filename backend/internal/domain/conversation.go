@@ -468,6 +468,9 @@ type ConversationSettings struct {
 	Model string `json:"model,omitempty"`
 	// ReasoningEffort is how much thinking to spend, from the model's own list.
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	// ReasoningEffortSet distinguishes an explicit provider-default choice from
+	// an omitted choice that should inherit AO/project policy.
+	ReasoningEffortSet bool `json:"-"`
 	// ApprovalMode is AO's permission vocabulary, applied per turn.
 	ApprovalMode PermissionMode `json:"approvalMode,omitempty"`
 	// OpenCodeMode is the provider-owned mode explicitly selected through ACP.

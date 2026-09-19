@@ -48,8 +48,10 @@ func sessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOption {
 	// the model's variant names as values. The model setter resets the variant
 	// to "default" else the first variant when no explicit variant is given,
 	// so the model must be applied first and the effort second.
-	if settings.Effort != "" {
-		options = append(options, acpdriver.SessionOption{ID: "effort", Value: settings.Effort})
+	if settings.EffortOverride || settings.Effort != "" {
+		options = append(options, acpdriver.SessionOption{
+			ID: "effort", Value: settings.Effort, AllowEmpty: settings.EffortOverride && settings.Effort == "",
+		})
 	}
 	if len(options) == 0 {
 		return nil

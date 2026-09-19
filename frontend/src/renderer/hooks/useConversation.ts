@@ -624,7 +624,11 @@ export function useConversationCommands(sessionId: string | undefined) {
 				"/api/v1/sessions/{sessionId}/conversation/settings",
 				{
 					params: { path: { sessionId: targetSessionId } },
-					body: settings,
+					body: {
+						model: settings.model,
+						reasoningEffort: settings.reasoningEffort,
+						approvalMode: settings.approvalMode,
+					},
 				},
 			);
 			if (error) throw error;
@@ -1407,6 +1411,7 @@ function toSnapshot(wire: WireSnapshot): ConversationSnapshot {
 		...(wire.messages ?? []).map(toMessage),
 		...(wire.activities ?? []).map(toActivity),
 	].sort((a, b) => a.sequence - b.sequence);
+	const reasoningEffortSet = wire.settings?.reasoningEffortSet ?? false;
 
 	return {
 		conversationId: wire.conversationId,
@@ -1420,7 +1425,10 @@ function toSnapshot(wire: WireSnapshot): ConversationSnapshot {
 		nativeForkAvailableAfterSequence: wire.nativeForkAvailableAfterSequence ?? 0,
 		settings: {
 			model: wire.settings?.model || undefined,
-			reasoningEffort: wire.settings?.reasoningEffort || undefined,
+			reasoningEffort: reasoningEffortSet
+				? (wire.settings?.reasoningEffort ?? "")
+				: (wire.settings?.reasoningEffort || undefined),
+			reasoningEffortSet,
 			approvalMode: (wire.settings?.approvalMode as ApprovalMode | undefined) || undefined,
 		},
 		// Absent means the provider has not reported, which the meter renders as

@@ -777,6 +777,20 @@ describe("useConversation snapshot mapping", () => {
 		]);
 	});
 
+	it.each([
+		["omitted", { model: "gpt-5.6-terra" }, undefined, false],
+		["explicit empty", { model: "gpt-5.6-terra", reasoningEffortSet: true }, "", true],
+		["explicit nonempty", { model: "gpt-5.6-terra", reasoningEffort: "high", reasoningEffortSet: true }, "high", true],
+	])("preserves %s reasoning-effort presence across a refetch", async (_name, settings, effort, set) => {
+		getMock.mockResolvedValue({ data: { ...WIRE, settings }, error: undefined });
+
+		const { result } = renderHook(() => useConversation("ao-1"), { wrapper });
+		await waitFor(() => expect(result.current.snapshot).toBeDefined());
+
+		expect(result.current.snapshot!.settings.reasoningEffort).toBe(effort);
+		expect(result.current.snapshot!.settings.reasoningEffortSet).toBe(set);
+	});
+
 	it("maps retry lineage and consumed-source facts from the daemon", async () => {
 		getMock.mockResolvedValue({
 			data: {

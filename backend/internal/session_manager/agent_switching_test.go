@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1753,6 +1754,8 @@ func TestBuildSourceHandoffRequestUsesCurrentNativeSessionContext(t *testing.T) 
 	candidatePath := filepath.Join(t.TempDir(), "agent-handoff-candidate.json")
 	aoExecutable := filepath.Join(t.TempDir(), "AO Tools", "ao")
 	request := buildSourceHandoffRequest(sw, candidatePath, aoExecutable)
+	escapedCandidatePath := strings.ReplaceAll(candidatePath, `\`, `\\`)
+	escapedAOExecutable := strings.ReplaceAll(aoExecutable, `\`, `\\`)
 
 	for _, want := range []string{
 		"context already present in your current native conversation",
@@ -1764,8 +1767,8 @@ func TestBuildSourceHandoffRequestUsesCurrentNativeSessionContext(t *testing.T) 
 		"testsAndResults",
 		"recommendedNextSteps",
 		"taskComplete",
-		candidatePath,
-		aoExecutable,
+		escapedCandidatePath,
+		escapedAOExecutable,
 		`"switch": "switch-1"`,
 		`"sourceGeneration": "source-generation"`,
 		`"aoExecutable":`,
@@ -2326,7 +2329,7 @@ func TestSwitchAgentFreshPreservesAOIdentityAndDeliversArtifact(t *testing.T) {
 		t.Fatalf("AO rewrote provider transcript metadata while capturing it: before=%+v after=%+v", providerFinalInfo, providerAfterInfo)
 	}
 	if !strings.Contains(target.launchSystemPrompt, "<ao-continuation") ||
-		!strings.Contains(target.launchSystemPrompt, resolvedFinalTranscriptPath) ||
+		!strings.Contains(target.launchSystemPrompt, strconv.Quote(resolvedFinalTranscriptPath)) ||
 		!strings.Contains(target.launchSystemPrompt, "FINAL_SOURCE_RECORD") ||
 		!strings.Contains(target.launchSystemPrompt, "implement the feature") ||
 		!strings.Contains(target.launchSystemPrompt, "please keep the API small") ||
@@ -4908,7 +4911,7 @@ func TestSwitchAgentRefreshesLateSourceNativeIdentityAtStopBoundary(t *testing.T
 		t.Fatalf("late source native metadata was not retained: %+v", retained)
 	}
 	continuation := target.launchSystemPrompt
-	if !strings.Contains(continuation, expectedTranscriptPath) {
+	if !strings.Contains(continuation, strconv.Quote(expectedTranscriptPath)) {
 		t.Fatalf("continuation omitted final source transcript path:\n%s", continuation)
 	}
 }

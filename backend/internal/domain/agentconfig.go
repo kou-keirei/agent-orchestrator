@@ -13,7 +13,11 @@ const (
 	// PermissionModeDefault is special: adapters choose their own baseline
 	// behavior for it. Most defer to the agent's own config; some managed
 	// adapters may map it to a safer non-interactive default.
-	PermissionModeDefault           PermissionMode = "default"
+	PermissionModeDefault PermissionMode = "default"
+	// PermissionModeReadOnly requires a provider to enforce a preventive
+	// filesystem boundary. Unsupported harnesses must reject it rather than
+	// treating it as an advisory approval posture.
+	PermissionModeReadOnly          PermissionMode = "read-only"
 	PermissionModeAcceptEdits       PermissionMode = "accept-edits"
 	PermissionModeAuto              PermissionMode = "auto"
 	PermissionModeBypassPermissions PermissionMode = "bypass-permissions"
@@ -37,6 +41,30 @@ type AgentConfig struct {
 	Permissions PermissionMode `json:"permissions,omitempty"`
 }
 
+// ApplyPermissionFloor preserves an immutable read-only session policy while
+// leaving broader modes to their existing agent-specific rules.
+func ApplyPermissionFloor(floor, requested PermissionMode) PermissionMode {
+	if floor == PermissionModeReadOnly && requested.Valid() {
+		return PermissionModeReadOnly
+	}
+	return requested
+}
+
+// ResolvePermissionMode validates a requested permission mode and applies an
+// immutable session floor. Unknown values never fall back to a broader mode.
+func ResolvePermissionMode(floor, requested PermissionMode) (PermissionMode, error) {
+	if !floor.Valid() {
+		return "", fmt.Errorf("invalid permission floor %q", floor)
+	}
+	if !requested.Valid() {
+		return "", fmt.Errorf("invalid permission mode %q", requested)
+	}
+	if floor == PermissionModeReadOnly && requested != "" && requested != PermissionModeReadOnly {
+		return "", fmt.Errorf("permission mode %q would broaden immutable read-only floor", requested)
+	}
+	return ApplyPermissionFloor(floor, requested), nil
+}
+
 // IsZero reports whether the config carries no settings, so storage can persist
 // SQL NULL and resolution can skip an empty config.
 func (c AgentConfig) IsZero() bool {
@@ -48,7 +76,7 @@ func (c AgentConfig) IsZero() bool {
 // one.
 func (m PermissionMode) Valid() bool {
 	switch m {
-	case "", PermissionModeDefault, PermissionModeAcceptEdits,
+	case "", PermissionModeDefault, PermissionModeReadOnly, PermissionModeAcceptEdits,
 		PermissionModeAuto, PermissionModeBypassPermissions:
 		return true
 	default:
@@ -67,5 +95,5 @@ func (c AgentConfig) Validate() error {
 	if c.Permissions.Valid() {
 		return nil
 	}
-	return fmt.Errorf("invalid permissions %q: want one of default, accept-edits, auto, bypass-permissions", c.Permissions)
+	return fmt.Errorf("invalid permissions %q: want one of default, read-only, accept-edits, auto, bypass-permissions", c.Permissions)
 }

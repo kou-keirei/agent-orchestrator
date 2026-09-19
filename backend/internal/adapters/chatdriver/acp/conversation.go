@@ -463,7 +463,7 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 	}
 	if optionsFor != nil {
 		for _, option := range optionsFor(settings) {
-			if option.ID == "" || option.Value == "" {
+			if option.ID == "" || (option.Value == "" && !option.AllowEmpty) {
 				continue
 			}
 			if (option.ID == "model" && legacyModel) || (option.ID == "mode" && legacyMode) {

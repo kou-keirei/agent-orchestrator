@@ -1325,9 +1325,8 @@ func (s *Store) ListVisibleRunningTurnProviderIDs(
 
 // SetConversationSettings records the provider choices for the next turn.
 //
-// An empty field is stored as NULL rather than as an empty string, so "the user
-// cleared this" and "the user never chose" stay the same thing: fall back to the
-// provider's default.
+// Omitted effort is stored as NULL; an explicit empty effort is stored as a
+// present empty value so restore can preserve the distinction from inheritance.
 func (s *Store) SetConversationSettings(
 	ctx context.Context,
 	conversationID string,
@@ -1338,7 +1337,7 @@ func (s *Store) SetConversationSettings(
 	defer s.writeMu.Unlock()
 	if err := s.qw.UpdateConversationTurnSettings(ctx, gen.UpdateConversationTurnSettingsParams{
 		Model:           nullableString(settings.Model),
-		ReasoningEffort: nullableString(settings.ReasoningEffort),
+		ReasoningEffort: nullableReasoningEffort(settings),
 		ApprovalMode:    nullableString(string(settings.ApprovalMode)),
 		OpencodeMode:    settings.OpenCodeMode,
 		UpdatedAt:       now,
@@ -1375,6 +1374,13 @@ func nullableString(value string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: value, Valid: true}
+}
+
+func nullableReasoningEffort(settings domain.ConversationSettings) sql.NullString {
+	if settings.ReasoningEffortSet || settings.ReasoningEffort != "" {
+		return sql.NullString{String: settings.ReasoningEffort, Valid: true}
+	}
+	return nullableString(settings.ReasoningEffort)
 }
 
 // RecordUsage stores the conversation's current token position, overwriting the
@@ -3038,10 +3044,11 @@ func conversationToDomain(row gen.Conversation) domain.ConversationRecord {
 		ActiveBranchID: row.ActiveBranchID,
 		LatestSequence: row.LatestSequence,
 		Settings: domain.ConversationSettings{
-			Model:           row.Model.String,
-			ReasoningEffort: row.ReasoningEffort.String,
-			ApprovalMode:    domain.PermissionMode(row.ApprovalMode.String),
-			OpenCodeMode:    row.OpencodeMode,
+			Model:              row.Model.String,
+			ReasoningEffort:    row.ReasoningEffort.String,
+			ReasoningEffortSet: row.ReasoningEffort.Valid,
+			ApprovalMode:       domain.PermissionMode(row.ApprovalMode.String),
+			OpenCodeMode:       row.OpencodeMode,
 		},
 		ProviderTitle: row.ProviderTitle,
 		AppliedTitle:  row.AppliedTitle,

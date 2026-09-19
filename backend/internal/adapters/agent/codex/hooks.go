@@ -96,24 +96,35 @@ func appendSessionHookFlags(cmd *[]string) error {
 
 func appendSessionHookFlagsForExecutable(cmd *[]string, executable string) {
 	prefix := shellQuoteHookExecutable(executable) + " hooks codex "
+	windowsPrefix := windowsHookExecutable(executable) + " hooks codex "
 	for _, spec := range codexManagedHooks {
 		action := strings.TrimPrefix(spec.Command, codexHookCommandPrefix)
-		flag := fmt.Sprintf(`hooks.%s=[{hooks=[{type="command",command=%s,timeout=%d}]}]`,
-			spec.Event, codexTOMLBasicString(prefix+action), codexHookTimeout)
+		flag := fmt.Sprintf(`hooks.%s=[{hooks=[{type="command",command=%s`,
+			spec.Event, codexTOMLBasicString(prefix+action))
+		if runtime.GOOS == "windows" {
+			// Codex 0.154 runs Windows command hooks through cmd.exe /C. Keep
+			// this override as a direct quoted executable invocation so the
+			// complete argv survives cmd.exe's command-line boundary; the
+			// provider's raw Windows argument path preserves the embedded quotes.
+			flag += `,commandWindows=` + codexTOMLBasicString(windowsPrefix+action)
+		}
+		flag += fmt.Sprintf(`,timeout=%d}]}]`, codexHookTimeout)
 		*cmd = append(*cmd, "-c", flag)
 	}
 }
 
 func shellQuoteHookExecutable(executable string) string {
 	if runtime.GOOS == "windows" {
-		// Codex invokes command hooks through PowerShell on Windows. A bare quoted
-		// path (`"C:\...\ao.exe"`) parses as a string expression, not an invocation,
-		// so SessionStart/UserPromptSubmit/Stop all fail before ao.exe runs
-		// ("Unexpected token 'hooks'"). Prefixing the quoted path with the call
-		// operator `& ` turns it into a command invocation that runs the binary.
+		// Codex before 0.154 invokes the legacy command field through
+		// PowerShell. A bare quoted path is a string expression there; the call
+		// operator keeps the executable invocation and argv intact.
 		return `& "` + executable + `"`
 	}
 	return `'` + strings.ReplaceAll(executable, `'`, `'"'"'`) + `'`
+}
+
+func windowsHookExecutable(executable string) string {
+	return `"` + executable + `"`
 }
 
 // appendWorkspaceTrustFlag marks the session's worktree as a trusted Codex

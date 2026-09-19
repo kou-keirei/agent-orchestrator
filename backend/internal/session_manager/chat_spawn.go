@@ -30,7 +30,7 @@ type ChatLauncher interface {
 	// PreflightChat reports whether a harness can start in chat mode right now.
 	// Called before any durable state exists so an unsupported request costs
 	// nothing.
-	PreflightChat(ctx context.Context, harness domain.AgentHarness, permissions ports.PermissionMode) error
+	PreflightChat(ctx context.Context, harness domain.AgentHarness, workspacePath string, permissions ports.PermissionMode) error
 	// StartChat launches the controller and returns the provider conversation
 	// handle to persist for resume. Implementations must call ControllerReady
 	// after the provider and generation exist but before consuming live events.
@@ -107,7 +107,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	defer releaseCodexAdmission()
 	agentConfig := in.cfg.AgentConfig
 	if !in.cfg.AgentConfigResolved {
-		agentConfig = applySpawnAgentConfig(effectiveAgentConfig(in.cfg.Harness, in.cfg.Kind, in.project.Config), in.cfg.AgentConfig)
+		agentConfig = applySpawnAgentConfig(effectiveAgentConfig(in.cfg.Kind, in.project.Config), in.cfg.AgentConfig)
 	}
 
 	var diffBaseSHA, diffBaseRef string
@@ -121,6 +121,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	if agent, ok := m.agents.Agent(in.cfg.Harness); ok {
 		m.augmentAgentRuntimeEnv(agent, env)
 	}
+	pinRuntimePermissionEnv(env, agentConfig.Permissions)
 
 	var (
 		controllerCommitted bool
@@ -136,6 +137,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		Env:                     env,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		EffortOverride:          in.cfg.EffortOverride,
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            in.systemPrompt,
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
@@ -150,6 +152,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 			if agent, ok := m.agents.Agent(in.cfg.Harness); ok {
 				m.augmentAgentRuntimeEnv(agent, launchEnv)
 			}
+			pinRuntimePermissionEnv(launchEnv, agentConfig.Permissions)
 			in.record = prepared
 			return launchEnv, nil
 		},
@@ -327,9 +330,11 @@ func (m *Manager) resumeChatController(
 	}
 
 	agentConfig := restoredAgentConfig(rec, project.Config)
-	if rec.Metadata.Permissions != "" {
-		agentConfig.Permissions = rec.Metadata.Permissions
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: stored permission mode is invalid: %w", operation, rec.ID, err)
 	}
+	agentConfig.Permissions = permissions
 	additionalDirectories, err := m.restoredWorkspaceProjectDirectories(ctx, rec, project, ws.Path)
 	if err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: workspace roots: %w", operation, rec.ID, err)
@@ -338,6 +343,7 @@ func (m *Manager) resumeChatController(
 	if agent, ok := m.agents.Agent(rec.Harness); ok {
 		m.augmentAgentRuntimeEnv(agent, env)
 	}
+	pinRuntimePermissionEnv(env, agentConfig.Permissions)
 	historyMode := ports.ChatHistoryImport
 	var providerHandoff *domain.ChatProviderHandoff
 	if requireNativeHistory {
@@ -374,6 +380,7 @@ func (m *Manager) resumeChatController(
 			if agent, ok := m.agents.Agent(rec.Harness); ok {
 				m.augmentAgentRuntimeEnv(agent, launchEnv)
 			}
+			pinRuntimePermissionEnv(launchEnv, agentConfig.Permissions)
 			rec = prepared
 			return launchEnv, nil
 		},

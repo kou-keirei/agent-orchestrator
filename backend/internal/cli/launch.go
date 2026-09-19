@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 func newLaunchCommand(ctx *commandContext) *cobra.Command {
@@ -51,7 +51,7 @@ func (c *commandContext) runLaunchCommand(ctx context.Context, dir string, argv,
 	if len(argv) == 0 {
 		return errors.New("launch: command argv is required")
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := aoprocess.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdin = c.deps.In

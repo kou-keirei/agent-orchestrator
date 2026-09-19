@@ -20,6 +20,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/registry"
+	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/tmuxbin"
 )
@@ -423,11 +424,23 @@ func checkHooksLog(dataDir string, now time.Time) doctorCheck {
 }
 
 func (c *commandContext) checkHarness(ctx context.Context, harness harnessProbe) doctorCheck {
-	path, err := c.deps.LookPath(harness.BinaryName)
+	var (
+		path string
+		err  error
+	)
+	if harness.Name == "codex" {
+		path, err = c.resolveCodexBinary(ctx)
+	} else {
+		path, err = c.deps.LookPath(harness.BinaryName)
+	}
 	if err != nil || path == "" {
+		message := fmt.Sprintf("%s not found in PATH", harness.BinaryName)
+		if harness.Name == "codex" && runtime.GOOS == "windows" {
+			message = "codex not found in PATH or known install locations"
+		}
 		return doctorCheck{
 			Level: doctorWarn, Section: doctorSectionAgents, Name: harness.Name,
-			Message: fmt.Sprintf("%s not found in PATH", harness.BinaryName),
+			Message: message,
 		}
 	}
 	if harness.VersionArg == "" {
@@ -464,13 +477,27 @@ func (c *commandContext) checkHarness(ctx context.Context, harness harnessProbe)
 // cannot drift from the real spawn argv.
 func (c *commandContext) checkCodexLaunchFlags(ctx context.Context) doctorCheck {
 	const name = "codex-launch-flags"
-	path, err := c.deps.LookPath("codex")
+	path, err := c.resolveCodexBinary(ctx)
 	if err != nil || path == "" {
-		return doctorCheck{Level: doctorPass, Section: doctorSectionAgents, Name: name, Message: "skipped: codex not found in PATH"}
+		message := "skipped: codex not found in PATH"
+		if runtime.GOOS == "windows" {
+			message = "skipped: codex not found in PATH or known install locations"
+		}
+		return doctorCheck{Level: doctorPass, Section: doctorSectionAgents, Name: name, Message: message}
 	}
+	workspace, err := agentlaunch.FinalWorkspacePath("")
+	if err != nil {
+		return doctorCheck{Level: doctorWarn, Section: doctorSectionAgents, Name: name, Message: "skipped: Codex workspace is unavailable"}
+	}
+	env := agentlaunch.CodexEnvironment(ctx, path, nil)
 	for _, probe := range codex.DoctorLaunchProbes() {
 		reqCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		out, err := c.deps.CommandOutput(reqCtx, path, probe...)
+		var out []byte
+		if c.deps.CommandOutputInDirWithEnv != nil {
+			out, err = c.deps.CommandOutputInDirWithEnv(reqCtx, workspace, env, path, probe...)
+		} else {
+			out, err = c.deps.CommandOutput(reqCtx, path, probe...)
+		}
 		cancel()
 		if err != nil {
 			return doctorCheck{

@@ -42,7 +42,7 @@ type Project = components["schemas"]["Project"];
 type ProjectConfig = components["schemas"]["ProjectConfig"];
 type TrackerIntakeConfig = components["schemas"]["TrackerIntakeConfig"];
 
-const PERMISSION_MODE_VALUES = ["default", "accept-edits", "auto", "bypass-permissions"] as const;
+const PERMISSION_MODE_VALUES = ["default", "read-only", "accept-edits", "auto", "bypass-permissions"] as const;
 const DEFAULT_BRANCH_AUTO = "auto";
 
 const projectQueryKey = (id: string) => ["project", id] as const;
@@ -805,7 +805,9 @@ function PermissionModeSelect({ ariaLabel, value, onChange }: { ariaLabel: strin
 			label:
 				value === "default"
 					? t("settings.project.permissionDefault")
-					: value === "accept-edits"
+					: value === "read-only"
+						? t("settings.project.permissionReadOnly", { defaultValue: "Read-only" })
+						: value === "accept-edits"
 						? t("settings.project.permissionAcceptEdits")
 						: value === "auto"
 							? t("settings.project.permissionAuto")

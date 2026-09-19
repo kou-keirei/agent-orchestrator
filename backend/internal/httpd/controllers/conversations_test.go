@@ -41,6 +41,7 @@ type fakeConversationService struct {
 	configErr         error
 	setConfigID       string
 	setConfigValue    ports.ChatConfigOptionValue
+	settings          domain.ConversationSettings
 	mcpServers        []domain.ConversationMCPServer
 	reloadErr         error
 	sent              ports.ChatUserMessage
@@ -95,8 +96,9 @@ func (f *fakeConversationService) SetConfigOption(_ context.Context, _ domain.Se
 	return f.configOptions, f.configErr
 }
 
-func (f *fakeConversationService) SetTurnSettings(context.Context, domain.SessionID, domain.ConversationSettings) (domain.ConversationSettings, error) {
-	return domain.ConversationSettings{}, nil
+func (f *fakeConversationService) SetTurnSettings(_ context.Context, _ domain.SessionID, settings domain.ConversationSettings) (domain.ConversationSettings, error) {
+	f.settings = settings
+	return settings, nil
 }
 
 func (f *fakeConversationService) Compact(context.Context, domain.SessionID) (ports.ChatCompactionResult, error) {
@@ -401,6 +403,51 @@ func postConversationJSON(t *testing.T, server *httptest.Server, path, body stri
 		got, _ := io.ReadAll(response.Body)
 		t.Fatalf("status = %d, body = %s, want %d", response.StatusCode, got, wantStatus)
 	}
+}
+
+func TestConversationSettingsPreserveReasoningEffortPresence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		body   string
+		set    bool
+		effort string
+		inJSON string
+	}{
+		{name: "omitted", body: `{}`, inJSON: `"reasoningEffortSet":false`},
+		{name: "explicit default", body: `{"reasoningEffort":""}`, set: true, inJSON: `"reasoningEffortSet":true`},
+		{name: "explicit value", body: `{"reasoningEffort":"high"}`, set: true, effort: "high", inJSON: `"reasoningEffort":"high"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeConversationService{}
+			server := conversationTestServer(t, service)
+			response := postConversation(t, server, "/api/v1/sessions/p1-1/conversation/settings", test.body, http.StatusOK)
+			if service.settings.ReasoningEffortSet != test.set || service.settings.ReasoningEffort != test.effort {
+				t.Fatalf("settings = %#v, want set=%v effort=%q", service.settings, test.set, test.effort)
+			}
+			if !bytes.Contains(response, []byte(test.inJSON)) {
+				t.Fatalf("response = %s, want %s", response, test.inJSON)
+			}
+		})
+	}
+}
+
+func postConversation(t *testing.T, server *httptest.Server, path, body string, wantStatus int) []byte {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPatch, server.URL+path, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", path, err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	got, _ := io.ReadAll(response.Body)
+	if response.StatusCode != wantStatus {
+		t.Fatalf("status = %d, body = %s, want %d", response.StatusCode, got, wantStatus)
+	}
+	return got
 }
 
 func TestSnapshotExposesTurnDiff(t *testing.T) {

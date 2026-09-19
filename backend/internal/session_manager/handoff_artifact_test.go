@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -220,10 +221,11 @@ func TestWriteAgentHandoffFileIsPrivateAtomicAndImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("%s mode = %o, want 600", written.Path, info.Mode().Perm())
 	}
-	if dirInfo, statErr := os.Stat(filepath.Dir(written.Path)); statErr != nil || dirInfo.Mode().Perm() != 0o700 {
+	if dirInfo, statErr := os.Stat(filepath.Dir(written.Path)); statErr != nil ||
+		(runtime.GOOS != "windows" && dirInfo.Mode().Perm() != 0o700) {
 		t.Fatalf("handoff directory = (%v, %v), want mode 700", dirInfo, statErr)
 	}
 	data, err := os.ReadFile(written.Path)

@@ -512,9 +512,10 @@ func (c chatLauncher) SupportsChat(harness domain.AgentHarness) bool {
 func (c chatLauncher) PreflightChat(
 	ctx context.Context,
 	harness domain.AgentHarness,
+	workspacePath string,
 	permissions ports.PermissionMode,
 ) error {
-	return c.svc.PreflightChat(ctx, harness, permissions)
+	return c.svc.PreflightChat(ctx, harness, workspacePath, permissions)
 }
 
 func (c chatLauncher) StartChat(ctx context.Context, cfg sessionmanager.ChatStart) (sessionmanager.ChatStarted, error) {

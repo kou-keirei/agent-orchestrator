@@ -53,6 +53,10 @@ func TestClaudeSessionOptionsUseACPConfigIDs(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("options = %#v, want %#v", got, want)
 	}
+	got = claudeSessionOptions(ports.ChatTurnSettings{EffortOverride: true})
+	if len(got) != 1 || got[0].ID != "effort" || got[0].Value != "" || !got[0].AllowEmpty {
+		t.Fatalf("explicit provider default = %#v", got)
+	}
 }
 
 func TestValidateClaudeACPExecutableRejectsWindowsCommandShims(t *testing.T) {

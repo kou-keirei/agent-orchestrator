@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
+
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 const codexFileStoreOverride = `cli_auth_credentials_store="file"`
@@ -41,9 +42,9 @@ func newCodexLoginCommand(ctx *commandContext) *cobra.Command {
 }
 
 func (c *commandContext) runCodexLogin(ctx context.Context, in io.Reader, out, stderr io.Writer) error {
-	codex, err := c.deps.LookPath("codex")
+	codex, err := c.resolveCodexBinary(ctx)
 	if err != nil {
-		return fmt.Errorf("codex CLI is not installed or is not available on PATH")
+		return fmt.Errorf("codex CLI is not installed or could not be resolved")
 	}
 	style := newCodexLoginStyle(out)
 	if err := writeCodexLoginMenu(out, style); err != nil {
@@ -182,7 +183,7 @@ func readCodexLoginSelection(in io.Reader) (string, error) {
 }
 
 func runInteractiveCommand(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // executable and argv are resolved and fixed by the internal command.
+	cmd := aoprocess.CommandContext(ctx, name, args...) //nolint:gosec // executable and argv are resolved and fixed by the internal command.
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr

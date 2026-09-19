@@ -268,6 +268,8 @@ type SessionView struct {
 	// Model is the agent model this session resolved to at spawn time. Empty
 	// means the agent's default model. Pulled from the json:"-" domain Metadata.
 	Model string `json:"model,omitempty"`
+	// Permissions is the immutable session permission floor selected at spawn.
+	Permissions domain.PermissionMode `json:"permissions,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 	// LastUserMessageAt is the latest real user-authored task direction time.
 	// Lifecycle and internal automation updates do not advance it.
 	LastUserMessageAt *time.Time       `json:"lastUserMessageAt,omitempty"`
@@ -305,6 +307,13 @@ type SpawnSessionRequest struct {
 	// keeps the resolved project/role default. The daemon validates that the
 	// selected harness can honor the model before launching.
 	Model string `json:"model,omitempty" maxLength:"256"`
+	// Effort is an optional provider-advertised model tuning override. A nil
+	// pointer means the caller omitted the override; a non-nil empty string
+	// explicitly requests the provider/model default.
+	Effort *string `json:"effort,omitempty" maxLength:"64"`
+	// Permissions is an optional per-session permission override. Read-only is
+	// accepted only when the selected Chat driver proves its native boundary.
+	Permissions domain.PermissionMode `json:"permissions,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 
 	// DisplayName is the sidebar label for the session, capped at 20 characters.
 	// `ao spawn --name` always sets it; other clients (e.g. the desktop new-task
@@ -871,7 +880,7 @@ type DelegateTaskRequest struct {
 	Effort    *string             `json:"effort,omitempty" maxLength:"64"`
 	// ApprovalMode is an optional per-session override. The UI uses the explicit
 	// bypass value only after the user accepts an approval-less Chat fallback.
-	ApprovalMode domain.PermissionMode `json:"approvalMode,omitempty" enum:"default,accept-edits,auto,bypass-permissions"`
+	ApprovalMode domain.PermissionMode `json:"approvalMode,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 	// Mode is omitted for the daemon-owned default. The UI sends tui only when
 	// the user explicitly accepts the fallback after Chat preflight fails.
 	Mode domain.SessionMode `json:"mode,omitempty" enum:"tui,chat"`
@@ -1994,7 +2003,7 @@ type ConversationConfigOptionResponse struct {
 
 // ConversationConfigChoiceResponse is one value in a provider select.
 type ConversationConfigChoiceResponse struct {
-	PermissionMode domain.PermissionMode `json:"permissionMode,omitempty" enum:"default,accept-edits,auto,bypass-permissions"`
+	PermissionMode domain.PermissionMode `json:"permissionMode,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 	Value          string                `json:"value"`
 	Name           string                `json:"name"`
 	Description    string                `json:"description,omitempty"`
@@ -2046,15 +2055,23 @@ type ConversationSkillResponse struct {
 	Source string `json:"source,omitempty"`
 }
 
-// ConversationTurnSettingsPayload is the provider choices for the next turn. It is
-// both the request body for changing them and the echo of what is now stored.
-//
-// Every field is optional and an empty value means "use the provider's default",
-// so clearing a choice and never making one are the same thing.
+// SetConversationTurnSettingsRequest is the client choice for the next turn.
+// A nil ReasoningEffort means omitted; a non-nil empty string explicitly selects
+// the provider default.
+type SetConversationTurnSettingsRequest struct {
+	Model           string  `json:"model,omitempty"`
+	ReasoningEffort *string `json:"reasoningEffort,omitempty"`
+	ApprovalMode    string  `json:"approvalMode,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
+}
+
+// ConversationTurnSettingsPayload is the provider choices for the next turn.
+// ReasoningEffortSet preserves whether the value was explicitly selected; the
+// value itself is intentionally empty when the durable choice was omitted.
 type ConversationTurnSettingsPayload struct {
-	Model           string `json:"model,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
-	ApprovalMode    string `json:"approvalMode,omitempty" enum:"default,accept-edits,auto,bypass-permissions"`
+	Model              string `json:"model,omitempty"`
+	ReasoningEffort    string `json:"reasoningEffort,omitempty"`
+	ReasoningEffortSet bool   `json:"reasoningEffortSet"`
+	ApprovalMode       string `json:"approvalMode,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 }
 
 // ResolveConversationApprovalRequest answers a pending approval. DecisionID must
@@ -2238,10 +2255,12 @@ type ConversationSnapshotResponse struct {
 	Mode                       string `json:"mode" enum:"chat,tui"`
 	// Controller is reported separately from history so a client can tell "no
 	// messages yet" apart from "the agent is not running".
-	Controller     string `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
-	LatestSequence int64  `json:"latestSequence"`
-	OldestSequence int64  `json:"oldestSequence,omitempty"`
-	HasMoreBefore  bool   `json:"hasMoreBefore"`
+	Controller      string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
+	PermissionFloor string                   `json:"permissionFloor,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
+	NativeEvidence  NativePermissionEvidence `json:"nativeEvidence"`
+	LatestSequence  int64                    `json:"latestSequence"`
+	OldestSequence  int64                    `json:"oldestSequence,omitempty"`
+	HasMoreBefore   bool                     `json:"hasMoreBefore"`
 	// NativeForkAvailableAfterSequence is the first provider-backed human prompt
 	// in the active provider scope. It keeps edit gating exact across bounded pages.
 	NativeForkAvailableAfterSequence int64                             `json:"nativeForkAvailableAfterSequence"`
@@ -2297,6 +2316,20 @@ type ConversationSnapshotResponse struct {
 	// unstarted session's abilities are not yet known — and a client must treat
 	// absent as "do not offer yet" rather than as "cannot".
 	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// NativePermissionEvidence is the provider response posture for this Chat
+// conversation. Unknown fields are intentional when the provider cannot expose
+// effective state, especially across a persistent-host reconnect.
+type NativePermissionEvidence struct {
+	Provider             string `json:"provider,omitempty"`
+	RequestedPermission  string `json:"requestedPermission,omitempty"`
+	EffectivePermission  string `json:"effectivePermission,omitempty"`
+	ApprovalPolicy       string `json:"approvalPolicy,omitempty"`
+	ThreadSandbox        string `json:"threadSandbox,omitempty"`
+	TurnSandbox          string `json:"turnSandbox,omitempty"`
+	PreventiveCapability bool   `json:"preventiveCapability"`
+	ProofStatus          string `json:"proofStatus" enum:"PROVEN,UNPROVEN,DEFERRED_WITH_EXACT_REASON"`
 }
 
 // ConversationBranchMaterializationResponse describes the fidelity of the

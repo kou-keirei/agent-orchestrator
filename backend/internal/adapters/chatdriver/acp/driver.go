@@ -97,6 +97,9 @@ type PermissionPolicy func(
 type SessionOption struct {
 	ID    string
 	Value string
+	// AllowEmpty preserves an explicit provider-default selection. It is only
+	// needed for options whose empty value has provider-defined meaning.
+	AllowEmpty bool
 }
 
 // Driver opens ACP conversations for a single harness.
@@ -187,7 +190,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	}
 	if d.cfg.ValidateTurnSettings != nil {
 		if err := d.cfg.ValidateTurnSettings(cfg.Permissions, ports.ChatTurnSettings{
-			Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions,
+			Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride, Approval: cfg.Permissions,
 		}); err != nil {
 			return nil, fmt.Errorf("validate ACP session settings: %w", err)
 		}
@@ -250,7 +253,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		cfg.Permissions, d.cfg.ValidateTurnSettings, resp.ConfigOptions,
 		conv.legacyWire.modelState(), resp.Modes,
 	)
-	if err := conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions}); err != nil {
+	if err := conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride, Approval: cfg.Permissions}); err != nil {
 		// Initial model and permission mode may have been applied via launch-time
 		// flags (e.g. kimchiacp passes --model, --auto, --yolo). An agent that
 		// does not implement the runtime ACP setters returns -32601; tolerate it
@@ -276,7 +279,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	}
 	if d.cfg.ValidateTurnSettings != nil {
 		if err := d.cfg.ValidateTurnSettings(cfg.Permissions, ports.ChatTurnSettings{
-			Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions,
+			Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride, Approval: cfg.Permissions,
 		}); err != nil {
 			return nil, fmt.Errorf("%w: validate ACP session settings: %w", ports.ErrChatResumeFailed, err)
 		}
@@ -312,7 +315,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		}
 		if d.cfg.ValidateTurnSettings != nil {
 			if err := d.cfg.ValidateTurnSettings(ports.PermissionMode(live.InitialPermissions), ports.ChatTurnSettings{
-				Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions,
+				Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride, Approval: cfg.Permissions,
 			}); err != nil {
 				conv.discard()
 				return nil, fmt.Errorf("%w: live ACP launch settings: %w", ports.ErrChatRecoveryInconclusive, err)
@@ -392,7 +395,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		cfg.Permissions, d.cfg.ValidateTurnSettings, configOptions,
 		conv.legacyWire.modelState(), modes,
 	)
-	if err := conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, Approval: cfg.Permissions}); err != nil {
+	if err := conv.applyTurnSettings(ctx, ports.ChatTurnSettings{Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride, Approval: cfg.Permissions}); err != nil {
 		if !errors.Is(err, ErrACPSetterUnsupported) {
 			conv.discard()
 			return nil, fmt.Errorf("%w: configure ACP session: %w", ports.ErrChatResumeFailed, err)

@@ -1493,6 +1493,35 @@ func TestSessionsAPI_SpawnPassesModelToService(t *testing.T) {
 	if svc.lastSpawn.AgentConfig.Model != "sonnet" {
 		t.Fatalf("service AgentConfig.Model = %q, want sonnet", svc.lastSpawn.AgentConfig.Model)
 	}
+	if svc.lastSpawn.EffortOverride || svc.lastSpawn.AgentConfig.Effort != "" {
+		t.Fatalf("omitted effort = %q/%t, want empty/false", svc.lastSpawn.AgentConfig.Effort, svc.lastSpawn.EffortOverride)
+	}
+}
+
+func TestSessionsAPI_SpawnPreservesExplicitEffortValues(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		effort       string
+		wantEffort   string
+		wantOverride bool
+	}{
+		{name: "advertised max", effort: "max", wantEffort: "max", wantOverride: true},
+		{name: "explicit provider default", effort: "", wantEffort: "", wantOverride: true},
+		{name: "invalid is forwarded for provider validation", effort: "not-advertised", wantEffort: "not-advertised", wantOverride: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newFakeSessionService()
+			srv := newSessionTestServer(t, svc)
+			body, status, _ := doRequest(t, srv, "POST", "/api/v1/sessions",
+				`{"projectId":"ao","kind":"worker","harness":"codex","prompt":"fix","effort":`+strconv.Quote(tc.effort)+`}`)
+			if status != http.StatusCreated {
+				t.Fatalf("POST session = %d, want 201; body=%s", status, body)
+			}
+			if svc.lastSpawn.AgentConfig.Effort != tc.wantEffort || svc.lastSpawn.EffortOverride != tc.wantOverride {
+				t.Fatalf("service effort/override = %q/%t, want %q/%t", svc.lastSpawn.AgentConfig.Effort, svc.lastSpawn.EffortOverride, tc.wantEffort, tc.wantOverride)
+			}
+		})
+	}
 }
 
 func TestSessionsAPI_SpawnPassesParentSessionToService(t *testing.T) {

@@ -449,6 +449,51 @@ func productionCaps() ports.ChatCapabilities {
 	}
 }
 
+func readOnlyCaps() ports.ChatCapabilities {
+	caps := productionCaps()
+	caps[ports.ChatCapabilityPreventiveReadOnly] = true
+	return caps
+}
+
+func TestReadOnlyFloorSurvivesSettingsAndDispatch(t *testing.T) {
+	st := openStore(t)
+	conv := newFakeConversation()
+	caps := readOnlyCaps()
+	conv.setCapabilities(caps)
+	svc := chatsvc.New(chatsvc.Options{
+		Store: st, Sessions: st, Reader: fullSnapshotReader(st),
+		Drivers: fakeRegistry{driver: fakeDriver{conv: conv, caps: caps}},
+		Log:     slog.New(slog.DiscardHandler),
+		NewID:   func() string { return "read-only-floor" },
+	})
+	t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
+
+	if _, err := svc.Start(context.Background(), chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeReadOnly,
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := svc.SetTurnSettings(context.Background(), testSession, domain.ConversationSettings{
+		ApprovalMode: ports.PermissionModeBypassPermissions,
+	}); !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("SetTurnSettings error = %v, want immutable-floor refusal", err)
+	}
+	if _, err := svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "inspect"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if sent := conv.sentMessages(); len(sent) != 1 || sent[0].Settings.Approval != ports.PermissionModeReadOnly {
+		t.Fatalf("sent messages = %+v, want one read-only turn", sent)
+	}
+	snapshot, err := svc.Snapshot(context.Background(), testSession)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.PermissionFloor != ports.PermissionModeReadOnly {
+		t.Fatalf("snapshot permission floor = %q, want read-only", snapshot.PermissionFloor)
+	}
+}
+
 func TestSuccessfulChatProbeIsReusedByStart(t *testing.T) {
 	st := openStore(t)
 	probes := 0
@@ -470,7 +515,7 @@ func TestSuccessfulChatProbeIsReusedByStart(t *testing.T) {
 	})
 	t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
 
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); err != nil {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); err != nil {
 		t.Fatalf("PreflightChat: %v", err)
 	}
 	if _, err := svc.Start(context.Background(), chatsvc.StartConfig{
@@ -495,13 +540,13 @@ func TestFailedChatProbeCanBeRetriedThenCached(t *testing.T) {
 	}}
 	svc := chatsvc.New(chatsvc.Options{Drivers: fakeRegistry{driver: driver}})
 
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); err == nil {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); err == nil {
 		t.Fatal("first PreflightChat must surface the transient probe failure")
 	}
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); err != nil {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); err != nil {
 		t.Fatalf("second PreflightChat: %v", err)
 	}
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); err != nil {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); err != nil {
 		t.Fatalf("cached PreflightChat: %v", err)
 	}
 	if attempts != 2 {
@@ -524,13 +569,13 @@ func TestCapabilityCacheEvaluatesEveryRequestedPermissionMode(t *testing.T) {
 	}
 	svc := chatsvc.New(chatsvc.Options{Drivers: fakeRegistry{driver: driver}})
 
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); !errors.Is(err, ports.ErrChatUnsupported) {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); !errors.Is(err, ports.ErrChatUnsupported) {
 		t.Fatalf("default preflight error = %v, want ErrChatUnsupported", err)
 	}
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeBypassPermissions); err != nil {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeBypassPermissions); err != nil {
 		t.Fatalf("bypass preflight: %v", err)
 	}
-	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, ports.PermissionModeDefault); !errors.Is(err, ports.ErrChatUnsupported) {
+	if err := svc.PreflightChat(context.Background(), domain.HarnessCodex, "", ports.PermissionModeDefault); !errors.Is(err, ports.ErrChatUnsupported) {
 		t.Fatalf("cached default preflight error = %v, want ErrChatUnsupported", err)
 	}
 	if probes != 1 {
@@ -653,7 +698,9 @@ func TestServiceResumePreservesExplicitProviderDefaultTuning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConversation: %v", err)
 	}
-	if err := st.SetConversationSettings(context.Background(), existing.ID, domain.ConversationSettings{}, time.Now()); err != nil {
+	if err := st.SetConversationSettings(context.Background(), existing.ID, domain.ConversationSettings{
+		ReasoningEffortSet: true,
+	}, time.Now()); err != nil {
 		t.Fatalf("SetConversationSettings: %v", err)
 	}
 
@@ -674,8 +721,8 @@ func TestServiceResumePreservesExplicitProviderDefaultTuning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start resume: %v", err)
 	}
-	if resumed.Effort != "" {
-		t.Fatalf("resume effort = %q, want persisted provider default", resumed.Effort)
+	if resumed.Effort != "" || !resumed.EffortOverride {
+		t.Fatalf("resume tuning = effort %q override %v, want explicit provider default", resumed.Effort, resumed.EffortOverride)
 	}
 }
 
@@ -703,7 +750,7 @@ func TestServicePersistsAndPassesInitialModelTuningBeforeProviderStart(t *testin
 
 	_, err := svc.Start(context.Background(), chatsvc.StartConfig{
 		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
-		WorkspacePath: t.TempDir(), Model: "gpt-test", Effort: "high",
+		WorkspacePath: t.TempDir(), Model: "gpt-test", Effort: "high", EffortOverride: true,
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)

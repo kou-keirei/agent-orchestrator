@@ -13,10 +13,11 @@ import (
 )
 
 func configureProviderProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP,
-		HideWindow:    true,
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP
+	cmd.SysProcAttr.HideWindow = true
 }
 
 func killProviderProcess(ctx context.Context, cmd *exec.Cmd) error {

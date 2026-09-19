@@ -422,7 +422,7 @@ func (c *ConversationsController) setSettings(w http.ResponseWriter, r *http.Req
 		apispec.NotImplemented(w, r, "PATCH", "/api/v1/sessions/{sessionId}/conversation/settings")
 		return
 	}
-	var req ConversationTurnSettingsPayload
+	var req SetConversationTurnSettingsRequest
 	if !decodeConversationBody(w, r, &req) {
 		return
 	}
@@ -437,12 +437,16 @@ func (c *ConversationsController) setSettings(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	settings := domain.ConversationSettings{
+		Model:        req.Model,
+		ApprovalMode: approval,
+	}
+	if req.ReasoningEffort != nil {
+		settings.ReasoningEffort = *req.ReasoningEffort
+		settings.ReasoningEffortSet = true
+	}
 	settings, err := c.Svc.SetTurnSettings(r.Context(),
-		domain.SessionID(chi.URLParam(r, "sessionId")), domain.ConversationSettings{
-			Model:           req.Model,
-			ReasoningEffort: req.ReasoningEffort,
-			ApprovalMode:    approval,
-		})
+		domain.SessionID(chi.URLParam(r, "sessionId")), settings)
 	if err != nil {
 		writeConversationError(w, r, err)
 		return
@@ -503,10 +507,18 @@ func configOptionsPayload(options []ports.ChatConfigOption) ConversationConfigOp
 
 func turnSettingsPayload(settings domain.ConversationSettings) ConversationTurnSettingsPayload {
 	return ConversationTurnSettingsPayload{
-		Model:           settings.Model,
-		ReasoningEffort: settings.ReasoningEffort,
-		ApprovalMode:    string(settings.ApprovalMode),
+		Model:              settings.Model,
+		ReasoningEffort:    requestedReasoningEffort(settings),
+		ReasoningEffortSet: settings.ReasoningEffortSet,
+		ApprovalMode:       string(settings.ApprovalMode),
 	}
+}
+
+func requestedReasoningEffort(settings domain.ConversationSettings) string {
+	if !settings.ReasoningEffortSet {
+		return ""
+	}
+	return settings.ReasoningEffort
 }
 
 func (c *ConversationsController) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -861,6 +873,10 @@ func writeConversationError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict",
 			"SESSION_MODE_UNSUPPORTED", err.Error(), nil)
 
+	case errors.Is(err, ports.ErrChatPermissionModeUnsupported):
+		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict",
+			"CHAT_APPROVAL_MODE_UNSUPPORTED", err.Error(), nil)
+
 	case errors.Is(err, ports.ErrChatDriverUnavailable):
 		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict",
 			"CHAT_DRIVER_UNAVAILABLE", err.Error(), nil)
@@ -896,6 +912,8 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 		Harness:                          string(s.Harness),
 		Mode:                             string(s.Mode),
 		Controller:                       string(s.Controller),
+		PermissionFloor:                  string(s.PermissionFloor),
+		NativeEvidence:                   nativePermissionEvidencePayload(s.NativeEvidence),
 		LatestSequence:                   s.Conversation.LatestSequence,
 		OldestSequence:                   s.OldestSequence,
 		HasMoreBefore:                    s.HasMoreBefore,
@@ -975,6 +993,19 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 		})
 	}
 	return out
+}
+
+func nativePermissionEvidencePayload(evidence ports.ChatNativeEvidence) NativePermissionEvidence {
+	return NativePermissionEvidence{
+		Provider:             evidence.Provider,
+		RequestedPermission:  evidence.RequestedPermission,
+		EffectivePermission:  evidence.EffectivePermission,
+		ApprovalPolicy:       evidence.ApprovalPolicy,
+		ThreadSandbox:        evidence.ThreadSandbox,
+		TurnSandbox:          evidence.TurnSandbox,
+		PreventiveCapability: evidence.PreventiveCapability,
+		ProofStatus:          evidence.ProofStatus,
+	}
 }
 
 func branchMaterializationPayload(branch domain.ConversationBranch) *ConversationBranchMaterializationResponse {

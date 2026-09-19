@@ -44,6 +44,7 @@ import type {
 /** AO's generic approval modes, used by harnesses without a native vocabulary. */
 const APPROVAL_COPY: Record<ApprovalMode, { label: string }> = {
 	default: { label: "Default approvals" },
+	"read-only": { label: "Read-only" },
 	"accept-edits": { label: "Accept edits" },
 	auto: { label: "Auto-approve" },
 	"bypass-permissions": { label: "Bypass permissions" },
@@ -51,6 +52,7 @@ const APPROVAL_COPY: Record<ApprovalMode, { label: string }> = {
 
 const APPROVAL_ORDER: ApprovalMode[] = [
 	"default",
+	"read-only",
 	"accept-edits",
 	"auto",
 	"bypass-permissions",
@@ -61,6 +63,7 @@ const APPROVAL_ORDER: ApprovalMode[] = [
 // fourth, ambiguous "default" option.
 const CODEX_APPROVAL_COPY: Record<ApprovalMode, { label: string }> = {
 	default: { label: "Full access" },
+	"read-only": { label: "Read-only" },
 	"accept-edits": { label: "Ask for approval" },
 	auto: { label: "Approve for me" },
 	"bypass-permissions": { label: "Bypass permissions" },
@@ -68,6 +71,7 @@ const CODEX_APPROVAL_COPY: Record<ApprovalMode, { label: string }> = {
 
 const CODEX_APPROVAL_ORDER: ApprovalMode[] = [
 	"default",
+	"read-only",
 	"accept-edits",
 	"auto",
 	"bypass-permissions",
@@ -135,7 +139,9 @@ export function TurnSettingsBar({
 	const modelLabel = rerouted ?? chosenLabel;
 	const efforts = (selected ?? fallback)?.efforts ?? [];
 	const effortLabel =
-		settings.reasoningEffort ?? (selected ?? fallback)?.defaultEffort ?? undefined;
+		settings.reasoningEffortSet && settings.reasoningEffort === ""
+			? "Provider default"
+			: settings.reasoningEffort ?? (selected ?? fallback)?.defaultEffort ?? undefined;
 	const approvalCopy = harness === "codex" ? CODEX_APPROVAL_COPY : APPROVAL_COPY;
 	const approvalOrder = harness === "codex" ? CODEX_APPROVAL_ORDER : APPROVAL_ORDER;
 	const approvalLabel = approvalCopy[settings.approvalMode ?? "default"].label;
@@ -354,7 +360,12 @@ function ModelEffortPicker({
 									key={model.id}
 									active={model.id === settings.model}
 									radio
-									onSelect={() => onChange({ ...settings, model: model.id, reasoningEffort: undefined })}
+									onSelect={() => onChange({
+										...settings,
+										model: model.id,
+										reasoningEffort: undefined,
+										reasoningEffortSet: false,
+									})}
 									className={cn("text-xs", model.id === settings.model ? "text-foreground" : "text-muted-foreground")}
 								>
 									{model.displayName}
@@ -368,17 +379,31 @@ function ModelEffortPicker({
 					<OptionMenuSub>
 						<OptionMenuSubTrigger label="Effort" value={effortLabel ? capitalize(effortLabel) : "Effort"} />
 						<OptionMenuSubContent className={CHAT_MENU_CLASS}>
+							<OptionMenuItem
+								active={settings.reasoningEffortSet && settings.reasoningEffort === ""}
+								radio
+								onSelect={() => onChange({ ...settings, reasoningEffort: "", reasoningEffortSet: true })}
+								className="text-xs"
+							>
+								<span className={cn(
+									settings.reasoningEffortSet && settings.reasoningEffort === ""
+										? "text-foreground"
+										: "text-muted-foreground",
+								)}>
+									Provider default
+								</span>
+							</OptionMenuItem>
 							{efforts.map((effort) => (
 								<OptionMenuItem
 									key={effort}
-									active={effort === settings.reasoningEffort}
+									active={settings.reasoningEffortSet && effort === settings.reasoningEffort}
 									radio
-									onSelect={() => onChange({ ...settings, reasoningEffort: effort })}
+									onSelect={() => onChange({ ...settings, reasoningEffort: effort, reasoningEffortSet: true })}
 									className={cn("text-xs")}
 								>
 									<span
 										className={cn(
-											effort === settings.reasoningEffort
+											settings.reasoningEffortSet && effort === settings.reasoningEffort
 												? "text-foreground"
 												: "text-muted-foreground",
 										)}

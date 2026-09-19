@@ -140,4 +140,8 @@ func TestSessionOptionsForwardsEffortAfterModel(t *testing.T) {
 	if len(got) != 1 || got[0].ID != "effort" || got[0].Value != "xhigh" {
 		t.Fatalf("effort-only settings = %#v", got)
 	}
+	got = sessionOptions(ports.ChatTurnSettings{EffortOverride: true})
+	if len(got) != 1 || got[0].ID != "effort" || got[0].Value != "" || !got[0].AllowEmpty {
+		t.Fatalf("explicit provider default = %#v", got)
+	}
 }

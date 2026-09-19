@@ -33,6 +33,15 @@ type SessionReader interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 }
 
+type workspaceCapabilityProber interface {
+	ProbeForWorkspace(context.Context, string) (ports.ChatCapabilities, error)
+}
+
+type capabilityProbeKey struct {
+	harness       domain.AgentHarness
+	workspacePath string
+}
+
 // Service owns the live Chat controllers.
 type Service struct {
 	store                  Store
@@ -54,7 +63,7 @@ type Service struct {
 	gateMu       sync.Mutex
 	gates        map[domain.SessionID]controllerGate
 	probeMu      sync.Mutex
-	probed       map[domain.AgentHarness]ports.ChatCapabilities
+	probed       map[capabilityProbeKey]ports.ChatCapabilities
 }
 
 // controllerGate serializes start/stop for one session without making provider
@@ -133,7 +142,7 @@ func New(opts Options) *Service {
 		controllers:            make(map[domain.SessionID]*Controller),
 		startConfigs:           make(map[domain.SessionID]StartConfig),
 		gates:                  make(map[domain.SessionID]controllerGate),
-		probed:                 make(map[domain.AgentHarness]ports.ChatCapabilities),
+		probed:                 make(map[capabilityProbeKey]ports.ChatCapabilities),
 	}
 }
 
@@ -248,6 +257,9 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		return nil, err
 	}
 	defer gate.unlock()
+	if !cfg.Permissions.Valid() {
+		return nil, fmt.Errorf("%w: unknown permission mode %q", ports.ErrChatPermissionModeUnsupported, cfg.Permissions)
+	}
 	if cfg.HistoryMode > ports.ChatHistoryDeferred {
 		return nil, errors.New("invalid Chat history mode")
 	}
@@ -386,11 +398,17 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 
 	var caps ports.ChatCapabilities
 	if cfg.ProviderConversationID == "" {
-		caps, err = s.driverCapabilities(ctx, cfg.Harness, driver)
+		caps, err = s.driverCapabilities(ctx, cfg.Harness, cfg.WorkspacePath, driver)
 		if err != nil {
 			return nil, err
 		}
-		if err := capabilityAdmissionError(cfg.Harness, caps, cfg.Permissions); err != nil {
+		admissionPermissions := cfg.Permissions
+		// Codex proves read-only only in the thread response. Its static probe
+		// cannot honestly advertise a per-thread preventive capability.
+		if cfg.Harness == domain.HarnessCodex && cfg.Permissions == ports.PermissionModeReadOnly {
+			admissionPermissions = ports.PermissionModeAuto
+		}
+		if err := capabilityAdmissionError(cfg.Harness, caps, admissionPermissions); err != nil {
 			return nil, err
 		}
 	}
@@ -505,20 +523,44 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		cfg.Model = conversation.Settings.Model
 	}
 	if cfg.ProviderConversationID != "" {
-		cfg.Effort = conversation.Settings.ReasoningEffort
+		if conversation.Settings.ReasoningEffortSet {
+			cfg.Effort = conversation.Settings.ReasoningEffort
+		}
+		cfg.EffortOverride = conversation.Settings.ReasoningEffortSet
 	}
 	if cfg.ProviderConversationID != "" && conversation.Settings.ApprovalMode != "" {
-		cfg.Permissions = conversation.Settings.ApprovalMode
+		if !conversation.Settings.ApprovalMode.Valid() {
+			return nil, fmt.Errorf("%w: stored permission mode %q is unknown", ports.ErrChatPermissionModeUnsupported, conversation.Settings.ApprovalMode)
+		}
+		if cfg.Permissions != ports.PermissionModeReadOnly {
+			cfg.Permissions = conversation.Settings.ApprovalMode
+		}
 	}
 	if cfg.ProviderConversationID == "" {
-		if err := capabilityAdmissionError(cfg.Harness, caps, cfg.Permissions); err != nil {
-			return nil, err
-		}
 		conversation.Settings.Model = cfg.Model
-		conversation.Settings.ReasoningEffort = cfg.Effort
+		if cfg.EffortOverride {
+			conversation.Settings.ReasoningEffort = cfg.Effort
+		} else {
+			conversation.Settings.ReasoningEffort = ""
+		}
+		conversation.Settings.ReasoningEffortSet = cfg.EffortOverride
 		conversation.Settings.ApprovalMode = cfg.Permissions
 		if err := s.store.SetConversationSettings(ctx, conversation.ID, conversation.Settings, s.now()); err != nil {
 			return nil, fmt.Errorf("record initial conversation settings: %w", err)
+		}
+		if !conversation.Settings.ReasoningEffortSet {
+			conversation.Settings.ReasoningEffort = cfg.Effort
+		}
+	} else {
+		settings := applyPermissionFloor(cfg.Permissions, conversation.Settings)
+		if settings != conversation.Settings {
+			conversation.Settings = settings
+			if err := s.store.SetConversationSettings(ctx, conversation.ID, settings, s.now()); err != nil {
+				return nil, fmt.Errorf("record restored conversation settings: %w", err)
+			}
+		}
+		if !conversation.Settings.ReasoningEffortSet {
+			conversation.Settings.ReasoningEffort = cfg.Effort
 		}
 	}
 
@@ -544,6 +586,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			PrepareEnv:             prepareEnv,
 			Model:                  cfg.Model,
 			Effort:                 cfg.Effort,
+			EffortOverride:         cfg.EffortOverride,
 			Permissions:            cfg.Permissions,
 			SystemPrompt:           cfg.SystemPrompt,
 			ProviderScopeID:        providerScopeID,
@@ -561,6 +604,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			PrepareEnv:            prepareEnv,
 			Model:                 cfg.Model,
 			Effort:                cfg.Effort,
+			EffortOverride:        cfg.EffortOverride,
 			Permissions:           cfg.Permissions,
 			SystemPrompt:          cfg.SystemPrompt,
 			ProviderScopeID:       providerScopeID,
@@ -610,6 +654,11 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			_ = cleanupUnpublishedConversation(conv, false)
 			return nil, err
 		}
+	} else if err := capabilityAdmissionError(cfg.Harness, conv.Capabilities(), cfg.Permissions); err != nil {
+		// The static probe admitted the launch path; this second check consumes
+		// only the capabilities negotiated by this actual provider thread.
+		_ = cleanupUnpublishedConversation(conv, true)
+		return nil, err
 	}
 	if !liveReconnect && cfg.Harness == domain.HarnessOpenCode && conversation.Settings.OpenCodeMode != "" {
 		if err := restoreOpenCodeMode(ctx, conv, conversation.Settings.OpenCodeMode); err != nil {
@@ -669,7 +718,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	// A fresh generation per launch, so events from the controller this one
 	// replaced can be told apart from the current one's.
 	controller := newController(
-		cfg.SessionID, conversation, generation, cfg.Harness, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged)
+		cfg.SessionID, conversation, generation, cfg.Harness, cfg.Permissions, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged)
 	var commitProviderHistory func(context.Context) error
 	if liveReconnect {
 		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
@@ -1148,6 +1197,8 @@ type Snapshot struct {
 	Harness                          domain.AgentHarness
 	Mode                             domain.SessionMode
 	Controller                       ports.ChatControllerState
+	PermissionFloor                  ports.PermissionMode
+	NativeEvidence                   ports.ChatNativeEvidence
 	Turns                            []domain.ConversationTurn
 	Messages                         []domain.ConversationMessage
 	Activities                       []domain.ConversationActivity
@@ -1219,10 +1270,12 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 		// That is an empty conversation, not a failure — returning an error here
 		// would make a brand-new session look broken.
 		return Snapshot{
-			SessionID:  id,
-			Harness:    record.Harness,
-			Mode:       domain.NormalizeSessionMode(record.Mode),
-			Controller: ports.ChatControllerStopped,
+			SessionID:       id,
+			Harness:         record.Harness,
+			Mode:            domain.NormalizeSessionMode(record.Mode),
+			Controller:      ports.ChatControllerStopped,
+			PermissionFloor: record.Metadata.Permissions,
+			NativeEvidence:  unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
 		}, nil
 	}
 	if err != nil {
@@ -1235,10 +1288,14 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 	}
 
 	state := ports.ChatControllerStopped
+	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
+	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
 	if controller, err := s.Controller(id); err == nil {
 		state = controller.State()
 		caps = controller.Capabilities()
+		permissionFloor = controller.PermissionFloor()
+		nativeEvidence = controller.NativeEvidence()
 	}
 
 	return Snapshot{
@@ -1250,6 +1307,8 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 		Harness:                          record.Harness,
 		Mode:                             domain.NormalizeSessionMode(record.Mode),
 		Controller:                       state,
+		PermissionFloor:                  permissionFloor,
+		NativeEvidence:                   nativeEvidence,
 		Turns:                            rows.Turns,
 		Messages:                         rows.Messages,
 		Activities:                       rows.Activities,
@@ -1271,10 +1330,12 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 	conversation, err := s.store.ConversationForSession(ctx, id)
 	if errors.Is(err, domain.ErrNoConversation) {
 		return Snapshot{
-			SessionID:  id,
-			Harness:    record.Harness,
-			Mode:       domain.NormalizeSessionMode(record.Mode),
-			Controller: ports.ChatControllerStopped,
+			SessionID:       id,
+			Harness:         record.Harness,
+			Mode:            domain.NormalizeSessionMode(record.Mode),
+			Controller:      ports.ChatControllerStopped,
+			PermissionFloor: record.Metadata.Permissions,
+			NativeEvidence:  unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
 		}, nil
 	}
 	if err != nil {
@@ -1290,10 +1351,14 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 		return Snapshot{}, fmt.Errorf("load conversation page %s: %w", conversation.ID, err)
 	}
 	state := ports.ChatControllerStopped
+	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
+	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
 	if controller, err := s.Controller(id); err == nil {
 		state = controller.State()
 		caps = controller.Capabilities()
+		permissionFloor = controller.PermissionFloor()
+		nativeEvidence = controller.NativeEvidence()
 	}
 	return Snapshot{
 		Conversation:                     rows.Conversation,
@@ -1304,6 +1369,8 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 		Harness:                          record.Harness,
 		Mode:                             domain.NormalizeSessionMode(record.Mode),
 		Controller:                       state,
+		PermissionFloor:                  permissionFloor,
+		NativeEvidence:                   nativeEvidence,
 		Turns:                            rows.Turns,
 		Messages:                         rows.Messages,
 		Activities:                       rows.Activities,
@@ -1315,6 +1382,19 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 		Usage:                            rows.Conversation.Usage,
 		RateLimits:                       rows.Conversation.RateLimits,
 	}, nil
+}
+
+func unprovenNativeEvidence(harness domain.AgentHarness, requested ports.PermissionMode) ports.ChatNativeEvidence {
+	return ports.ChatNativeEvidence{
+		Provider:             string(harness),
+		RequestedPermission:  string(requested),
+		EffectivePermission:  "unknown",
+		ApprovalPolicy:       "unknown",
+		ThreadSandbox:        "unknown",
+		TurnSandbox:          "unknown",
+		PreventiveCapability: false,
+		ProofStatus:          "UNPROVEN",
+	}
 }
 
 // SnapshotReaderFunc adapts a plain function to SnapshotReader. The daemon wiring
@@ -1362,15 +1442,21 @@ func (s *Service) SupportsChat(harness domain.AgentHarness) bool {
 func (s *Service) PreflightChat(
 	ctx context.Context,
 	harness domain.AgentHarness,
+	workspacePath string,
 	permissions ports.PermissionMode,
 ) error {
 	driver, err := s.drivers.Driver(harness)
 	if err != nil {
 		return fmt.Errorf("%w: %s has no chat driver", ports.ErrChatUnsupported, harness)
 	}
-	caps, err := s.driverCapabilities(ctx, harness, driver)
+	caps, err := s.driverCapabilities(ctx, harness, workspacePath, driver)
 	if err != nil {
 		return err
+	}
+	// Codex proves read-only only in the thread response. Its static probe
+	// cannot honestly advertise a per-thread preventive capability.
+	if harness == domain.HarnessCodex && permissions == ports.PermissionModeReadOnly {
+		permissions = ports.PermissionModeAuto
 	}
 	return capabilityAdmissionError(harness, caps, permissions)
 }
@@ -1380,6 +1466,9 @@ func capabilityAdmissionError(
 	caps ports.ChatCapabilities,
 	permissions ports.PermissionMode,
 ) error {
+	if !permissions.Valid() {
+		return fmt.Errorf("%w: unknown permission mode %q", ports.ErrChatPermissionModeUnsupported, permissions)
+	}
 	missing := ports.MissingCapabilitiesForPermissions(caps, permissions)
 	if len(missing) == 0 {
 		return nil
@@ -1396,7 +1485,8 @@ func capabilityAdmissionError(
 	}
 }
 
-// driverCapabilities performs the provider capability probe once per harness for
+// driverCapabilities performs the provider capability probe once per harness,
+// or once per harness and workspace for workspace-aware providers, for
 // the lifetime of this service. Reconciliation can resume many sessions using
 // the same provider; launching a throwaway provider process for every one makes
 // startup scale with twice the number of sessions. Only successful probes are
@@ -1406,18 +1496,32 @@ func capabilityAdmissionError(
 func (s *Service) driverCapabilities(
 	ctx context.Context,
 	harness domain.AgentHarness,
+	workspacePath string,
 	driver ports.ChatDriver,
 ) (ports.ChatCapabilities, error) {
+	prober, workspaceAware := driver.(workspaceCapabilityProber)
+	key := capabilityProbeKey{harness: harness}
+	if workspaceAware {
+		key.workspacePath = workspacePath
+	}
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
-	if caps, ok := s.probed[harness]; ok {
+	if caps, ok := s.probed[key]; ok {
 		return caps, nil
 	}
-	caps, err := driver.Probe(ctx)
+	var (
+		caps ports.ChatCapabilities
+		err  error
+	)
+	if workspaceAware {
+		caps, err = prober.ProbeForWorkspace(ctx, workspacePath)
+	} else {
+		caps, err = driver.Probe(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
-	s.probed[harness] = caps
+	s.probed[key] = caps
 	return caps, nil
 }
 
@@ -1535,6 +1639,19 @@ func (s *Service) SetConfigOption(
 	}
 	controller.configMu.Lock()
 	defer controller.configMu.Unlock()
+	// Serialize the provider mutation with ArmHandoff. Checking only after the
+	// provider call would let a settings change cross an already-armed source
+	// controller even if the durable settings write is later refused.
+	controller.sendMu.Lock()
+	defer controller.sendMu.Unlock()
+	if controller.handoffActive() {
+		return nil, ErrControllerHandoff
+	}
+	if permission, ok := permissionModeForConfigChoice(record.Harness, configID, value); ok {
+		if err := validatePermissionFloor(controller.permissionFloor, permission); err != nil {
+			return nil, err
+		}
+	}
 	options, err := configurer.SetConfigOption(ctx, configID, value)
 	if err != nil {
 		return nil, err
@@ -1550,7 +1667,7 @@ func (s *Service) SetConfigOption(
 		}
 	}
 	if settings != previous {
-		if err := controller.SetSettings(ctx, settings); err != nil {
+		if err := controller.setSettingsLocked(ctx, settings); err != nil {
 			return nil, err
 		}
 	}
@@ -1601,6 +1718,7 @@ func settingsFromConfigOptions(
 	if !hasEffort {
 		next.ReasoningEffort = ""
 	}
+	next.ReasoningEffortSet = hasEffort
 	return next, next != settings
 }
 
@@ -1750,20 +1868,33 @@ func permissionConfigOptions(harness domain.AgentHarness, options []ports.ChatCo
 		out[i].Choices = append([]ports.ChatConfigOptionChoice(nil), out[i].Choices...)
 		for j := range out[i].Choices {
 			out[i].Choices[j].PermissionMode = ""
-			if harness != domain.HarnessClaudeCode || out[i].ID != "mode" {
-				continue
-			}
-			switch out[i].Choices[j].Value {
-			case "manual", "default":
-				out[i].Choices[j].PermissionMode = domain.PermissionModeDefault
-			case "acceptEdits":
-				out[i].Choices[j].PermissionMode = domain.PermissionModeAcceptEdits
-			case "auto":
-				out[i].Choices[j].PermissionMode = domain.PermissionModeAuto
-			case "bypassPermissions":
-				out[i].Choices[j].PermissionMode = domain.PermissionModeBypassPermissions
+			if permission, ok := permissionModeForConfigChoice(harness, out[i].ID,
+				ports.ChatConfigOptionValue{Select: out[i].Choices[j].Value}); ok {
+				out[i].Choices[j].PermissionMode = permission
 			}
 		}
 	}
 	return out
+}
+
+func permissionModeForConfigChoice(
+	harness domain.AgentHarness,
+	configID string,
+	value ports.ChatConfigOptionValue,
+) (ports.PermissionMode, bool) {
+	if harness != domain.HarnessClaudeCode || configID != "mode" {
+		return "", false
+	}
+	switch value.Select {
+	case "manual", "default":
+		return domain.PermissionModeDefault, true
+	case "acceptEdits":
+		return domain.PermissionModeAcceptEdits, true
+	case "auto":
+		return domain.PermissionModeAuto, true
+	case "bypassPermissions":
+		return domain.PermissionModeBypassPermissions, true
+	default:
+		return "", false
+	}
 }

@@ -160,10 +160,15 @@ func (m *Manager) executeChatAgentSwitch(
 	if m.chat == nil {
 		return result, fmt.Errorf("switch Chat agent %s: %w", id, ports.ErrChatUnsupported)
 	}
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return result, fmt.Errorf("switch Chat agent %s: %w: stored permission mode is invalid: %v", id, ports.ErrChatPermissionModeUnsupported, err)
+	}
 	if err := m.chat.PreflightChat(
 		ctx,
 		cfg.TargetHarness,
-		effectiveAgentConfig(cfg.TargetHarness, rec.Kind, project.Config).Permissions,
+		rec.Metadata.WorkspacePath,
+		permissions,
 	); err != nil {
 		return result, fmt.Errorf("switch Chat agent %s: target preflight: %w", id, err)
 	}
@@ -171,7 +176,13 @@ func (m *Manager) executeChatAgentSwitch(
 	if !ok {
 		return result, fmt.Errorf("switch Chat agent %s: %w", id, ErrInterfaceHandoffUnsupported)
 	}
-	baseAgentConfig := effectiveAgentConfig(cfg.TargetHarness, rec.Kind, project.Config)
+	baseAgentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	baseAgentConfig.Permissions = permissions
+	if roleOverride(rec.Kind, project.Config).Harness != cfg.TargetHarness {
+		baseAgentConfig.Model = ""
+		baseAgentConfig.Effort = ""
+		baseAgentConfig.Mode = ""
+	}
 	agentConfig, err := m.resolveChatAgentConfig(ctx, ports.SpawnConfig{
 		ProjectID: rec.ProjectID,
 		Kind:      rec.Kind,
@@ -183,6 +194,7 @@ func (m *Manager) executeChatAgentSwitch(
 	if err != nil {
 		return result, fmt.Errorf("switch Chat agent %s: target config: %w", id, err)
 	}
+	pinRuntimePermissionEnv(targetSetupEnv, agentConfig.Permissions)
 
 	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID)
 	if err != nil {
@@ -367,6 +379,7 @@ func (m *Manager) executeChatAgentSwitch(
 	}
 	targetLaunchEnv := m.runtimeEnv(id, credentialRecord.ProjectID, credentialRecord.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(targetAgent, targetLaunchEnv)
+	pinRuntimePermissionEnv(targetLaunchEnv, agentConfig.Permissions)
 	releaseCodexAdmission, admissionErr := m.acquireCodexControllerAdmission(ctx, cfg.TargetHarness)
 	if admissionErr != nil {
 		return result, fmt.Errorf("switch Chat agent %s: %w", id, admissionErr)
@@ -405,6 +418,7 @@ func (m *Manager) executeChatAgentSwitch(
 			}
 			credentialRecord = prepared
 			m.augmentAgentRuntimeEnv(targetAgent, launchEnv)
+			pinRuntimePermissionEnv(launchEnv, agentConfig.Permissions)
 			return launchEnv, nil
 		},
 		ProviderConversationID: providerConversationID,
@@ -576,6 +590,7 @@ func committedChatSwitchConversation(
 	conversation.ActiveBranchID = chatSwitchProviderBoundaryID(switchID)
 	conversation.Settings.Model = ""
 	conversation.Settings.ReasoningEffort = ""
+	conversation.Settings.ReasoningEffortSet = false
 	conversation.UpdatedAt = activatedAt
 	return conversation
 }
@@ -625,9 +640,15 @@ func (m *Manager) rollbackStoppedChatAgentSwitchSource(
 	if err != nil {
 		return err
 	}
-	agentConfig := effectiveAgentConfig(rec.Harness, rec.Kind, project.Config)
+	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return fmt.Errorf("stored permission mode is invalid: %w", err)
+	}
+	agentConfig.Permissions = permissions
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(sourceAgent, env)
+	pinRuntimePermissionEnv(env, agentConfig.Permissions)
 	if err := m.prepareWorkspace(
 		ctx, sourceAgent, rec.ID, rec.Metadata.WorkspacePath,
 		systemPrompt, systemPromptFile, agentConfig, env,

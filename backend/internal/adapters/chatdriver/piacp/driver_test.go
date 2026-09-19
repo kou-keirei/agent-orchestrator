@@ -179,4 +179,8 @@ func TestPiACPFeatureMapping(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("session options = %#v, want %#v", got, want)
 	}
+	got = cfg.SessionOptions(ports.ChatTurnSettings{EffortOverride: true})
+	if len(got) != 1 || got[0].ID != "thought_level" || got[0].Value != "" || !got[0].AllowEmpty {
+		t.Fatalf("explicit provider default = %#v", got)
+	}
 }

@@ -30,6 +30,26 @@ type fakePlugin struct {
 	authErr    error
 }
 
+type workspaceFakePlugin struct {
+	fakePlugin
+	workspaceBin string
+}
+
+type countingWorkspacePlugin struct {
+	fakePlugin
+	workspaceBin string
+	calls        *int
+}
+
+func (p workspaceFakePlugin) ResolveBinaryForWorkspace(context.Context, string) (string, error) {
+	return p.workspaceBin, nil
+}
+
+func (p countingWorkspacePlugin) ResolveBinaryForWorkspace(context.Context, string) (string, error) {
+	*p.calls++
+	return p.workspaceBin, nil
+}
+
 func (f fakePlugin) ResolveBinary(context.Context) (string, error) { return f.bin, f.binErr }
 func (f fakePlugin) AuthStatus(context.Context) (ports.AgentAuthStatus, error) {
 	return f.authStatus, f.authErr
@@ -186,7 +206,7 @@ func newTestDriver(t *testing.T) (*Driver, *scriptedServer) {
 	d := &Driver{
 		plugin: fakePlugin{bin: "codex", authStatus: ports.AgentAuthStatusAuthorized},
 		log:    slog.New(slog.DiscardHandler),
-		versionProbe: func(context.Context, string) (string, error) {
+		versionProbe: func(context.Context, LaunchContract) (string, error) {
 			return "codex-cli 0.146.0", nil
 		},
 		spawn: func(context.Context, string, string, []string) (*process, error) {
@@ -279,6 +299,82 @@ func TestStartCompletesHandshakeAndOpensThread(t *testing.T) {
 	}
 }
 
+func TestPersistentConnectUsesWorkspaceResolvedCodexBinary(t *testing.T) {
+	d, _ := newTestDriver(t)
+	proc, err := d.spawn(context.Background(), "global-codex", "/tmp/daemon", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := filepath.Join(t.TempDir(), "session-worktree")
+	workspaceBin := filepath.Join(workspace, "node_modules", ".bin", "codex.cmd")
+	d.plugin = workspaceFakePlugin{
+		fakePlugin:   fakePlugin{bin: "global-codex", authStatus: ports.AgentAuthStatusAuthorized},
+		workspaceBin: workspaceBin,
+	}
+	d.persistent = true
+	var hostConfig persistenthost.Config
+	d.connectHost = func(_ context.Context, cfg persistenthost.Config) (*persistenthost.Transport, error) {
+		hostConfig = cfg
+		return &persistenthost.Transport{Stdin: proc.stdin, Stdout: proc.stdout}, nil
+	}
+
+	conv, _, err := d.connectSession(context.Background(), "ao-workspace", t.TempDir(), workspace, nil,
+		func(context.Context) (map[string]string, error) {
+			return map[string]string{"PATH": os.Getenv("PATH")}, nil
+		}, "")
+	if err != nil {
+		t.Fatalf("connectSession: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+	if hostConfig.Workdir != workspace {
+		t.Fatalf("persistent host workdir = %q, want %q", hostConfig.Workdir, workspace)
+	}
+	if !reflect.DeepEqual(hostConfig.Argv, []string{workspaceBin, "app-server"}) {
+		t.Fatalf("persistent host argv = %#v, want %#v", hostConfig.Argv, []string{workspaceBin, "app-server"})
+	}
+	pathParts := strings.Split(envValue(hostConfig.Env, "PATH"), string(os.PathListSeparator))
+	if len(pathParts) == 0 || pathParts[0] != filepath.Dir(workspaceBin) {
+		t.Fatalf("persistent host PATH = %#v, want workspace launcher directory first", pathParts)
+	}
+	if hostConfig.Prepare == nil {
+		t.Fatal("persistent host Prepare callback is nil")
+	}
+	prepared, err := hostConfig.Prepare(context.Background())
+	if err != nil {
+		t.Fatalf("persistent host Prepare: %v", err)
+	}
+	if !reflect.DeepEqual(prepared.Argv, []string{workspaceBin, "app-server"}) {
+		t.Fatalf("prepared persistent argv = %#v, want %#v", prepared.Argv, []string{workspaceBin, "app-server"})
+	}
+	preparedParts := strings.Split(envValue(prepared.Env, "PATH"), string(os.PathListSeparator))
+	if len(preparedParts) == 0 || preparedParts[0] != filepath.Dir(workspaceBin) {
+		t.Fatalf("prepared persistent PATH = %#v, want workspace launcher directory first", preparedParts)
+	}
+}
+
+func TestStartSendsExplicitEmptyEffortConfig(t *testing.T) {
+	d, srv := newTestDriver(t)
+	conv, err := d.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: t.TempDir(), EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+
+	start := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/start" })
+	var params struct {
+		Config map[string]string `json:"config"`
+	}
+	if err := json.Unmarshal(start.Params, &params); err != nil {
+		t.Fatalf("thread/start params: %v", err)
+	}
+	value, present := params.Config["model_reasoning_effort"]
+	if !present || value != "" {
+		t.Fatalf("thread/start effort config = %q (present=%t), want explicit empty", value, present)
+	}
+}
+
 func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	d, srv := newTestDriver(t)
 	prepareCalls := 0
@@ -323,6 +419,82 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	request := srv.awaitFrame(func(f frame) bool { return f.Method == "model/list" })
 	if request.ID == nil || string(*request.ID) != "42" {
 		t.Fatalf("first request id after reconnect = %v, want 42", request.ID)
+	}
+}
+
+func TestReadOnlyReconnectRefusesWithoutLiveEffectivePosture(t *testing.T) {
+	d, srv := newTestDriver(t)
+	workspace := t.TempDir()
+	proc, err := d.spawn(context.Background(), "codex", workspace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.persistent = true
+	d.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{Stdin: proc.stdin, Stdout: proc.stdout, Reconnected: true}, nil
+	}
+
+	_, err = d.Resume(context.Background(), ports.ChatResumeConfig{
+		SessionID: "ao-reconnect", ProviderConversationID: "thread-survived",
+		DataDir: t.TempDir(), WorkspacePath: workspace, Permissions: ports.PermissionModeReadOnly,
+	})
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("Resume error = %v, want ErrChatPermissionModeUnsupported", err)
+	}
+	if srv.sentMethod("thread/resume") {
+		t.Fatal("read-only reconnect attempted a native resume against the live provider")
+	}
+}
+
+func TestReadOnlyStartRequiresEffectiveProviderPosture(t *testing.T) {
+	workspace := t.TempDir()
+	for _, test := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "effective read only", body: `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}`, want: true},
+		{name: "broader sandbox", body: `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"workspaceWrite"}}`},
+		{name: "missing posture", body: `{"thread":{"id":"thread-1"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			srv.reply("thread/start", test.body)
+			conv, err := d.Start(context.Background(), ports.ChatStartConfig{
+				WorkspacePath: workspace, Permissions: ports.PermissionModeReadOnly,
+			})
+			if test.want {
+				if err != nil {
+					t.Fatalf("Start: %v", err)
+				}
+				defer func() { _ = conv.Close() }()
+				if !conv.Capabilities().Has(ports.ChatCapabilityPreventiveReadOnly) {
+					t.Fatal("effective provider posture did not publish preventive evidence")
+				}
+				evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
+				if evidence.Provider != "codex" || evidence.RequestedPermission != "read-only" ||
+					evidence.EffectivePermission != "read-only" || evidence.ApprovalPolicy != "never" ||
+					evidence.ThreadSandbox != "readOnly" || evidence.TurnSandbox != "readOnly" ||
+					!evidence.PreventiveCapability || evidence.ProofStatus != "PROVEN" {
+					t.Fatalf("native evidence = %+v", evidence)
+				}
+				return
+			}
+			if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+				t.Fatalf("Start error = %v, want ErrChatPermissionModeUnsupported", err)
+			}
+		})
+	}
+}
+
+func TestReadOnlyResumeRequiresEffectiveProviderPosture(t *testing.T) {
+	d, srv := newTestDriver(t)
+	srv.reply("thread/resume", `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"workspaceWrite"}}`)
+	_, err := d.Resume(context.Background(), ports.ChatResumeConfig{
+		ProviderConversationID: "thread-1", WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeReadOnly,
+	})
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("Resume error = %v, want ErrChatPermissionModeUnsupported", err)
 	}
 }
 
@@ -687,6 +859,28 @@ func TestResumeFailureDoesNotFallBackToStart(t *testing.T) {
 	}
 }
 
+func TestResumeRejectsMissingOrWrongProviderThreadID(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{}`},
+		{name: "wrong", body: `{"thread":{"id":"another-thread"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			srv.reply("thread/resume", test.body)
+			_, err := d.Resume(context.Background(), ports.ChatResumeConfig{
+				ProviderConversationID: "thread-1",
+				WorkspacePath:          t.TempDir(),
+			})
+			if !errors.Is(err, ports.ErrChatResumeFailed) {
+				t.Fatalf("Resume error = %v, want ErrChatResumeFailed", err)
+			}
+		})
+	}
+}
+
 func TestResumeReappliesWorkspaceAndStandingInstructions(t *testing.T) {
 	d, srv := newTestDriver(t)
 	conv, err := d.Resume(context.Background(), ports.ChatResumeConfig{
@@ -742,6 +936,29 @@ func TestResumeRequiresStoredThreadID(t *testing.T) {
 	}
 }
 
+func TestResumeSendsExplicitEmptyEffortConfig(t *testing.T) {
+	d, srv := newTestDriver(t)
+	conv, err := d.Resume(context.Background(), ports.ChatResumeConfig{
+		ProviderConversationID: "thread-1", WorkspacePath: t.TempDir(), EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+
+	resume := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/resume" })
+	var params struct {
+		Config map[string]string `json:"config"`
+	}
+	if err := json.Unmarshal(resume.Params, &params); err != nil {
+		t.Fatalf("thread/resume params: %v", err)
+	}
+	value, present := params.Config["model_reasoning_effort"]
+	if !present || value != "" {
+		t.Fatalf("thread/resume effort config = %q (present=%t), want explicit empty", value, present)
+	}
+}
+
 func TestProbeIgnoresAmbientAuthStatus(t *testing.T) {
 	d, _ := newTestDriver(t)
 	d.plugin = fakePlugin{bin: "codex", authStatus: ports.AgentAuthStatusUnauthorized}
@@ -751,6 +968,66 @@ func TestProbeIgnoresAmbientAuthStatus(t *testing.T) {
 	}
 	if missing := ports.MissingProductionCapabilities(caps); len(missing) != 0 {
 		t.Fatalf("codex is missing production capabilities: %v", missing)
+	}
+}
+
+func TestProbeForWorkspaceResolvesTheSessionWorkspaceBinary(t *testing.T) {
+	d, _ := newTestDriver(t)
+	workspace := t.TempDir()
+	workspaceBin := filepath.Join(workspace, "node_modules", ".bin", "codex.cmd")
+	d.plugin = workspaceFakePlugin{
+		fakePlugin:   fakePlugin{bin: "daemon-codex"},
+		workspaceBin: workspaceBin,
+	}
+	var probed string
+	d.versionProbe = func(_ context.Context, contract LaunchContract) (string, error) {
+		probed = contract.Executable
+		return "codex-cli 0.146.0", nil
+	}
+	if _, err := d.ProbeForWorkspace(context.Background(), workspace); err != nil {
+		t.Fatalf("ProbeForWorkspace: %v", err)
+	}
+	if probed != workspaceBin {
+		t.Fatalf("probed binary = %q, want workspace binary %q", probed, workspaceBin)
+	}
+}
+
+func TestProbeReusesOneLaunchContractForVersionAndHandshake(t *testing.T) {
+	d, _ := newTestDriver(t)
+	workspace := t.TempDir()
+	workspaceBin := filepath.Join(workspace, "node_modules", ".bin", "codex.cmd")
+	resolveCalls := 0
+	d.plugin = countingWorkspacePlugin{
+		fakePlugin:   fakePlugin{bin: "daemon-codex"},
+		workspaceBin: workspaceBin,
+		calls:        &resolveCalls,
+	}
+	var probed LaunchContract
+	d.versionProbe = func(_ context.Context, contract LaunchContract) (string, error) {
+		probed = contract
+		return "codex-cli 0.146.0", nil
+	}
+	var launched LaunchContract
+	originalSpawn := d.spawn
+	d.spawn = func(ctx context.Context, bin, workdir string, env []string) (*process, error) {
+		launched = LaunchContract{Executable: bin, WorkspacePath: workdir, Environment: env}
+		return originalSpawn(ctx, bin, workdir, env)
+	}
+
+	if _, err := d.ProbeForWorkspace(context.Background(), workspace); err != nil {
+		t.Fatalf("ProbeForWorkspace: %v", err)
+	}
+	if resolveCalls != 1 {
+		t.Fatalf("workspace resolver calls = %d, want one", resolveCalls)
+	}
+	if probed.Executable != workspaceBin || launched.Executable != workspaceBin {
+		t.Fatalf("launch executable drifted: version=%q launch=%q want %q", probed.Executable, launched.Executable, workspaceBin)
+	}
+	if probed.WorkspacePath != workspace || launched.WorkspacePath != workspace {
+		t.Fatalf("launch workspace drifted: version=%q launch=%q want %q", probed.WorkspacePath, launched.WorkspacePath, workspace)
+	}
+	if !reflect.DeepEqual(probed.Environment, launched.Environment) {
+		t.Fatalf("launch environment drifted between version and handshake")
 	}
 }
 
@@ -782,7 +1059,7 @@ func TestProbeRejectsIncompatibleProtocolBeforeCreation(t *testing.T) {
 
 func TestProbeRejectsCodexOlderThanTheTestedProtocolFloor(t *testing.T) {
 	d, _ := newTestDriver(t)
-	d.versionProbe = func(context.Context, string) (string, error) {
+	d.versionProbe = func(context.Context, LaunchContract) (string, error) {
 		return "codex-cli 0.145.9", nil
 	}
 
@@ -793,7 +1070,7 @@ func TestProbeRejectsCodexOlderThanTheTestedProtocolFloor(t *testing.T) {
 
 func TestProbeAcceptsNewerCodexVersion(t *testing.T) {
 	d, _ := newTestDriver(t)
-	d.versionProbe = func(context.Context, string) (string, error) {
+	d.versionProbe = func(context.Context, LaunchContract) (string, error) {
 		return "codex-cli 1.2.3", nil
 	}
 
@@ -821,9 +1098,27 @@ func TestInstalledCodexVersionAugmentsNodePATHForNPMLauncher(t *testing.T) {
 
 	d, _ := newTestDriver(t)
 	d.plugin = fakePlugin{bin: launcher, authStatus: ports.AgentAuthStatusAuthorized}
-	d.versionProbe = installedCodexVersion
+	d.versionProbe = probeCodexVersion
 	if _, err := d.Probe(context.Background()); err != nil {
 		t.Fatalf("Probe with augmented npm launcher: %v", err)
+	}
+}
+
+func TestInstalledCodexVersionRunsWindowsShimThroughProcessBoundary(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows command-shim boundary")
+	}
+	shim := filepath.Join(t.TempDir(), "codex.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif /i \"%~1\"==\"--version\" echo codex-cli 0.149.1\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := installedCodexVersion(context.Background(), shim)
+	if err != nil {
+		t.Fatalf("installedCodexVersion: %v", err)
+	}
+	if got != "codex-cli 0.149.1\r\n" {
+		t.Fatalf("installedCodexVersion = %q, want shim version", got)
 	}
 }
 
@@ -970,7 +1265,7 @@ func pathContainsDir(path, dir string) bool {
 
 func TestProbeRejectsUnparseableCodexVersion(t *testing.T) {
 	d, _ := newTestDriver(t)
-	d.versionProbe = func(context.Context, string) (string, error) {
+	d.versionProbe = func(context.Context, LaunchContract) (string, error) {
 		return "codex development build", nil
 	}
 
@@ -996,6 +1291,7 @@ func TestApprovalSettingsMirrorTUIPosture(t *testing.T) {
 		policy, sandbox, reviewer string
 	}{
 		{ports.PermissionModeDefault, "never", "danger-full-access", "user"},
+		{ports.PermissionModeReadOnly, "never", "read-only", "user"},
 		{ports.PermissionModeBypassPermissions, "never", "danger-full-access", "user"},
 		{ports.PermissionModeAcceptEdits, "on-request", "workspace-write", "user"},
 		{ports.PermissionModeAuto, "on-request", "workspace-write", "auto_review"},
@@ -1095,6 +1391,36 @@ func TestTurnSettingsUseTheTurnLevelWireShapes(t *testing.T) {
 	}
 }
 
+func TestTurnApprovalOverrideInvalidatesStaleNativeEvidence(t *testing.T) {
+	d, srv := newTestDriver(t)
+	srv.reply("thread/start", `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}`)
+	workspace := t.TempDir()
+	conv, err := d.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: workspace, Permissions: ports.PermissionModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+	if evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence(); evidence.ProofStatus != "PROVEN" {
+		t.Fatalf("initial native evidence = %+v, want proven", evidence)
+	}
+
+	if _, err := conv.SendTurn(context.Background(), ports.ChatUserMessage{
+		Text:     "go",
+		Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeAcceptEdits},
+	}); err != nil {
+		t.Fatalf("SendTurn: %v", err)
+	}
+	evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
+	if evidence.RequestedPermission != string(ports.PermissionModeAcceptEdits) ||
+		evidence.EffectivePermission != "unknown" || evidence.ApprovalPolicy != "unknown" ||
+		evidence.TurnSandbox != "unknown" || evidence.PreventiveCapability ||
+		evidence.ProofStatus != "UNPROVEN" {
+		t.Fatalf("native evidence after per-turn override = %+v, want fail-closed unknown posture", evidence)
+	}
+}
+
 // A caller that chooses nothing must produce exactly the payload it did before
 // per-turn settings existed: an empty field is not a value the provider has to
 // interpret.
@@ -1119,6 +1445,31 @@ func TestNoTurnSettingsSendsNoSettingsFields(t *testing.T) {
 		if _, present := params[key]; present {
 			t.Errorf("unset setting %q was sent anyway", key)
 		}
+	}
+}
+
+func TestApplyTurnSettingsPreservesExplicitEmptyEffort(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		settings ports.ChatTurnSettings
+		present  bool
+		value    string
+	}{
+		{name: "omitted"},
+		{name: "explicit default", settings: ports.ChatTurnSettings{EffortOverride: true}, present: true},
+		{name: "explicit value", settings: ports.ChatTurnSettings{Effort: "high", EffortOverride: true}, present: true, value: "high"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			params := map[string]any{}
+			applyTurnSettings(params, test.settings)
+			value, present := params["effort"]
+			if present != test.present {
+				t.Fatalf("effort presence = %v, want %v; params = %#v", present, test.present, params)
+			}
+			if present && value != test.value {
+				t.Fatalf("effort = %#v, want %q", value, test.value)
+			}
+		})
 	}
 }
 

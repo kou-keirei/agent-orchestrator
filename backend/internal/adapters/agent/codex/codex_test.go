@@ -3,10 +3,12 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -78,6 +80,24 @@ func TestCodexAuthStatusFromOutputRequiresAffirmativeEvidence(t *testing.T) {
 				t.Fatalf("auth output = (%q, %v), want (%q, %v)", status, known, tt.wantStatus, tt.wantKnown)
 			}
 		})
+	}
+}
+
+func TestAuthStatusRunsWindowsShimThroughProcessBoundary(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows command-shim boundary")
+	}
+	shim := filepath.Join(t.TempDir(), "codex.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif /i \"%~1\"==\"login\" if /i \"%~2\"==\"status\" echo Logged in using ChatGPT\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := (&Plugin{resolvedBinary: shim}).AuthStatus(context.Background())
+	if err != nil {
+		t.Fatalf("AuthStatus: %v", err)
+	}
+	if status != ports.AgentAuthStatusAuthorized {
+		t.Fatalf("AuthStatus = %q, want authorized", status)
 	}
 }
 
@@ -174,17 +194,74 @@ func sessionHookFlags(t *testing.T) []string {
 			t.Fatal(err)
 		}
 	}
+	windowsExecutable := executable
 	if runtime.GOOS == "windows" {
-		executable = `& "` + executable + `"`
+		executable = shellQuoteHookExecutable(executable)
 	} else {
 		executable = `'` + strings.ReplaceAll(executable, `'`, `'"'"'`) + `'`
 	}
 	prefix := executable + " hooks codex "
-	return []string{
-		"-c", `hooks.SessionStart=[{hooks=[{type="command",command=` + codexTOMLBasicString(prefix+"session-start") + `,timeout=5}]}]`,
-		"-c", `hooks.UserPromptSubmit=[{hooks=[{type="command",command=` + codexTOMLBasicString(prefix+"user-prompt-submit") + `,timeout=5}]}]`,
-		"-c", `hooks.PermissionRequest=[{hooks=[{type="command",command=` + codexTOMLBasicString(prefix+"permission-request") + `,timeout=5}]}]`,
-		"-c", `hooks.Stop=[{hooks=[{type="command",command=` + codexTOMLBasicString(prefix+"stop") + `,timeout=5}]}]`,
+	windowsPrefix := windowsHookExecutable(windowsExecutable) + " hooks codex "
+	flags := make([]string, 0, len(codexManagedHooks)*2)
+	for _, spec := range codexManagedHooks {
+		action := strings.TrimPrefix(spec.Command, codexHookCommandPrefix)
+		flag := `hooks.` + spec.Event + `=[{hooks=[{type="command",command=` + codexTOMLBasicString(prefix+action)
+		if runtime.GOOS == "windows" {
+			flag += `,commandWindows=` + codexTOMLBasicString(windowsPrefix+action)
+		}
+		flag += `,timeout=5}]}]`
+		flags = append(flags, "-c", flag)
+	}
+	return flags
+}
+
+func TestResolveBinaryRefreshesPastCachedLaunchPath(t *testing.T) {
+	dir := t.TempDir()
+	name := "codex"
+	content := []byte("#!/bin/sh\n")
+	mode := os.FileMode(0o755)
+	if runtime.GOOS == "windows" {
+		name = "codex.cmd"
+		content = []byte("@echo off\r\n")
+		mode = 0o600
+		t.Setenv("APPDATA", "")
+		t.Setenv("LOCALAPPDATA", "")
+		t.Setenv("USERPROFILE", t.TempDir())
+	}
+	want := filepath.Join(dir, name)
+	if err := os.WriteFile(want, content, mode); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	got, err := (&Plugin{resolvedBinary: "stale-codex-path"}).ResolveBinary(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveBinary: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveBinary = %q, want fresh path %q", got, want)
+	}
+}
+
+func TestWindowsHookCommandPreservesExecutableAndArgv(t *testing.T) {
+	executable := `C:\Users\Name With Space\AO\ao.exe`
+	got := windowsHookExecutable(executable) + " hooks codex stop"
+	want := `"` + executable + `" hooks codex stop`
+	if got != want {
+		t.Fatalf("windows hook command = %q, want %q", got, want)
+	}
+}
+
+func TestWindowsHookCommandsPreserveLegacyAnd0154Boundaries(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows hook command compatibility")
+	}
+	executable := `C:\Users\Name With Space\AO\ao.exe`
+	if got, want := shellQuoteHookExecutable(executable), `& "`+executable+`"`; got != want {
+		t.Fatalf("legacy Windows hook command = %q, want %q", got, want)
+	}
+	if got, want := windowsHookExecutable(executable), `"`+executable+`"`; got != want {
+		t.Fatalf("Codex 0.154 Windows hook command = %q, want %q", got, want)
 	}
 }
 
@@ -438,6 +515,20 @@ func TestGetLaunchCommandAppendsConfiguredEffort(t *testing.T) {
 	}
 }
 
+func TestGetLaunchCommandOmitsProviderDefaultEffort(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "codex"}
+
+	cmd, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{
+		Config: ports.AgentConfig{Effort: ""},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(cmd, "model_reasoning_effort") {
+		t.Fatalf("command %#v contains a native effort override for provider default", cmd)
+	}
+}
+
 func TestGetLaunchCommandOmitsBlankConfiguredModel(t *testing.T) {
 	plugin := &Plugin{resolvedBinary: "codex"}
 
@@ -522,6 +613,136 @@ func TestResolveCodexBinaryPrefersNPMOverWindowsAppsExecutable(t *testing.T) {
 	}
 }
 
+func TestResolveCodexBinaryFindsProjectLocalNPMNativeExecutable(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows install location")
+	}
+	project := t.TempDir()
+	t.Chdir(project)
+	t.Setenv("APPDATA", "")
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("PATH", t.TempDir())
+	shim := filepath.Join(project, "node_modules", ".bin", "codex.cmd")
+	if err := os.MkdirAll(filepath.Dir(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shim, []byte("@echo off\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(project, "node_modules", "@openai", "codex", "bin", "codex.exe")
+	if err := os.MkdirAll(filepath.Dir(want), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte("native codex"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolveCodexBinary(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveCodexBinary: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveCodexBinary = %q, want %q", got, want)
+	}
+}
+
+func TestResolveCodexBinaryForWorkspaceIgnoresDaemonCWD(t *testing.T) {
+	project := t.TempDir()
+	outside := t.TempDir()
+	t.Chdir(outside)
+	t.Setenv("PATH", t.TempDir())
+	if runtime.GOOS == "windows" {
+		t.Setenv("APPDATA", "")
+		t.Setenv("LOCALAPPDATA", "")
+		t.Setenv("USERPROFILE", outside)
+	}
+	name := "codex"
+	mode := os.FileMode(0o755)
+	if runtime.GOOS == "windows" {
+		name = "codex.cmd"
+		mode = 0o600
+	}
+	want := filepath.Join(project, "node_modules", ".bin", name)
+	if err := os.MkdirAll(filepath.Dir(want), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte("codex local shim"), mode); err != nil {
+		t.Fatal(err)
+	}
+
+	origFileExists := fileExists
+	fileExists = func(path string) bool {
+		return strings.HasPrefix(filepath.Clean(path), filepath.Clean(project)+string(os.PathSeparator)) && origFileExists(path)
+	}
+	t.Cleanup(func() { fileExists = origFileExists })
+
+	got, err := ResolveCodexBinaryForWorkspace(context.Background(), project)
+	if err != nil {
+		t.Fatalf("ResolveCodexBinaryForWorkspace: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveCodexBinaryForWorkspace = %q, want %q", got, want)
+	}
+	gotCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCWD != outside {
+		t.Fatalf("resolver changed process CWD to %q, want %q", gotCWD, outside)
+	}
+}
+
+func TestWindowsCodexTargetMatchesNPMPlatformPackages(t *testing.T) {
+	tests := []struct {
+		arch         string
+		packageName  string
+		targetTriple string
+	}{
+		{arch: "amd64", packageName: "codex-win32-x64", targetTriple: "x86_64-pc-windows-msvc"},
+		{arch: "arm64", packageName: "codex-win32-arm64", targetTriple: "aarch64-pc-windows-msvc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.arch, func(t *testing.T) {
+			got, ok := windowsCodexTargetForArch(tt.arch)
+			if !ok || got.npmPackage != tt.packageName || got.targetTriple != tt.targetTriple {
+				t.Fatalf("windowsCodexTargetForArch(%q) = %#v, %v", tt.arch, got, ok)
+			}
+		})
+	}
+	if _, ok := windowsCodexTargetForArch("386"); ok {
+		t.Fatal("windowsCodexTargetForArch(386) unexpectedly returned a target")
+	}
+}
+
+func TestWindowsNativeCodexCandidatesMatchCodex0154NPMLayouts(t *testing.T) {
+	shim := filepath.Join("prefix", "codex.cmd")
+	root := filepath.Join("prefix", "node_modules", "@openai", "codex")
+	want := []string{
+		filepath.Join(root, "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
+		filepath.Join("prefix", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
+		filepath.Join(root, "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
+		filepath.Join(root, "bin", "codex.exe"),
+	}
+	got := windowsNativeCodexCandidatesForShimWithArch(shim, "amd64")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("windowsNativeCodexCandidatesForShimWithArch = %#v, want %#v", got, want)
+	}
+
+	arm := windowsNativeCodexCandidatesForShimWithArch(shim, "arm64")
+	if !strings.Contains(strings.Join(arm, "\n"), "codex-win32-arm64") || !strings.Contains(strings.Join(arm, "\n"), "aarch64-pc-windows-msvc") {
+		t.Fatalf("arm64 candidates = %#v, want Codex arm64 package and target", arm)
+	}
+}
+
+func TestWindowsNativeCodexCandidatesMatchProjectLocalBinLayout(t *testing.T) {
+	shim := filepath.Join("project", "node_modules", ".bin", "codex.cmd")
+	root := filepath.Join("project", "node_modules", "@openai", "codex")
+	want := filepath.Join(root, "bin", "codex.exe")
+	if !slices.Contains(windowsNativeCodexCandidatesForShimWithArch(shim, "amd64"), want) {
+		t.Fatalf("project-local candidates = %#v, want %q", windowsNativeCodexCandidatesForShimWithArch(shim, "amd64"), want)
+	}
+}
+
 func TestGetLaunchCommandMapsApprovalModes(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -574,6 +795,20 @@ func TestGetLaunchCommandMapsApprovalModes(t *testing.T) {
 				t.Fatalf("command %#v contains %q", cmd, tt.notExpected)
 			}
 		})
+	}
+}
+
+func TestCodexTUIRejectsReadOnlyAtAdapterBoundary(t *testing.T) {
+	plugin := &Plugin{resolvedBinary: "codex"}
+	if _, err := plugin.GetLaunchCommand(context.Background(), ports.LaunchConfig{Permissions: ports.PermissionModeReadOnly}); !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("launch error = %v, want ErrChatPermissionModeUnsupported", err)
+	}
+	_, ok, err := plugin.GetRestoreCommand(context.Background(), ports.RestoreConfig{
+		Permissions: ports.PermissionModeReadOnly,
+		Session:     ports.SessionRef{ID: "session", Metadata: map[string]string{ports.MetadataKeyAgentSessionID: "thread"}},
+	})
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) || ok {
+		t.Fatalf("restore = (%v, %t), want read-only refusal", err, ok)
 	}
 }
 

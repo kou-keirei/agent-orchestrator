@@ -404,6 +404,7 @@ func TestDoctorJSONOutputIsDecodable(t *testing.T) {
 			}
 			return "", errors.New("missing")
 		},
+		ResolveCodexBinary: func(context.Context) (string, error) { return "", errors.New("codex missing") },
 		CommandOutput: func(_ context.Context, name string, _ ...string) ([]byte, error) {
 			if name == "/bin/tmux" {
 				return []byte("tmux 3.3a\n"), nil
@@ -441,6 +442,7 @@ func TestDoctorTextOutputIsGrouped(t *testing.T) {
 			}
 			return "", errors.New("missing")
 		},
+		ResolveCodexBinary: func(context.Context) (string, error) { return "", errors.New("codex missing") },
 		CommandOutput: func(_ context.Context, name string, _ ...string) ([]byte, error) {
 			if name == "/bin/tmux" {
 				return []byte("tmux 3.3a\n"), nil
@@ -657,6 +659,13 @@ func doctorContext(t *testing.T, paths map[string]string, commandOutput func(con
 			}
 			return path, nil
 		},
+		ResolveCodexBinary: func(context.Context) (string, error) {
+			path, ok := paths["codex"]
+			if !ok || path == "" {
+				return "", errors.New("codex missing")
+			}
+			return path, nil
+		},
 		ProcessAlive: func(int) bool { return false },
 	}
 	if commandOutput != nil {
@@ -718,6 +727,36 @@ func TestDoctorCodexLaunchFlagsPass(t *testing.T) {
 	check := findDoctorCheck(t, c.runDoctor(context.Background()), "codex-launch-flags")
 	if check.Level != doctorPass || !strings.Contains(check.Message, "accepts") {
 		t.Fatalf("canary = %+v, want PASS accepts", check)
+	}
+}
+
+func TestResolveCodexBinaryUsesInjectedResolver(t *testing.T) {
+	called := false
+	c := &commandContext{deps: Deps{
+		LookPath: func(string) (string, error) { return "PATH", nil },
+		ResolveCodexBinary: func(context.Context) (string, error) {
+			called = true
+			return "native-codex.exe", nil
+		},
+	}.withDefaults()}
+	got, err := c.resolveCodexBinary(context.Background())
+	if err != nil || got != "native-codex.exe" || !called {
+		t.Fatalf("injected Codex resolution = %q, %v, called=%t", got, err, called)
+	}
+}
+
+func TestResolveCodexBinaryFallsBackToLookPath(t *testing.T) {
+	c := &commandContext{deps: Deps{
+		LookPath: func(name string) (string, error) {
+			if name != "codex" {
+				t.Fatalf("LookPath name = %q, want codex", name)
+			}
+			return "codex-on-path", nil
+		},
+	}.withDefaults()}
+	got, err := c.resolveCodexBinary(context.Background())
+	if err != nil || got != "codex-on-path" {
+		t.Fatalf("fallback Codex resolution = %q, %v", got, err)
 	}
 }
 

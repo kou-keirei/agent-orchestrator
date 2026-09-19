@@ -39,9 +39,10 @@ func (l integrationChatLauncher) SupportsChat(harness domain.AgentHarness) bool 
 func (l integrationChatLauncher) PreflightChat(
 	ctx context.Context,
 	harness domain.AgentHarness,
+	workspacePath string,
 	permissions ports.PermissionMode,
 ) error {
-	return l.service.PreflightChat(ctx, harness, permissions)
+	return l.service.PreflightChat(ctx, harness, workspacePath, permissions)
 }
 
 func (l integrationChatLauncher) StartChat(ctx context.Context, cfg ChatStart) (ChatStarted, error) {

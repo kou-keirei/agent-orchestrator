@@ -33,6 +33,7 @@ func TestResumeNamespacesRepeatedNativeHistoryByOwnershipScope(t *testing.T) {
 		threadID := []string{"thread-A", "thread-B", "thread-A"}[i]
 		d, srv := newTestDriver(t)
 		srv.reply("thread/fork", `{"thread":{"id":"child"}}`)
+		srv.reply("thread/resume", `{"thread":{"id":"`+threadID+`"},"approvalPolicy":"on-request","sandbox":{"type":"workspace-write"}}`)
 		provider, err := d.Resume(ctx, ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: threadID, ProviderScopeID: scope, ProviderIDsScoped: true})
 		if err != nil {
 			t.Fatal(err)

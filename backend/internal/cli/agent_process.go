@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
 const supervisedExitReportTimeout = 5 * time.Second
@@ -56,7 +57,7 @@ func newAgentProcessSuperviseCommand(ctx *commandContext) *cobra.Command {
 }
 
 func (c *commandContext) runSupervisedProcess(ctx context.Context, sessionID, launchID string, argv []string) {
-	child := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // argv is constructed by the selected agent adapter.
+	child := aoprocess.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // argv is constructed by the selected agent adapter.
 	child.Stdin = c.deps.In
 	child.Stdout = c.deps.Out
 	child.Stderr = c.deps.Err

@@ -60,6 +60,10 @@ func (s *Service) DelegateTask(ctx context.Context, in DelegateTaskInput) (Deleg
 	if strings.TrimSpace(prompt) == "" {
 		prompt = ""
 	}
+	permissions, err := s.delegatedWorkerPermissions(ctx, in.ProjectID, in.ApprovalMode)
+	if err != nil {
+		return DelegateTaskOutcome{}, err
+	}
 
 	effort, effortOverride := optionalTuningValue(in.Effort)
 	worker, _, _, err := s.manager.Spawn(ctx, ports.SpawnConfig{
@@ -71,7 +75,7 @@ func (s *Service) DelegateTask(ctx context.Context, in DelegateTaskInput) (Deleg
 		AgentConfig: ports.AgentConfig{
 			Model:       strings.TrimSpace(in.Model),
 			Effort:      effort,
-			Permissions: in.ApprovalMode,
+			Permissions: permissions,
 		},
 		EffortOverride: effortOverride,
 		RequestedMode:  in.RequestedMode,
@@ -88,6 +92,40 @@ func (s *Service) DelegateTask(ctx context.Context, in DelegateTaskInput) (Deleg
 		s.refineDelegatedTaskTitleInBackground(worker.ID, in)
 	}
 	return DelegateTaskOutcome{WorkerID: worker.ID}, nil
+}
+
+// delegatedWorkerPermissions applies the immutable floor of the project
+// orchestrator to a delegated worker before Spawn can create durable state.
+// The newest active orchestrator is the same coordinator selected for title
+// refinement; no second ownership or authority store is introduced here.
+func (s *Service) delegatedWorkerPermissions(ctx context.Context, projectID domain.ProjectID, requested domain.PermissionMode) (domain.PermissionMode, error) {
+	orchestrators, err := s.activeOrchestrators(ctx, projectID)
+	if err != nil {
+		return "", fmt.Errorf("list project orchestrators: %w", err)
+	}
+	if len(orchestrators) == 0 {
+		if !requested.Valid() {
+			return "", fmt.Errorf("invalid delegated permission mode %q", requested)
+		}
+		return requested, nil
+	}
+	running := make([]domain.Session, 0, len(orchestrators))
+	for _, orchestrator := range orchestrators {
+		if orchestrator.Activity.State != domain.ActivityExited {
+			running = append(running, orchestrator)
+		}
+	}
+	parent := newestSession(orchestrators)
+	if len(running) > 0 {
+		parent = newestSession(running)
+	}
+	if !parent.Metadata.Permissions.Valid() {
+		return "", fmt.Errorf("invalid orchestrator permission floor %q", parent.Metadata.Permissions)
+	}
+	if !requested.Valid() {
+		return "", fmt.Errorf("invalid delegated permission mode %q", requested)
+	}
+	return domain.ApplyPermissionFloor(parent.Metadata.Permissions, requested), nil
 }
 
 func optionalTuningValue(value *string) (string, bool) {

@@ -2574,6 +2574,49 @@ func TestACPDriverExposesAndMutatesAdvertisedConfigOptions(t *testing.T) {
 	}
 }
 
+func TestACPDriverForwardsExplicitEmptyEffortAtStart(t *testing.T) {
+	agent := &fakeAgent{}
+	validated := ports.ChatTurnSettings{}
+	driver := New(Config{
+		Harness:      domain.HarnessClaudeCode,
+		Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true},
+		Probe:        func(context.Context) error { return nil },
+		Launch:       func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+		SessionOptions: func(settings ports.ChatTurnSettings) []SessionOption {
+			if !settings.EffortOverride {
+				return nil
+			}
+			return []SessionOption{{ID: "effort", Value: settings.Effort, AllowEmpty: settings.Effort == ""}}
+		},
+		ValidateTurnSettings: func(_ ports.PermissionMode, settings ports.ChatTurnSettings) error {
+			validated = settings
+			return nil
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	driver.useTestProcess(fakeSpawn(agent))
+
+	conv, err := driver.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: t.TempDir(), EffortOverride: true,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer conv.Close()
+
+	agent.mu.Lock()
+	value, present, calls := agent.options["effort"], false, agent.setCalls
+	if agent.options != nil {
+		_, present = agent.options["effort"]
+	}
+	agent.mu.Unlock()
+	if !validated.EffortOverride {
+		t.Fatal("validator did not receive EffortOverride")
+	}
+	if !present || value != "" || calls != 1 {
+		t.Fatalf("provider effort = %q (present=%t) across %d calls, want explicit empty once", value, present, calls)
+	}
+}
+
 func TestACPDriverConsumesLegacyKimiSelectorsOnSDK0135(t *testing.T) {
 	agent := &legacyKimiAgent{}
 	driver := New(Config{

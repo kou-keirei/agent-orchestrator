@@ -121,6 +121,7 @@ func (l *recordingLauncher) SupportsChat(_ domain.AgentHarness) bool { return tr
 func (l *recordingLauncher) PreflightChat(
 	_ context.Context,
 	harness domain.AgentHarness,
+	_ string,
 	permissions ports.PermissionMode,
 ) error {
 	l.preflighted = append(l.preflighted, harness)
@@ -955,6 +956,96 @@ func TestDefaultChatSpawnFallbackSkipsChatTuningResolution(t *testing.T) {
 	}
 }
 
+func TestDefaultChatSpawnFallbackPreservesEffortPresence(t *testing.T) {
+	tests := []struct {
+		name           string
+		effort         string
+		effortOverride bool
+		wantEffort     string
+	}{
+		{name: "omitted inherits project effort", wantEffort: "high"},
+		{name: "explicit empty selects provider default", effortOverride: true},
+		{name: "explicit value forwards exact effort", effort: "low", effortOverride: true, wantEffort: "low"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			launcher := &recordingLauncher{preflightErr: ports.ErrChatDriverUnavailable}
+			mgr, store, runtime := newChatManager(launcher)
+			mgr.defaults = fixedSessionModeDefaults(domain.SessionModeChat)
+			project := store.projects[string(chatTestProject)]
+			project.Config.Worker.AgentConfig.Effort = "high"
+			store.projects[string(chatTestProject)] = project
+			agent := &recordingAgent{}
+			mgr.agents = singleAgent{agent: agent}
+
+			rec, _, _, err := mgr.Spawn(context.Background(), ports.SpawnConfig{
+				ProjectID:      chatTestProject,
+				Kind:           domain.KindWorker,
+				Harness:        domain.HarnessCodex,
+				AgentConfig:    ports.AgentConfig{Effort: test.effort},
+				EffortOverride: test.effortOverride,
+			})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			if rec.Mode != domain.SessionModeTUI {
+				t.Fatalf("mode = %q, want TUI fallback", rec.Mode)
+			}
+			if runtime.created == 0 {
+				t.Fatal("TUI fallback created no terminal runtime")
+			}
+			if got := agent.lastConfig.Effort; got != test.wantEffort {
+				t.Fatalf("launch effort = %q, want %q", got, test.wantEffort)
+			}
+		})
+	}
+}
+
+func TestChatSpawnPreservesEffortPresence(t *testing.T) {
+	tests := []struct {
+		name           string
+		effort         string
+		effortOverride bool
+		wantEffort     string
+	}{
+		{name: "omitted inherits project effort", wantEffort: "high"},
+		{name: "explicit empty selects provider default", effortOverride: true},
+		{name: "explicit value forwards exact effort", effort: "low", effortOverride: true, wantEffort: "low"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			launcher := &recordingLauncher{}
+			mgr, store, runtime := newChatManager(launcher)
+			mgr.defaults = fixedSessionModeDefaults(domain.SessionModeChat)
+			project := store.projects[string(chatTestProject)]
+			project.Config.Worker.AgentConfig.Effort = "high"
+			store.projects[string(chatTestProject)] = project
+
+			rec, _, _, err := mgr.Spawn(context.Background(), ports.SpawnConfig{
+				ProjectID:      chatTestProject,
+				Kind:           domain.KindWorker,
+				Harness:        domain.HarnessCodex,
+				RequestedMode:  domain.SessionModeChat,
+				AgentConfig:    ports.AgentConfig{Effort: test.effort},
+				EffortOverride: test.effortOverride,
+			})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			if rec.Mode != domain.SessionModeChat || runtime.created != 0 {
+				t.Fatalf("mode/runtime = %q/%d, want Chat/0", rec.Mode, runtime.created)
+			}
+			if len(launcher.started) != 1 {
+				t.Fatalf("Chat starts = %d, want 1", len(launcher.started))
+			}
+			start := launcher.started[0]
+			if start.Effort != test.wantEffort || start.EffortOverride != test.effortOverride {
+				t.Fatalf("Chat effort/override = %q/%t, want %q/%t", start.Effort, start.EffortOverride, test.wantEffort, test.effortOverride)
+			}
+		})
+	}
+}
+
 func TestDefaultChatSpawnReturnsUnexpectedPreflightError(t *testing.T) {
 	preflightErr := errors.New("probe state corrupted")
 	launcher := &recordingLauncher{preflightErr: preflightErr}
@@ -1010,6 +1101,56 @@ func TestDefaultChatSpawnUsesChatWhenAvailable(t *testing.T) {
 	if len(launcher.preflightPermissions) != 1 ||
 		launcher.preflightPermissions[0] != ports.PermissionModeBypassPermissions {
 		t.Fatalf("preflight permissions = %v, want bypass-permissions", launcher.preflightPermissions)
+	}
+}
+
+func TestReadOnlyChatSpawnPinsPermissionForProvider(t *testing.T) {
+	launcher := &recordingLauncher{}
+	mgr, _, runtime := newChatManager(launcher)
+
+	rec, _, _, err := mgr.Spawn(context.Background(), ports.SpawnConfig{
+		ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+		RequestedMode: domain.SessionModeChat,
+		AgentConfig:   ports.AgentConfig{Permissions: ports.PermissionModeReadOnly},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if runtime.created != 0 {
+		t.Fatalf("read-only Chat spawn created %d terminal runtimes, want 0", runtime.created)
+	}
+	if rec.Metadata.Permissions != ports.PermissionModeReadOnly {
+		t.Fatalf("stored permissions = %q, want read-only", rec.Metadata.Permissions)
+	}
+	if len(launcher.started) != 1 || launcher.started[0].Permissions != ports.PermissionModeReadOnly {
+		t.Fatalf("Chat starts = %+v, want one read-only start", launcher.started)
+	}
+	if launcher.started[0].Env["AO_PERMISSION_MODE"] != string(ports.PermissionModeReadOnly) {
+		t.Fatalf("AO_PERMISSION_MODE = %q, want read-only", launcher.started[0].Env["AO_PERMISSION_MODE"])
+	}
+}
+
+func TestReadOnlyTUISpawnFailsBeforeDurableState(t *testing.T) {
+	launcher := &recordingLauncher{}
+	mgr, store, runtime := newChatManager(launcher)
+
+	_, _, _, err := mgr.Spawn(context.Background(), ports.SpawnConfig{
+		ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+		RequestedMode: domain.SessionModeTUI,
+		AgentConfig:   ports.AgentConfig{Permissions: ports.PermissionModeReadOnly},
+	})
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("Spawn error = %v, want read-only Chat boundary refusal", err)
+	}
+	if runtime.created != 0 || len(launcher.started) != 0 {
+		t.Fatalf("unsupported read-only TUI touched runtime=%d Chat starts=%d", runtime.created, len(launcher.started))
+	}
+	sessions, listErr := store.ListAllSessions(context.Background())
+	if listErr != nil {
+		t.Fatalf("ListAllSessions: %v", listErr)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("unsupported read-only TUI left %d sessions, want 0", len(sessions))
 	}
 }
 

@@ -175,6 +175,9 @@ type Controller struct {
 	conversation domain.ConversationRecord
 	generation   string
 	harness      domain.AgentHarness
+	// permissionFloor is the immutable session policy recorded at creation. Live
+	// conversation settings may select model or effort, but never broaden it.
+	permissionFloor ports.PermissionMode
 
 	conv                   ports.ChatConversation
 	store                  Store
@@ -287,11 +290,35 @@ var ErrRetryContentInvalid = errors.New("stored retry content is invalid")
 // prompt remains visible, but the new provider may negotiate fewer capabilities.
 var ErrRetryUnsupported = errors.New("current agent cannot retry this prompt content")
 
+func validatePermissionMode(caps ports.ChatCapabilities, mode ports.PermissionMode) error {
+	if !mode.Valid() {
+		return fmt.Errorf("%w: unknown permission mode %q", ports.ErrChatPermissionModeUnsupported, mode)
+	}
+	if mode == ports.PermissionModeReadOnly && !caps.Has(ports.ChatCapabilityPreventiveReadOnly) {
+		return fmt.Errorf("%w: %q requires %s", ports.ErrChatPermissionModeUnsupported,
+			mode, ports.ChatCapabilityPreventiveReadOnly)
+	}
+	return nil
+}
+
+func validatePermissionFloor(floor, requested ports.PermissionMode) error {
+	if _, err := domain.ResolvePermissionMode(floor, requested); err != nil {
+		return fmt.Errorf("%w: %w", ports.ErrChatPermissionModeUnsupported, err)
+	}
+	return nil
+}
+
+func applyPermissionFloor(floor ports.PermissionMode, settings domain.ConversationSettings) domain.ConversationSettings {
+	settings.ApprovalMode = domain.ApplyPermissionFloor(floor, settings.ApprovalMode)
+	return settings
+}
+
 func newController(
 	sessionID domain.SessionID,
 	conversation domain.ConversationRecord,
 	generation string,
 	harness domain.AgentHarness,
+	permissionFloor ports.PermissionMode,
 	conv ports.ChatConversation,
 	store Store,
 	activity ActivityRecorder,
@@ -301,11 +328,13 @@ func newController(
 	onAccountChanged func(domain.SessionID, string, domain.AgentHarness),
 	onCodexCapacityChanged func(domain.SessionID, string, ports.CodexCapacityObservation),
 ) *Controller {
+	conversation.Settings = applyPermissionFloor(permissionFloor, conversation.Settings)
 	c := &Controller{
 		sessionID:              sessionID,
 		conversation:           conversation,
 		generation:             generation,
 		harness:                harness,
+		permissionFloor:        permissionFloor,
 		conv:                   conv,
 		store:                  store,
 		activity:               activity,
@@ -339,6 +368,9 @@ func newController(
 	}
 	return c
 }
+
+// PermissionFloor reports the immutable session policy.
+func (c *Controller) PermissionFloor() ports.PermissionMode { return c.permissionFloor }
 
 // restoreLiveTurnOwnership rebuilds the volatile busy gate from durable facts
 // before a replacement daemon publishes a reconnected controller. The provider
@@ -1269,6 +1301,15 @@ func (c *Controller) Capabilities() ports.ChatCapabilities {
 	return c.conv.Capabilities()
 }
 
+// NativeEvidence returns provider-owned posture when the active driver exposes
+// it, otherwise an explicit unproven record.
+func (c *Controller) NativeEvidence() ports.ChatNativeEvidence {
+	if reader, ok := c.conv.(ports.ChatNativeEvidenceReader); ok {
+		return reader.NativeEvidence()
+	}
+	return unprovenNativeEvidence(c.harness, c.permissionFloor)
+}
+
 // Send records a message and dispatches it, or queues it if the agent is busy.
 //
 // The durable record is written first: if the provider call then fails, the user
@@ -1296,6 +1337,13 @@ func (c *Controller) sendLocked(
 	c.mu.Unlock()
 	if handoff {
 		return domain.ConversationTurn{}, ErrControllerHandoff
+	}
+	settings := c.turnSettings()
+	if err := validatePermissionFloor(c.permissionFloor, settings.Approval); err != nil {
+		return domain.ConversationTurn{}, err
+	}
+	if err := validatePermissionMode(c.Capabilities(), settings.Approval); err != nil {
+		return domain.ConversationTurn{}, err
 	}
 
 	now := c.now()
@@ -1362,6 +1410,13 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	defer c.sendMu.Unlock()
 	if c.handoffActive() {
 		return domain.ConversationTurn{}, ErrControllerHandoff
+	}
+	settings := c.turnSettings()
+	if err := validatePermissionFloor(c.permissionFloor, settings.Approval); err != nil {
+		return domain.ConversationTurn{}, err
+	}
+	if err := validatePermissionMode(c.Capabilities(), settings.Approval); err != nil {
+		return domain.ConversationTurn{}, err
 	}
 
 	source, err := c.store.TurnByID(ctx, turnID)
@@ -1504,6 +1559,32 @@ func (c *Controller) Settings() domain.ConversationSettings {
 // The row is written first: if that fails, the in-memory copy must not move, or a
 // restart would silently revert a choice the user watched take effect.
 func (c *Controller) SetSettings(ctx context.Context, settings domain.ConversationSettings) error {
+	// Settings are part of the intake boundary. Serialize the check and durable
+	// write with ArmHandoff so an armed transition cannot change provider posture
+	// while source ownership is being transferred.
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return c.setSettingsLocked(ctx, settings)
+}
+
+// setSettingsLocked is the settings mutation shared by the turn-settings and
+// provider-config paths. Callers must hold sendMu; that lock is also the
+// linearization point with ArmHandoff, so a live provider mutation cannot occur
+// after the source controller has been frozen.
+func (c *Controller) setSettingsLocked(ctx context.Context, settings domain.ConversationSettings) error {
+	c.mu.Lock()
+	handoff := c.handoff != controllerHandoffNone
+	c.mu.Unlock()
+	if handoff {
+		return ErrControllerHandoff
+	}
+	if err := validatePermissionFloor(c.permissionFloor, settings.ApprovalMode); err != nil {
+		return err
+	}
+	settings = applyPermissionFloor(c.permissionFloor, settings)
+	if err := validatePermissionMode(c.Capabilities(), settings.ApprovalMode); err != nil {
+		return err
+	}
 	if err := c.store.SetConversationSettings(ctx, c.conversation.ID, settings, c.now()); err != nil {
 		return fmt.Errorf("record conversation settings: %w", err)
 	}
@@ -1515,11 +1596,12 @@ func (c *Controller) SetSettings(ctx context.Context, settings domain.Conversati
 
 // turnSettings converts the stored choices into what a driver takes per turn.
 func (c *Controller) turnSettings() ports.ChatTurnSettings {
-	current := c.Settings()
+	current := applyPermissionFloor(c.permissionFloor, c.Settings())
 	return ports.ChatTurnSettings{
-		Model:    current.Model,
-		Effort:   current.ReasoningEffort,
-		Approval: current.ApprovalMode,
+		Model:          current.Model,
+		Effort:         current.ReasoningEffort,
+		EffortOverride: current.ReasoningEffortSet,
+		Approval:       current.ApprovalMode,
 	}
 }
 
@@ -1575,6 +1657,36 @@ func (c *Controller) dispatch(
 	// setting that only applied when the user pressed send would silently stop
 	// applying exactly when they were not watching.
 	msg.Settings = c.turnSettings()
+	if err := validatePermissionFloor(c.permissionFloor, msg.Settings.Approval); err != nil {
+		completedAt := c.now()
+		if settleErr := c.store.SettleTurnByID(ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
+			c.log.Error("failed to settle turn after permission validation error", "error", settleErr)
+		}
+		return domain.ConversationTurn{
+			ID:                 turnID,
+			ConversationID:     c.conversation.ID,
+			HandledBySessionID: c.sessionID,
+			State:              domain.TurnStateFailed,
+			ErrorMessage:       err.Error(),
+			RequestedAt:        requestedAt,
+			CompletedAt:        &completedAt,
+		}, fmt.Errorf("send turn: %w", err)
+	}
+	if err := validatePermissionMode(c.Capabilities(), msg.Settings.Approval); err != nil {
+		completedAt := c.now()
+		if settleErr := c.store.SettleTurnByID(ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
+			c.log.Error("failed to settle turn after permission validation error", "error", settleErr)
+		}
+		return domain.ConversationTurn{
+			ID:                 turnID,
+			ConversationID:     c.conversation.ID,
+			HandledBySessionID: c.sessionID,
+			State:              domain.TurnStateFailed,
+			ErrorMessage:       err.Error(),
+			RequestedAt:        requestedAt,
+			CompletedAt:        &completedAt,
+		}, fmt.Errorf("send turn: %w", err)
+	}
 
 	c.mu.Lock()
 	c.dispatchingTurnID = turnID

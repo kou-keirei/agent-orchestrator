@@ -154,8 +154,10 @@ func sessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOption {
 	if settings.Model != "" {
 		options = append(options, acpdriver.SessionOption{ID: "model", Value: settings.Model})
 	}
-	if settings.Effort != "" {
-		options = append(options, acpdriver.SessionOption{ID: "thought_level", Value: settings.Effort})
+	if settings.EffortOverride || settings.Effort != "" {
+		options = append(options, acpdriver.SessionOption{
+			ID: "thought_level", Value: settings.Effort, AllowEmpty: settings.EffortOverride && settings.Effort == "",
+		})
 	}
 	return options
 }

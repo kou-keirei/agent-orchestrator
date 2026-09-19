@@ -34,6 +34,9 @@ func TestCodexLoginRunsSelectedNativeLoginMethod(t *testing.T) {
 				Out:      &stdout,
 				Err:      &stdout,
 				LookPath: func(string) (string, error) { return "/usr/local/bin/codex", nil },
+				ResolveCodexBinary: func(context.Context) (string, error) {
+					return "/usr/local/bin/codex", nil
+				},
 				ReadSecret: func(io.Reader) ([]byte, error) {
 					return []byte(tt.secret), nil
 				},
@@ -101,7 +104,10 @@ func TestCodexLoginReportsMissingBinaryAndNativeFailure(t *testing.T) {
 	}{
 		{
 			name: "missing binary",
-			deps: Deps{LookPath: func(string) (string, error) { return "", errors.New("missing") }},
+			deps: Deps{
+				LookPath:           func(string) (string, error) { return "", errors.New("missing") },
+				ResolveCodexBinary: func(context.Context) (string, error) { return "", errors.New("missing") },
+			},
 			want: "codex CLI is not installed",
 		},
 		{
@@ -109,6 +115,9 @@ func TestCodexLoginReportsMissingBinaryAndNativeFailure(t *testing.T) {
 			deps: Deps{
 				In:       strings.NewReader("1\n"),
 				LookPath: func(string) (string, error) { return "/codex", nil },
+				ResolveCodexBinary: func(context.Context) (string, error) {
+					return "/codex", nil
+				},
 				RunInteractiveCommand: func(context.Context, string, []string, io.Reader, io.Writer, io.Writer) error {
 					return errors.New("exit status 1")
 				},

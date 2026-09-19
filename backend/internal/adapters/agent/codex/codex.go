@@ -23,14 +23,17 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/agentbase"
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/binaryutil"
+	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/pkg/agentruntime"
 )
 
-// Plugin is the Codex agent adapter. It is safe for concurrent use; the binary
-// path is resolved once and cached under binaryMu.
+// Plugin is the Codex agent adapter. It is safe for concurrent use; session
+// launch/auth calls cache their resolved binary under binaryMu, while the
+// AgentBinaryResolver surface performs a fresh lookup for preflight and cache
+// invalidation.
 type Plugin struct {
 	agentbase.Base
 	binaryMu       sync.Mutex
@@ -117,7 +120,13 @@ func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
 // instructions, and the initial prompt (passed after `--` so a leading "-" is
 // not read as a flag).
 func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (cmd []string, err error) {
-	binary, err := p.codexBinary(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if cfg.Permissions == ports.PermissionModeReadOnly {
+		return nil, fmt.Errorf("%w: Codex TUI has no enforced read-only boundary", ports.ErrChatPermissionModeUnsupported)
+	}
+	binary, err := p.codexBinary(ctx, cfg.WorkspacePath)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +158,9 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	if cfg.Permissions == ports.PermissionModeReadOnly {
+		return nil, false, fmt.Errorf("%w: Codex TUI has no enforced read-only boundary", ports.ErrChatPermissionModeUnsupported)
+	}
 	if _, ok := agentruntime.RestoreIdentity(
 		agentruntime.HarnessCodex,
 		cfg.Session.ID,
@@ -156,7 +168,7 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	); !ok {
 		return nil, false, nil
 	}
-	binary, err := p.codexBinary(ctx)
+	binary, err := p.codexBinary(ctx, cfg.Session.WorkspacePath)
 	if err != nil {
 		return nil, false, err
 	}
@@ -301,14 +313,22 @@ func codexRolloutNameMatches(name, nativeConversationID string) bool {
 
 // AuthStatus checks Codex's local login state without making a model call.
 func (p *Plugin) AuthStatus(ctx context.Context) (ports.AgentAuthStatus, error) {
-	binary, err := p.codexBinary(ctx)
+	workspace, err := agentlaunch.FinalWorkspacePath("")
 	if err != nil {
 		return ports.AgentAuthStatusUnknown, err
 	}
+	binary, err := p.codexBinary(ctx, workspace)
+	if err != nil {
+		return ports.AgentAuthStatusUnknown, err
+	}
+	env := agentlaunch.CodexEnvironment(ctx, binary, nil)
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	out, err := aoprocess.CommandContext(probeCtx, binary, "login", "status").CombinedOutput()
+	cmd := aoprocess.CommandContext(probeCtx, binary, "login", "status")
+	cmd.Dir = workspace
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
 	if probeCtx.Err() != nil {
 		return ports.AgentAuthStatusUnknown, probeCtx.Err()
 	}
@@ -336,12 +356,43 @@ func codexAuthStatusFromOutput(out []byte) (ports.AgentAuthStatus, bool) {
 // ResolveCodexBinary returns the path to the codex binary on this machine,
 // searching platform-specific well-known install locations and PATH.
 func ResolveCodexBinary(ctx context.Context) (string, error) {
+	return resolveCodexBinary(ctx, "")
+}
+
+// ResolveCodexBinaryForWorkspace resolves Codex using the supplied project or
+// session workspace as the local-install root. The explicit path is important
+// for a daemon whose process directory is unrelated to the workspace it starts.
+// Invalid or empty paths retain the legacy machine-wide discovery behavior.
+func ResolveCodexBinaryForWorkspace(ctx context.Context, workspacePath string) (string, error) {
+	workspacePath = strings.TrimSpace(workspacePath)
+	if workspacePath == "" || !filepath.IsAbs(workspacePath) {
+		return ResolveCodexBinary(ctx)
+	}
+	return resolveCodexBinary(ctx, filepath.Clean(workspacePath))
+}
+
+func resolveCodexBinary(ctx context.Context, workspacePath string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 
 	if runtime.GOOS == "windows" {
 		candidates := []string{}
+		// A daemon started from a project may have npm's local shim available
+		// only as <project>/node_modules/.bin/codex.cmd. Search those layouts
+		// before global locations so the local install wins as it would on PATH.
+		if workspacePath == "" {
+			var err error
+			workspacePath, err = os.Getwd()
+			if err != nil {
+				return "", err
+			}
+		}
+		if local, ok, err := resolveWorkspaceCodexBinary(ctx, workspacePath); err != nil {
+			return "", err
+		} else if ok {
+			return local, nil
+		}
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			shim := filepath.Join(appData, "npm", "codex.cmd")
 			candidates = append(candidates, windowsNativeCodexCandidatesForShim(shim)...)
@@ -382,6 +433,11 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 	if path, err := exec.LookPath("codex"); err == nil && path != "" {
 		return path, nil
 	}
+	if local, ok, err := resolveWorkspaceCodexBinary(ctx, workspacePath); err != nil {
+		return "", err
+	} else if ok {
+		return local, nil
+	}
 
 	candidates := []string{
 		"/usr/local/bin/codex",
@@ -414,6 +470,37 @@ func ResolveCodexBinary(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("codex: %w", ports.ErrAgentBinaryNotFound)
 }
 
+func resolveWorkspaceCodexBinary(ctx context.Context, workspacePath string) (string, bool, error) {
+	if workspacePath == "" || !filepath.IsAbs(workspacePath) {
+		return "", false, nil
+	}
+	for _, dir := range windowsProjectBinDirectories(workspacePath) {
+		if runtime.GOOS == "windows" {
+			shim := filepath.Join(dir, "codex.cmd")
+			for _, candidate := range windowsNativeCodexCandidatesForShim(shim) {
+				if fileExists(candidate) {
+					return resolveNativeWindowsCodex(candidate), true, nil
+				}
+				if err := ctx.Err(); err != nil {
+					return "", false, err
+				}
+			}
+			if fileExists(shim) {
+				return resolveNativeWindowsCodex(shim), true, nil
+			}
+		} else {
+			candidate := filepath.Join(dir, "codex")
+			if fileExists(candidate) {
+				return candidate, true, nil
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+	}
+	return "", false, nil
+}
+
 func resolveNativeWindowsCodex(path string) string {
 	if runtime.GOOS != "windows" || !strings.EqualFold(filepath.Ext(path), ".cmd") {
 		return path
@@ -423,15 +510,94 @@ func resolveNativeWindowsCodex(path string) string {
 			return candidate
 		}
 	}
+	// A shim is retained only as a shell-invoked resolution. All Codex process
+	// callers use internal/process, which supplies cmd.exe /d /s /c semantics;
+	// callers must not pass this result to exec.Command directly.
 	return path
 }
 
 func windowsNativeCodexCandidatesForShim(shim string) []string {
-	dir := filepath.Dir(shim)
-	return []string{
-		filepath.Join(dir, "node_modules", "@openai", "codex", "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe"),
-		filepath.Join(dir, "node_modules", "@openai", "codex", "bin", "codex.exe"),
+	return windowsNativeCodexCandidatesForShimWithArch(shim, runtime.GOARCH)
+}
+
+type windowsCodexTarget struct {
+	npmPackage   string
+	targetTriple string
+}
+
+func windowsCodexTargetForArch(arch string) (windowsCodexTarget, bool) {
+	switch arch {
+	case "amd64":
+		return windowsCodexTarget{
+			npmPackage:   "codex-win32-x64",
+			targetTriple: "x86_64-pc-windows-msvc",
+		}, true
+	case "arm64":
+		return windowsCodexTarget{
+			npmPackage:   "codex-win32-arm64",
+			targetTriple: "aarch64-pc-windows-msvc",
+		}, true
+	default:
+		return windowsCodexTarget{}, false
 	}
+}
+
+func windowsNativeCodexCandidatesForShimWithArch(shim, arch string) []string {
+	dir := filepath.Dir(shim)
+	roots := []string{filepath.Join(dir, "node_modules", "@openai", "codex")}
+	if strings.EqualFold(filepath.Base(dir), ".bin") {
+		// npm local shims live beside the package's node_modules directory,
+		// unlike a global npm bin directory whose sibling is node_modules.
+		roots = append(roots, filepath.Join(filepath.Dir(dir), "@openai", "codex"))
+	}
+	candidates := make([]string, 0, len(roots)*4)
+	if target, ok := windowsCodexTargetForArch(arch); ok {
+		vendorBinary := filepath.Join("vendor", target.targetTriple, "bin", "codex.exe")
+		// npm may keep the optional platform package nested under Codex or hoist it
+		// alongside Codex. The Node launcher uses require.resolve, which supports
+		// both layouts.
+		for _, codexRoot := range roots {
+			candidates = append(candidates,
+				filepath.Join(codexRoot, "node_modules", "@openai", target.npmPackage, vendorBinary),
+				filepath.Join(filepath.Dir(filepath.Dir(codexRoot)), "@openai", target.npmPackage, vendorBinary),
+				filepath.Join(codexRoot, vendorBinary),
+			)
+		}
+	}
+	// Older npm packages bundled the executable directly in the package bin
+	// directory. Keep this fallback for installs whose shim still points here.
+	for _, codexRoot := range roots {
+		candidates = append(candidates, filepath.Join(codexRoot, "bin", "codex.exe"))
+	}
+	return uniquePaths(candidates)
+}
+
+func windowsProjectBinDirectories(start string) []string {
+	dir := filepath.Clean(start)
+	var dirs []string
+	for {
+		dirs = append(dirs, filepath.Join(dir, "node_modules", ".bin"))
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return dirs
+}
+
+func uniquePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		key := strings.ToLower(filepath.Clean(path))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, path)
+	}
+	return out
 }
 
 func isWindowsAppsCodexExecutable(path string) bool {
@@ -444,7 +610,20 @@ func isWindowsAppsCodexExecutable(path string) bool {
 		strings.Contains(clean, string(filepath.Separator)+"windowsapps"+string(filepath.Separator)+"openai.codex_")
 }
 
-func (p *Plugin) codexBinary(ctx context.Context) (string, error) {
+func (p *Plugin) codexBinary(ctx context.Context, workspacePath string) (string, error) {
+	if workspacePath = strings.TrimSpace(workspacePath); workspacePath != "" && filepath.IsAbs(workspacePath) {
+		if local, ok, err := resolveWorkspaceCodexBinary(ctx, filepath.Clean(workspacePath)); err != nil {
+			return "", err
+		} else if ok {
+			return local, nil
+		}
+		// Preserve the existing launch cache when no workspace-local install is
+		// present. A local candidate above always wins over the cached path.
+		if p.resolvedBinary != "" {
+			return p.resolvedBinary, nil
+		}
+		return ResolveCodexBinaryForWorkspace(ctx, workspacePath)
+	}
 	p.binaryMu.Lock()
 	defer p.binaryMu.Unlock()
 

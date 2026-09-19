@@ -90,6 +90,42 @@ func TestDelegateTaskSpawnsWorkerThenRequestsTitleFromNewestActiveOrchestrator(t
 	}
 }
 
+func TestDelegateTaskCapsWorkerPermissionToActiveOrchestratorFloor(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		parent    domain.PermissionMode
+		requested domain.PermissionMode
+		want      domain.PermissionMode
+	}{
+		{name: "read-only parent caps auto child", parent: domain.PermissionModeReadOnly, requested: domain.PermissionModeAuto, want: domain.PermissionModeReadOnly},
+		{name: "read-only parent caps bypass child", parent: domain.PermissionModeReadOnly, requested: domain.PermissionModeBypassPermissions, want: domain.PermissionModeReadOnly},
+		{name: "read-only parent retains read-only child", parent: domain.PermissionModeReadOnly, requested: domain.PermissionModeReadOnly, want: domain.PermissionModeReadOnly},
+		{name: "read-only parent pins omitted child", parent: domain.PermissionModeReadOnly, requested: "", want: domain.PermissionModeReadOnly},
+		{name: "ordinary parent preserves narrower child", parent: domain.PermissionModeAuto, requested: domain.PermissionModeReadOnly, want: domain.PermissionModeReadOnly},
+		{name: "ordinary parent preserves ordinary child", parent: domain.PermissionModeAuto, requested: domain.PermissionModeBypassPermissions, want: domain.PermissionModeBypassPermissions},
+		{name: "ordinary parent leaves omitted child for normal inheritance", parent: domain.PermissionModeAuto, requested: "", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.projects["ao"] = domain.ProjectRecord{ID: "ao"}
+			st.sessions["orch"] = domain.SessionRecord{
+				ID: "orch", ProjectID: "ao", Kind: domain.KindOrchestrator,
+				Metadata: domain.SessionMetadata{Permissions: test.parent},
+			}
+			cmd := &fakeCommander{}
+			_, err := (&Service{store: st, manager: cmd, runBackground: runInline}).DelegateTask(
+				context.Background(), DelegateTaskInput{ProjectID: "ao", Brief: "Fix it", ApprovalMode: test.requested},
+			)
+			if err != nil {
+				t.Fatalf("DelegateTask: %v", err)
+			}
+			if got := cmd.spawnedCfg.AgentConfig.Permissions; got != test.want {
+				t.Fatalf("worker effective permissions = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestDelegatedTaskDisplayName(t *testing.T) {
 	for _, tt := range []struct {
 		name  string

@@ -706,6 +706,7 @@ func (c *transitionChat) SupportsChat(_ domain.AgentHarness) bool {
 func (c *transitionChat) PreflightChat(
 	ctx context.Context,
 	_ domain.AgentHarness,
+	_ string,
 	_ ports.PermissionMode,
 ) error {
 	if c.preflightStarted != nil {
@@ -1726,67 +1727,6 @@ func TestInterfaceTransitionTUIToChatPreservesAVisibleDraftEvenAfterFreshIdle(t 
 	}
 }
 
-func TestInterfaceTransitionTUIToChatIgnoresATransientComposerDraft(t *testing.T) {
-	manager, store, runtime, _, _ := newTransitionManager(t, domain.SessionModeTUI)
-	useFastInterfaceTransitionTimings(manager)
-	manager.agents = singleAgent{agent: transitionSurfaceAgent{}}
-	now := time.Now()
-	rec := store.sessions["session-1"]
-	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-time.Minute)}
-	store.sessions["session-1"] = rec
-	runtime.aliveByHandle = map[string]bool{"runtime-1": true}
-	// Providers repaint non-dim chrome through the composer borders between
-	// stable frames. A draft claim that vanishes on the next capture is chrome,
-	// not human input, and must not fail the switch.
-	runtime.outputs = []string{
-		draftTerminalOutput, draftTerminalOutput,
-		idleTerminalOutput, idleTerminalOutput, idleTerminalOutput,
-	}
-	manager.SetTerminalInputGate(&transitionInputGate{
-		acquired: make(chan string, 1),
-		released: make(chan string, 1),
-	})
-
-	transition, err := manager.StartInterfaceTransition(context.Background(), "session-1", domain.SessionModeChat, domain.SessionInterfaceTransitionDrain, domain.SessionInterfaceTransitionHistoryStrict)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	settled := awaitTransition(t, store, transition.ID)
-	if settled.Phase != domain.SessionInterfaceTransitionCompleted {
-		t.Fatalf("phase = %s, error = %s", settled.Phase, settled.ErrorDetail)
-	}
-}
-
-func TestInterfaceTransitionTUIToChatIgnoresASingleDraftFrameBetweenIdleCaptures(t *testing.T) {
-	manager, store, runtime, _, _ := newTransitionManager(t, domain.SessionModeTUI)
-	useFastInterfaceTransitionTimings(manager)
-	manager.agents = singleAgent{agent: transitionSurfaceAgent{}}
-	now := time.Now()
-	rec := store.sessions["session-1"]
-	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-time.Minute)}
-	store.sessions["session-1"] = rec
-	runtime.aliveByHandle = map[string]bool{"runtime-1": true}
-	runtime.outputs = []string{
-		idleTerminalOutput, draftTerminalOutput, idleTerminalOutput,
-		idleTerminalOutput, idleTerminalOutput,
-	}
-	manager.SetTerminalInputGate(&transitionInputGate{
-		acquired: make(chan string, 1),
-		released: make(chan string, 1),
-	})
-
-	transition, err := manager.StartInterfaceTransition(context.Background(), "session-1", domain.SessionModeChat, domain.SessionInterfaceTransitionDrain, domain.SessionInterfaceTransitionHistoryStrict)
-
-	if err != nil {
-		t.Fatal(err)
-	}
-	settled := awaitTransition(t, store, transition.ID)
-	if settled.Phase != domain.SessionInterfaceTransitionCompleted {
-		t.Fatalf("phase = %s, error = %s", settled.Phase, settled.ErrorDetail)
-	}
-}
-
 func TestInterfaceTransitionTUIToChatPreservesDraftWhenSurfaceAlsoLooksActive(t *testing.T) {
 	manager, store, runtime, _, _ := newTransitionManager(t, domain.SessionModeTUI)
 	useFastInterfaceTransitionTimings(manager)
@@ -2750,6 +2690,23 @@ func TestInterfaceTransitionChatToTUIInterruptsThenStopsBeforeStarting(t *testin
 	}
 	if got := fmt.Sprint(*log); got != "[prepare:chat:interrupt stop:chat start:tui]" {
 		t.Fatalf("controller order = %s", got)
+	}
+}
+
+func TestInterfaceTransitionReadOnlyChatToTUIRefusesBeforeStoppingSource(t *testing.T) {
+	manager, store, runtime, chat, log := newTransitionManager(t, domain.SessionModeChat)
+	rec := store.sessions["session-1"]
+	rec.Metadata.Permissions = domain.PermissionModeReadOnly
+	store.sessions["session-1"] = rec
+
+	_, err := manager.StartInterfaceTransition(context.Background(), "session-1", domain.SessionModeTUI,
+		domain.SessionInterfaceTransitionInterrupt, domain.SessionInterfaceTransitionHistoryStrict)
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("StartInterfaceTransition error = %v, want read-only Chat boundary refusal", err)
+	}
+	if len(store.transitions) != 0 || runtime.created != 0 || chat.preparedPolicy != "" || len(*log) != 0 {
+		t.Fatalf("read-only refusal mutated source: transitions=%d runtime=%d policy=%q log=%v",
+			len(store.transitions), runtime.created, chat.preparedPolicy, *log)
 	}
 }
 

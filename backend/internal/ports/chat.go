@@ -217,6 +217,10 @@ const (
 	// terminal identity/output metadata. It is read-only transcript richness, not
 	// permission for the provider to execute through AO's terminal runtime.
 	ChatCapabilityTerminalOutput ChatCapability = "terminal_output"
+	// ChatCapabilityPreventiveReadOnly means the driver can enforce a no-write
+	// session while retaining non-interactive approval semantics. Advisory plan
+	// modes do not qualify.
+	ChatCapabilityPreventiveReadOnly ChatCapability = "preventive_read_only"
 )
 
 // ChatCapabilities is the set a driver reports from Probe.
@@ -224,6 +228,27 @@ type ChatCapabilities map[ChatCapability]bool
 
 // Has reports whether the capability is present and enabled.
 func (c ChatCapabilities) Has(capability ChatCapability) bool { return c[capability] }
+
+// ChatNativeEvidence is provider-owned permission posture exposed through the
+// normal conversation read model. Unknown values are explicit: AO must not
+// derive effective permission from persisted settings or a static capability.
+type ChatNativeEvidence struct {
+	Provider             string
+	RequestedPermission  string
+	EffectivePermission  string
+	ApprovalPolicy       string
+	ThreadSandbox        string
+	TurnSandbox          string
+	PreventiveCapability bool
+	ProofStatus          string
+}
+
+// ChatNativeEvidenceReader is implemented by conversations whose provider
+// exposes native permission posture. Drivers that cannot provide it remain
+// fail-closed and return an unproven snapshot.
+type ChatNativeEvidenceReader interface {
+	NativeEvidence() ChatNativeEvidence
+}
 
 // chatProductionFloor is the minimum a driver must support before AO will let a
 // session that can mutate a workspace run in Chat mode. Without approvals a
@@ -253,6 +278,10 @@ func MissingProductionCapabilities(caps ChatCapabilities) []ChatCapability {
 // not require an approval channel because the user has opted out of approvals.
 func MissingCapabilitiesForPermissions(caps ChatCapabilities, permissions PermissionMode) []ChatCapability {
 	missing := MissingProductionCapabilities(caps)
+	if NormalizePermissionMode(permissions) == PermissionModeReadOnly &&
+		!caps.Has(ChatCapabilityPreventiveReadOnly) {
+		missing = append(missing, ChatCapabilityPreventiveReadOnly)
+	}
 	if NormalizePermissionMode(permissions) != PermissionModeBypassPermissions {
 		return missing
 	}
@@ -288,6 +317,9 @@ type ChatStartConfig struct {
 	// Effort is an optional provider-advertised model tuning value; empty
 	// defers to the provider's configured default.
 	Effort string
+	// EffortOverride preserves whether Effort was explicitly supplied. An empty
+	// value therefore means provider default, not inherited project policy.
+	EffortOverride bool
 	// Permissions is AO's existing per-session approval policy. Drivers map it
 	// onto their provider's native approval and sandbox settings.
 	Permissions PermissionMode
@@ -322,8 +354,10 @@ type ChatResumeConfig struct {
 	// Model is optional; empty keeps the provider conversation's current model.
 	Model string
 	// Effort is optional; empty keeps the provider conversation's current effort.
-	Effort      string
-	Permissions PermissionMode
+	Effort string
+	// EffortOverride preserves the spawn/session presence bit for conformance.
+	EffortOverride bool
+	Permissions    PermissionMode
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string
@@ -396,14 +430,16 @@ type ChatUserMessage struct {
 //
 // Per turn, not per session: the provider takes these on every turn/start, so a
 // user can change model or approval posture between messages without restarting
-// the agent. Empty fields mean "use whatever the conversation was started with",
-// which is what makes this additive — a caller that sets nothing behaves exactly
-// as before.
+// the agent. Empty fields mean "use whatever the conversation was started with"
+// unless the corresponding presence bit says the provider default was explicit.
 type ChatTurnSettings struct {
 	// Model is the provider's model id, from ChatModel.ID.
 	Model string
 	// Effort is how much reasoning to spend, from ChatModel.Efforts.
 	Effort string
+	// EffortOverride distinguishes an explicit provider-default choice (Effort
+	// empty) from an omitted choice that should inherit the thread setting.
+	EffortOverride bool
 	// Approval is AO's permission mode for this turn. The driver maps it onto
 	// whatever approval policy and sandbox its provider understands.
 	Approval PermissionMode
@@ -412,7 +448,7 @@ type ChatTurnSettings struct {
 // IsZero reports whether nothing was chosen, so a dispatch can omit the fields
 // entirely rather than sending empty strings the provider would have to interpret.
 func (s ChatTurnSettings) IsZero() bool {
-	return s.Model == "" && s.Effort == "" && s.Approval == ""
+	return s.Model == "" && s.Effort == "" && !s.EffortOverride && s.Approval == ""
 }
 
 // ChatModel is one model the provider offers for a conversation.

@@ -74,7 +74,8 @@ func TestRetryTurnDispatchesFailedPromptAsNewTurn(t *testing.T) {
 		t.Fatalf("failed turn error = %q, want the transport error", failed.ErrorMessage)
 	}
 	settings := domain.ConversationSettings{
-		Model: "current-model", ReasoningEffort: "high", ApprovalMode: domain.PermissionModeAcceptEdits,
+		Model: "current-model", ReasoningEffort: "high", ReasoningEffortSet: true,
+		ApprovalMode: domain.PermissionModeAcceptEdits,
 	}
 	if _, err := h.svc.SetTurnSettings(ctx, testSession, settings); err != nil {
 		t.Fatalf("SetTurnSettings: %v", err)
@@ -104,7 +105,8 @@ func TestRetryTurnDispatchesFailedPromptAsNewTurn(t *testing.T) {
 	if len(sent[1].Content) != 1 || sent[1].Content[0].URI != "file:///worktree/ci-log.txt" || sent[1].Content[0].Name != "ci-log.txt" {
 		t.Fatalf("second send content = %+v, want the original resource", sent[1].Content)
 	}
-	if sent[1].Settings.Model != settings.Model || sent[1].Settings.Effort != settings.ReasoningEffort || sent[1].Settings.Approval != settings.ApprovalMode {
+	if sent[1].Settings.Model != settings.Model || sent[1].Settings.Effort != settings.ReasoningEffort ||
+		!sent[1].Settings.EffortOverride || sent[1].Settings.Approval != settings.ApprovalMode {
 		t.Fatalf("second send settings = %+v, want current settings %+v", sent[1].Settings, settings)
 	}
 

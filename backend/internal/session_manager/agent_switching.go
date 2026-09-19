@@ -1351,7 +1351,21 @@ func (m *Manager) prepareTargetActivation(ctx context.Context, store ports.Agent
 	if err != nil {
 		return preparedTargetActivation{}, fmt.Errorf("system prompt file: %w", err)
 	}
-	config := effectiveAgentConfig(harness, rec.Kind, project.Config)
+	config := effectiveAgentConfig(rec.Kind, project.Config)
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return preparedTargetActivation{}, fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+	}
+	config.Permissions = permissions
+	if config.Permissions == ports.PermissionModeReadOnly {
+		return preparedTargetActivation{}, fmt.Errorf("%w: %q requires a Chat driver that advertises %s",
+			ports.ErrChatPermissionModeUnsupported, config.Permissions,
+			ports.ChatCapabilityPreventiveReadOnly)
+	}
+	if roleOverride(rec.Kind, project.Config).Harness != harness {
+		config.Model = ""
+		config.Mode = ""
+	}
 	if model := strings.TrimSpace(modelOverride); model != "" {
 		config.Model = model
 	}

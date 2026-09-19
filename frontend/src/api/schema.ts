@@ -2939,6 +2939,8 @@ export interface components {
             /** @enum {string} */
             mode: "chat" | "tui";
             model?: string;
+            /** @enum {string} */
+            permissions?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             /** Format: date-time */
             pinnedAt?: null | string;
             /** Format: int64 */
@@ -3015,7 +3017,7 @@ export interface components {
             groupName?: string;
             name: string;
             /** @enum {string} */
-            permissionMode?: "default" | "accept-edits" | "auto" | "bypass-permissions";
+            permissionMode?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             value: string;
         };
         ConversationConfigOptionResponse: {
@@ -3153,10 +3155,13 @@ export interface components {
             /** @enum {string} */
             mode: "chat" | "tui";
             modelReroute?: components["schemas"]["ConversationModelReroutePayload"];
+            nativeEvidence: components["schemas"]["NativePermissionEvidence"];
             /** Format: int64 */
             nativeForkAvailableAfterSequence: number;
             /** Format: int64 */
             oldestSequence?: number;
+            /** @enum {string} */
+            permissionFloor?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             rateLimits?: components["schemas"]["ConversationRateLimitsPayload"];
             sessionId: string;
             settings: components["schemas"]["ConversationTurnSettingsPayload"];
@@ -3193,9 +3198,10 @@ export interface components {
         };
         ConversationTurnSettingsPayload: {
             /** @enum {string} */
-            approvalMode?: "default" | "accept-edits" | "auto" | "bypass-permissions";
+            approvalMode?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             model?: string;
             reasoningEffort?: string;
+            reasoningEffortSet: boolean;
         };
         ConversationUsagePayload: {
             /** Format: int64 */
@@ -3225,7 +3231,7 @@ export interface components {
             /** @enum {string} */
             agent?: "claude-code" | "codex" | "aider" | "opencode" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "muse" | "kiro" | "kilocode" | "vibe" | "pi" | "kimchi" | "omp" | "prime-agent" | "autohand" | "fake";
             /** @enum {string} */
-            approvalMode?: "default" | "accept-edits" | "auto" | "bypass-permissions";
+            approvalMode?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             attachments?: components["schemas"]["AttachmentInput"][];
             brief: string;
             effort?: null | string;
@@ -3591,6 +3597,17 @@ export interface components {
         MuteDeviceRequest: {
             /** @description True to stop sending push notifications to this device. */
             muted: boolean;
+        };
+        NativePermissionEvidence: {
+            approvalPolicy?: string;
+            effectivePermission?: string;
+            preventiveCapability: boolean;
+            /** @enum {string} */
+            proofStatus: "PROVEN" | "UNPROVEN" | "DEFERRED_WITH_EXACT_REASON";
+            provider?: string;
+            requestedPermission?: string;
+            threadSandbox?: string;
+            turnSandbox?: string;
         };
         NotificationEnvelope: {
             notification: components["schemas"]["NotificationResponse"];
@@ -4090,12 +4107,18 @@ export interface components {
         SetConversationTitleResponse: {
             title: string;
         };
+        SetConversationTurnSettingsRequest: {
+            /** @enum {string} */
+            approvalMode?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
+            model?: string;
+            reasoningEffort?: null | string;
+        };
         SetProjectConfigInput: {
             config: components["schemas"]["ProjectConfig"];
         };
         SetProjectPermissionsInput: {
             /** @enum {string} */
-            permissions: "default" | "accept-edits" | "auto" | "bypass-permissions";
+            permissions: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             sourceHarness?: string;
         };
         SetReviewActivityRequest: {
@@ -4186,6 +4209,7 @@ export interface components {
             attachments?: components["schemas"]["AttachmentInput"][];
             branch?: string;
             displayName?: string;
+            effort?: null | string;
             /** @enum {string} */
             harness?: "claude-code" | "codex" | "aider" | "opencode" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "muse" | "kiro" | "kilocode" | "vibe" | "pi" | "kimchi" | "omp" | "prime-agent" | "autohand";
             issueId?: string;
@@ -4195,6 +4219,8 @@ export interface components {
             mode?: "chat" | "tui";
             model?: string;
             parentSessionId?: string;
+            /** @enum {string} */
+            permissions?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             projectId?: string;
             prompt?: string;
             /** @enum {string} */
@@ -9464,7 +9490,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ConversationTurnSettingsPayload"];
+                "application/json": components["schemas"]["SetConversationTurnSettingsRequest"];
             };
         };
         responses: {

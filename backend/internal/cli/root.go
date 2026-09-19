@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/codex"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
@@ -64,15 +65,17 @@ type Deps struct {
 	Out io.Writer
 	Err io.Writer
 
-	HTTPClient            *http.Client
-	Executable            func() (string, error)
-	StartProcess          func(processStartConfig) error
-	ProcessAlive          func(pid int) bool
-	LookPath              func(file string) (string, error)
-	CommandOutput         func(ctx context.Context, name string, args ...string) ([]byte, error)
-	CommandOutputInDir    func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
-	RunInteractiveCommand func(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error
-	ReadSecret            func(io.Reader) ([]byte, error)
+	HTTPClient                *http.Client
+	Executable                func() (string, error)
+	StartProcess              func(processStartConfig) error
+	ProcessAlive              func(pid int) bool
+	LookPath                  func(file string) (string, error)
+	ResolveCodexBinary        func(context.Context) (string, error)
+	CommandOutput             func(ctx context.Context, name string, args ...string) ([]byte, error)
+	CommandOutputInDir        func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
+	CommandOutputInDirWithEnv func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error)
+	RunInteractiveCommand     func(ctx context.Context, name string, args []string, stdin io.Reader, stdout, stderr io.Writer) error
+	ReadSecret                func(io.Reader) ([]byte, error)
 	// DoctorGitHubRESTBase lets tests point the doctor GitHub token probe at
 	// httptest without mutating package-global state.
 	DoctorGitHubRESTBase string
@@ -86,22 +89,24 @@ type Deps struct {
 // DefaultDeps returns production dependencies.
 func DefaultDeps() Deps {
 	return Deps{
-		In:                    os.Stdin,
-		Out:                   os.Stdout,
-		Err:                   os.Stderr,
-		HTTPClient:            &http.Client{Timeout: 2 * time.Second},
-		Executable:            os.Executable,
-		StartProcess:          startProcess,
-		ProcessAlive:          processalive.Alive,
-		LookPath:              exec.LookPath,
-		CommandOutput:         commandOutput,
-		CommandOutputInDir:    commandOutputInDir,
-		RunInteractiveCommand: runInteractiveCommand,
-		ReadSecret:            readSecret,
-		DoctorGitHubRESTBase:  defaultDoctorGitHubRESTBase,
-		DoctorGitLabRESTBase:  defaultDoctorGitLabRESTBase,
-		Now:                   time.Now,
-		Sleep:                 time.Sleep,
+		In:                        os.Stdin,
+		Out:                       os.Stdout,
+		Err:                       os.Stderr,
+		HTTPClient:                &http.Client{Timeout: 2 * time.Second},
+		Executable:                os.Executable,
+		StartProcess:              startProcess,
+		ProcessAlive:              processalive.Alive,
+		LookPath:                  exec.LookPath,
+		ResolveCodexBinary:        codex.ResolveCodexBinary,
+		CommandOutput:             commandOutput,
+		CommandOutputInDir:        commandOutputInDir,
+		CommandOutputInDirWithEnv: commandOutputInDirWithEnv,
+		RunInteractiveCommand:     runInteractiveCommand,
+		ReadSecret:                readSecret,
+		DoctorGitHubRESTBase:      defaultDoctorGitHubRESTBase,
+		DoctorGitLabRESTBase:      defaultDoctorGitLabRESTBase,
+		Now:                       time.Now,
+		Sleep:                     time.Sleep,
 	}
 }
 
@@ -115,8 +120,16 @@ func commandOutputInDir(ctx context.Context, dir, name string, args ...string) (
 	return cmd.CombinedOutput()
 }
 
+func commandOutputInDirWithEnv(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
+	cmd := aoprocess.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	return cmd.CombinedOutput()
+}
+
 func (d Deps) withDefaults() Deps {
 	def := DefaultDeps()
+	customLookPath := d.LookPath != nil
 	if d.In == nil {
 		d.In = def.In
 	}
@@ -140,6 +153,9 @@ func (d Deps) withDefaults() Deps {
 	}
 	if d.LookPath == nil {
 		d.LookPath = def.LookPath
+	}
+	if d.ResolveCodexBinary == nil && !customLookPath {
+		d.ResolveCodexBinary = def.ResolveCodexBinary
 	}
 	if d.CommandOutput == nil {
 		d.CommandOutput = def.CommandOutput
@@ -166,6 +182,13 @@ func (d Deps) withDefaults() Deps {
 		d.Sleep = def.Sleep
 	}
 	return d
+}
+
+func (c *commandContext) resolveCodexBinary(ctx context.Context) (string, error) {
+	if c.deps.ResolveCodexBinary != nil {
+		return c.deps.ResolveCodexBinary(ctx)
+	}
+	return c.deps.LookPath("codex")
 }
 
 // NewRootCommand builds a testable root command.

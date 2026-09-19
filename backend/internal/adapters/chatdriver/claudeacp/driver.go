@@ -146,8 +146,10 @@ func claudeSessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOp
 	if settings.Model != "" {
 		options = append(options, acpdriver.SessionOption{ID: "model", Value: settings.Model})
 	}
-	if settings.Effort != "" {
-		options = append(options, acpdriver.SessionOption{ID: "effort", Value: settings.Effort})
+	if settings.EffortOverride || settings.Effort != "" {
+		options = append(options, acpdriver.SessionOption{
+			ID: "effort", Value: settings.Effort, AllowEmpty: settings.EffortOverride && settings.Effort == "",
+		})
 	}
 	return options
 }

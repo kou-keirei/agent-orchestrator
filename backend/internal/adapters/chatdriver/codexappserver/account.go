@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,7 @@ type AccountFactory struct {
 	mu              sync.Mutex
 	capability      map[string]domain.CodexAccountCapabilities
 	capabilityCalls map[string]*capabilityCall
-	probeSchema     func(context.Context, string) domain.CodexAccountCapabilities
+	probeSchema     func(context.Context, LaunchContract) domain.CodexAccountCapabilities
 }
 
 type capabilityCall struct {
@@ -77,7 +78,8 @@ func (f *AccountFactory) Open(ctx context.Context, account ports.CodexAccountCon
 	}
 	if account.Managed {
 		info, err := os.Lstat(account.Home)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+			(runtime.GOOS != "windows" && info.Mode().Perm() != 0o700) {
 			return nil, errors.New("managed Codex account home is unavailable")
 		}
 	}
@@ -89,7 +91,11 @@ func (f *AccountFactory) Open(ctx context.Context, account ports.CodexAccountCon
 	if account.Managed {
 		args = []string{"-c", `cli_auth_credentials_store="file"`, "app-server"}
 	}
-	proc, err := f.spawn(ctx, bin, account.Home, envSlice(map[string]string{"CODEX_HOME": account.Home}), args)
+	contract, err := newLaunchContract(ctx, bin, account.Home, map[string]string{"CODEX_HOME": account.Home})
+	if err != nil {
+		return nil, fmt.Errorf("prepare Codex account launch: %w", err)
+	}
+	proc, err := f.spawn(ctx, contract.Executable, contract.WorkspacePath, contract.Environment, args)
 	if err != nil {
 		return nil, fmt.Errorf("launch Codex account client: %w", err)
 	}
@@ -114,13 +120,17 @@ func (f *AccountFactory) Capabilities(ctx context.Context) domain.CodexAccountCa
 	if err != nil {
 		return unknownCodexCapabilities("Codex capability detection is unavailable.")
 	}
+	contract, err := newLaunchContract(probeCtx, bin, "", nil)
+	if err != nil {
+		return unknownCodexCapabilities("Codex capability detection is unavailable.")
+	}
 	versionCtx, cancel := context.WithTimeout(probeCtx, 5*time.Second)
-	version, versionErr := installedCodexVersion(versionCtx, bin)
+	version, versionErr := installedCodexVersionContract(versionCtx, contract)
 	cancel()
-	key := bin + "\x00" + strings.TrimSpace(version)
+	key := contract.cacheIdentity() + "\x00" + strings.TrimSpace(version)
 	cacheable := versionErr == nil
 	if versionErr != nil {
-		key = bin + "\x00unknown"
+		key = contract.cacheIdentity() + "\x00unknown"
 	}
 	f.mu.Lock()
 	if cached, ok := f.capability[key]; ok {
@@ -142,7 +152,7 @@ func (f *AccountFactory) Capabilities(ctx context.Context) domain.CodexAccountCa
 	f.capabilityCalls[key] = call
 	f.mu.Unlock()
 	started := time.Now()
-	result := f.probeSchema(probeCtx, bin)
+	result := f.probeSchema(probeCtx, contract)
 	f.mu.Lock()
 	call.result = result
 	if cacheable && result.AccountRead.State != domain.CodexCapabilityUnknown && result.NativeLogin.State != domain.CodexCapabilityUnknown && result.CapacityRead.State != domain.CodexCapabilityUnknown {
@@ -155,7 +165,7 @@ func (f *AccountFactory) Capabilities(ctx context.Context) domain.CodexAccountCa
 	return result
 }
 
-func (f *AccountFactory) detectCapabilities(ctx context.Context, bin string) domain.CodexAccountCapabilities {
+func (f *AccountFactory) detectCapabilities(ctx context.Context, contract LaunchContract) domain.CodexAccountCapabilities {
 	probeCtx, cancel := context.WithTimeout(ctx, capabilityProbeTimeout)
 	defer cancel()
 	dir, err := os.MkdirTemp("", "ao-codex-schema-")
@@ -163,18 +173,21 @@ func (f *AccountFactory) detectCapabilities(ctx context.Context, bin string) dom
 		return unknownCodexCapabilities("Codex capability detection is unavailable.")
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	cmd := aoprocess.CommandContext(probeCtx, bin, "app-server", "generate-json-schema", "--experimental", "--out", dir)
+	cmd := aoprocess.CommandContext(probeCtx, contract.Executable, "app-server", "generate-json-schema", "--experimental", "--out", dir)
+	cmd.Dir = contract.WorkspacePath
+	cmd.Env = contract.Environment
 	if err := cmd.Run(); err != nil {
 		return unknownCodexCapabilities("Codex capability detection did not complete.")
 	}
 	capabilities := inspectCodexSchemaDirectory(dir)
-	capabilities.NativeLogin = probeCodexCLISurface(probeCtx, bin, []string{"login", "--help"}, "Native Codex login is available.")
+	capabilities.NativeLogin = probeCodexCLISurface(probeCtx, contract, []string{"login", "--help"}, "Native Codex login is available.")
 	return capabilities
 }
 
-func probeCodexCLISurface(ctx context.Context, bin string, args []string, supportedReason string) domain.CodexCapabilityObservation {
-	cmd := aoprocess.CommandContext(ctx, bin, args...)
-	cmd.Env = codexProcessEnv(ctx, bin, nil)
+func probeCodexCLISurface(ctx context.Context, contract LaunchContract, args []string, supportedReason string) domain.CodexCapabilityObservation {
+	cmd := aoprocess.CommandContext(ctx, contract.Executable, args...)
+	cmd.Dir = contract.WorkspacePath
+	cmd.Env = contract.Environment
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {

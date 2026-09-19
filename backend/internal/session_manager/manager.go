@@ -842,12 +842,22 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if projectKind == domain.ProjectKindScratch && strings.TrimSpace(cfg.Branch) != "" {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", ErrScratchBranchUnsupported)
 	}
-	if cfg.ParentSessionID != "" && cfg.AgentConfig.Permissions == "" {
+	if cfg.ParentSessionID != "" {
 		permissions, err := m.inheritedSpawnPermissions(ctx, cfg.ProjectID, cfg.ParentSessionID)
 		if err != nil {
 			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 		}
-		cfg.AgentConfig.Permissions = permissions
+		if permissions != "" {
+			if cfg.AgentConfig.Permissions == "" {
+				cfg.AgentConfig.Permissions = permissions
+			} else {
+				resolved, resolveErr := domain.ResolvePermissionMode(permissions, cfg.AgentConfig.Permissions)
+				if resolveErr != nil {
+					return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", resolveErr)
+				}
+				cfg.AgentConfig.Permissions = resolved
+			}
+		}
 	}
 	// A per-project role override picks the harness when the spawn names none,
 	// so a project can default workers to one agent and orchestrators to another.
@@ -870,7 +880,17 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// Resolve the effective agent config (project base + role override + spawn
 	// override) and validate the model before any durable state is created. A
 	// model the harness cannot honor should not leave a seed row behind.
-	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
+	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Kind, project.Config), cfg.AgentConfig)
+	// Effort is the one spawn setting whose empty value is meaningful. Keep the
+	// request-presence bit separate from the value-only agent config merge so an
+	// explicit --effort= clears an inherited project effort before either Chat or
+	// TUI (including the Chat-to-TUI fallback) is selected.
+	if cfg.EffortOverride {
+		agentConfig.Effort = cfg.AgentConfig.Effort
+	}
+	if _, err := domain.ResolvePermissionMode("", agentConfig.Permissions); err != nil {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
+	}
 	if err := validateSpawnModel(cfg.Harness, agentConfig.Model); err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %s", ErrUnsupportedModel, err.Error())
 	}
@@ -895,7 +915,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			m.logger.Warn("spawn: default Chat unavailable; falling back to TUI",
 				"harness", cfg.Harness, "error", ports.ErrChatUnsupported)
 			mode = domain.SessionModeTUI
-		} else if err := m.chat.PreflightChat(ctx, cfg.Harness, agentConfig.Permissions); err != nil {
+		} else if err := m.chat.PreflightChat(ctx, cfg.Harness, project.Path, agentConfig.Permissions); err != nil {
 			fallbackAllowed := errors.Is(err, ports.ErrChatUnsupported) ||
 				errors.Is(err, ports.ErrChatDriverUnavailable) ||
 				errors.Is(err, ports.ErrChatDriverIncompatible) ||
@@ -922,6 +942,11 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// A chat session runs no agent inside a terminal runtime, so the terminal
 	// prerequisites are not its concern.
 	if mode == domain.SessionModeTUI {
+		if agentConfig.Permissions == ports.PermissionModeReadOnly {
+			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w: %q requires a Chat driver that advertises %s",
+				ports.ErrChatPermissionModeUnsupported, agentConfig.Permissions,
+				ports.ChatCapabilityPreventiveReadOnly)
+		}
 		if err := m.validateRuntimePrerequisites(); err != nil {
 			return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 		}
@@ -1131,7 +1156,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 }
 
 func (m *Manager) resolveChatAgentConfig(ctx context.Context, cfg ports.SpawnConfig, project domain.ProjectConfig) (ports.AgentConfig, error) {
-	base := effectiveAgentConfig(cfg.Harness, cfg.Kind, project)
+	base := effectiveAgentConfig(cfg.Kind, project)
 	requested := cfg.AgentConfig
 	resolved := applySpawnAgentConfig(base, requested)
 	if cfg.EffortOverride {
@@ -1197,8 +1222,9 @@ func containsString(values []string, value string) bool {
 }
 
 // inheritedSpawnPermissions derives a worker override from its requesting chat
-// orchestrator. The request supplies identity only: the stored conversation
-// settings remain the authority for the permission policy.
+// orchestrator. The request supplies identity only: the session's pinned
+// metadata is authoritative, with stored conversation settings as a legacy
+// fallback.
 func (m *Manager) inheritedSpawnPermissions(ctx context.Context, projectID domain.ProjectID, parentID domain.SessionID) (domain.PermissionMode, error) {
 	parent, ok, err := m.store.GetSession(ctx, parentID)
 	if err != nil {
@@ -1209,6 +1235,9 @@ func (m *Manager) inheritedSpawnPermissions(ctx context.Context, projectID domai
 		// A worker (or a stale/cross-project value) must preserve the historical
 		// project-default spawn behavior rather than gain an inherited policy.
 		return "", nil
+	}
+	if parent.Metadata.Permissions != "" {
+		return parent.Metadata.Permissions, nil
 	}
 	conversations, ok := m.store.(conversationSettingsStore)
 	if !ok {
@@ -1540,24 +1569,16 @@ func roleConfigName(kind domain.SessionKind) string {
 
 // effectiveAgentConfig merges the role override's agent config over the
 // project's base agent config; set override fields win.
-//
-// Model/Mode are inherited only when the launch harness matches the role's
-// configured harness — otherwise they were tuned for a different agent and
-// would leak a provider-specific alias onto the wrong harness. An empty role
-// harness means "not pinned" and always matches. Permissions is
-// harness-neutral and is always inherited.
-func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, cfg domain.ProjectConfig) ports.AgentConfig {
+func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig) ports.AgentConfig {
 	merged := cfg.AgentConfig
-	role := roleOverride(kind, cfg)
-	override := role.AgentConfig
-	harnessMatches := role.Harness == "" || role.Harness == harness
-	if harnessMatches && override.Model != "" {
+	override := roleOverride(kind, cfg).AgentConfig
+	if override.Model != "" {
 		merged.Model = override.Model
 	}
-	if harnessMatches && override.Effort != "" {
+	if override.Effort != "" {
 		merged.Effort = override.Effort
 	}
-	if harnessMatches && override.Mode != "" {
+	if override.Mode != "" {
 		merged.Mode = override.Mode
 	}
 	if override.Permissions != "" {
@@ -1566,8 +1587,23 @@ func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, 
 	return merged
 }
 
+// sessionPermission resolves the one permission value used by every restore,
+// interface switch, and agent switch. Session metadata is the immutable floor;
+// project settings are only the fallback for legacy rows that have none.
+func sessionPermission(rec domain.SessionRecord, cfg domain.ProjectConfig) (domain.PermissionMode, error) {
+	permission := effectiveAgentConfig(rec.Kind, cfg).Permissions
+	if rec.Metadata.Permissions != "" {
+		permission = rec.Metadata.Permissions
+	}
+	resolved, err := domain.ResolvePermissionMode("", permission)
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
 func restoredAgentConfig(rec domain.SessionRecord, cfg domain.ProjectConfig) ports.AgentConfig {
-	merged := effectiveAgentConfig(rec.Harness, rec.Kind, cfg)
+	merged := effectiveAgentConfig(rec.Kind, cfg)
 	if rec.Harness == domain.HarnessClaudeCode {
 		merged.Model = rec.Metadata.Model
 	}
@@ -2421,8 +2457,15 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	// Restore resolves the project model while retaining this session's pinned
 	// permission policy independently of future project defaults.
 	agentConfig := restoredAgentConfig(rec, project.Config)
-	if rec.Metadata.Permissions != "" {
-		agentConfig.Permissions = rec.Metadata.Permissions
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: stored permission mode is invalid: %w", operation, rec.ID, err)
+	}
+	agentConfig.Permissions = permissions
+	if agentConfig.Permissions == ports.PermissionModeReadOnly {
+		return RestoreResult{}, fmt.Errorf("%s %s: %w: %q requires a Chat driver that advertises %s",
+			operation, rec.ID, ports.ErrChatPermissionModeUnsupported, agentConfig.Permissions,
+			ports.ChatCapabilityPreventiveReadOnly)
 	}
 	var env map[string]string
 	rec, env, err = m.prepareWorkerLaunchEnv(ctx, rec, project.Config.Env)
@@ -3963,7 +4006,7 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
-		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
+		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,

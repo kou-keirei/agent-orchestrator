@@ -3824,7 +3824,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ConversationTurnSettingsPayload'
+              $ref: '#/components/schemas/SetConversationTurnSettingsRequest'
         required: true
       responses:
         "200":
@@ -8407,6 +8407,14 @@ components:
           type: string
         model:
           type: string
+        permissions:
+          enum:
+          - default
+          - read-only
+          - accept-edits
+          - auto
+          - bypass-permissions
+          type: string
         pinnedAt:
           format: date-time
           type:
@@ -8652,6 +8660,7 @@ components:
         permissionMode:
           enum:
           - default
+          - read-only
           - accept-edits
           - auto
           - bypass-permissions
@@ -9010,12 +9019,22 @@ components:
           type: string
         modelReroute:
           $ref: '#/components/schemas/ConversationModelReroutePayload'
+        nativeEvidence:
+          $ref: '#/components/schemas/NativePermissionEvidence'
         nativeForkAvailableAfterSequence:
           format: int64
           type: integer
         oldestSequence:
           format: int64
           type: integer
+        permissionFloor:
+          enum:
+          - default
+          - read-only
+          - accept-edits
+          - auto
+          - bypass-permissions
+          type: string
         rateLimits:
           $ref: '#/components/schemas/ConversationRateLimitsPayload'
         sessionId:
@@ -9038,6 +9057,7 @@ components:
       - sessionId
       - mode
       - controller
+      - nativeEvidence
       - latestSequence
       - hasMoreBefore
       - nativeForkAvailableAfterSequence
@@ -9128,6 +9148,7 @@ components:
         approvalMode:
           enum:
           - default
+          - read-only
           - accept-edits
           - auto
           - bypass-permissions
@@ -9136,6 +9157,10 @@ components:
           type: string
         reasoningEffort:
           type: string
+        reasoningEffortSet:
+          type: boolean
+      required:
+      - reasoningEffortSet
       type: object
     ConversationUsagePayload:
       properties:
@@ -9230,6 +9255,7 @@ components:
         approvalMode:
           enum:
           - default
+          - read-only
           - accept-edits
           - auto
           - bypass-permissions
@@ -10222,6 +10248,32 @@ components:
           type: boolean
       required:
       - muted
+      type: object
+    NativePermissionEvidence:
+      properties:
+        approvalPolicy:
+          type: string
+        effectivePermission:
+          type: string
+        preventiveCapability:
+          type: boolean
+        proofStatus:
+          enum:
+          - PROVEN
+          - UNPROVEN
+          - DEFERRED_WITH_EXACT_REASON
+          type: string
+        provider:
+          type: string
+        requestedPermission:
+          type: string
+        threadSandbox:
+          type: string
+        turnSandbox:
+          type: string
+      required:
+      - preventiveCapability
+      - proofStatus
       type: object
     NotificationEnvelope:
       properties:
@@ -11491,6 +11543,23 @@ components:
       required:
       - title
       type: object
+    SetConversationTurnSettingsRequest:
+      properties:
+        approvalMode:
+          enum:
+          - default
+          - read-only
+          - accept-edits
+          - auto
+          - bypass-permissions
+          type: string
+        model:
+          type: string
+        reasoningEffort:
+          type:
+          - "null"
+          - string
+      type: object
     SetProjectConfigInput:
       properties:
         config:
@@ -11503,6 +11572,7 @@ components:
         permissions:
           enum:
           - default
+          - read-only
           - accept-edits
           - auto
           - bypass-permissions
@@ -11739,6 +11809,11 @@ components:
         displayName:
           maxLength: 20
           type: string
+        effort:
+          maxLength: 64
+          type:
+          - "null"
+          - string
         harness:
           enum:
           - claude-code
@@ -11785,6 +11860,14 @@ components:
           maxLength: 256
           type: string
         parentSessionId:
+          type: string
+        permissions:
+          enum:
+          - default
+          - read-only
+          - accept-edits
+          - auto
+          - bypass-permissions
           type: string
         projectId:
           type: string

@@ -52,8 +52,22 @@ type conversation struct {
 	historyParentID string
 	providerScopeID string
 	events          chan ports.ChatEvent
+	// preventiveReadOnly is set only after Codex confirms the exact native
+	// approval and sandbox posture for this thread.
+	preventiveReadOnly bool
+	nativeEvidence     ports.ChatNativeEvidence
 	// Effective defaults returned when Codex opened or resumed this thread.
 	threadModel, threadEffort string
+
+	dispatchMu     sync.RWMutex
+	dispatchInput  ports.ChatDispatchConformanceInput
+	dispatchResult ports.ChatDispatchConformance
+	// dispatchFirstTurnObserved prevents a malformed first notification from
+	// being replaced by a later turn that would no longer be the first witness.
+	dispatchFirstTurnObserved bool
+	// dispatchFirstTurnResponseObserved makes the provider's turn/start response
+	// the immutable anchor even if turn/started races the response delivery.
+	dispatchFirstTurnResponseObserved bool
 
 	mu      sync.Mutex
 	pending map[string]*parkedRequest
@@ -90,6 +104,7 @@ type conversation struct {
 }
 
 var _ ports.ChatConversation = (*conversation)(nil)
+var _ ports.ChatDispatchConformanceReporter = (*conversation)(nil)
 
 // Asserted here so a refactor cannot silently drop model listing: the service
 // feature-detects this interface, and a missed method would just mean "no models"
@@ -117,6 +132,15 @@ func newConversation(proc *process, log *slog.Logger, providerScopeID string) *c
 		pending:         make(map[string]*parkedRequest),
 		pumpDone:        make(chan struct{}),
 		providerScopeID: providerScopeID,
+		nativeEvidence: ports.ChatNativeEvidence{
+			Provider:             "codex",
+			EffectivePermission:  "unknown",
+			ApprovalPolicy:       "unknown",
+			ThreadSandbox:        "unknown",
+			TurnSandbox:          "unknown",
+			PreventiveCapability: false,
+			ProofStatus:          "UNPROVEN",
+		},
 	}
 	c.conn = newConnAt(proc.stdin, proc.stdout, log, c.handleServerRequest, proc.nextRequestID)
 	return c
@@ -132,6 +156,106 @@ func (c *conversation) start(threadID, model, effort string) {
 	go c.pump()
 }
 
+func (c *conversation) configureDispatch(input ports.ChatDispatchConformanceInput) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	c.dispatchInput = input
+	c.dispatchResult = VerifyDispatchConformance(input)
+}
+
+// DispatchConformance reports the current evidence result. Before the first
+// native turn arrives it is intentionally invalid: a thread response alone is
+// not proof that the child dispatched its first turn with those values.
+func (c *conversation) DispatchConformance() ports.ChatDispatchConformance {
+	c.dispatchMu.RLock()
+	defer c.dispatchMu.RUnlock()
+	return c.dispatchResult
+}
+
+func (c *conversation) recordDispatchedFirstTurn(providerTurnID string, settings ports.ChatTurnSettings) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchFirstTurnResponseObserved {
+		return
+	}
+	c.dispatchFirstTurnResponseObserved = true
+	// A notification can race the response. Retain the response's exact id and
+	// let the verifier classify a different notification as the wrong turn.
+	if providerTurnID != "" {
+		c.dispatchInput.FirstProviderTurnID = providerTurnID
+		// Per-turn model/effort selections are the actual first dispatch. If
+		// they differ from thread/start, retaining the thread values would
+		// falsely certify stale initial settings as first-turn evidence.
+		if settings.Model != "" {
+			c.dispatchInput.Dispatched.Values.Model = settings.Model
+		}
+		if settings.EffortOverride || settings.Effort != "" {
+			c.dispatchInput.Dispatched.Values.Effort = settings.Effort
+		}
+		bindDispatchEvidence(&c.dispatchInput.Requested, c.dispatchInput.SessionID, c.dispatchInput.ProviderConversationID, providerTurnID)
+		bindDispatchEvidence(&c.dispatchInput.Configured, c.dispatchInput.SessionID, c.dispatchInput.ProviderConversationID, providerTurnID)
+		bindDispatchEvidence(&c.dispatchInput.Dispatched, c.dispatchInput.SessionID, c.dispatchInput.ProviderConversationID, providerTurnID)
+		provider := c.dispatchInput.ProviderSelected
+		provider.ProviderTurnID = providerTurnID
+		provider.Fresh = true
+		provider.Correlated = true
+		c.dispatchInput.ProviderSelected = provider
+	} else {
+		// A successful RPC without a turn id is incomplete provider evidence. Do
+		// not let a later notification turn it into a valid first-turn result.
+		c.dispatchInput.ProviderSelected.Correlated = false
+	}
+	c.dispatchResult = VerifyDispatchConformance(c.dispatchInput)
+}
+
+// observeFirstTurn binds the authoritative thread response to the first native
+// turn/started notification. Codex's current notification has no repeated
+// model/effort fields, so the response values are copied into an explicitly
+// labelled correlation record rather than read from AO's model catalog.
+func (c *conversation) observeFirstTurn(params []byte) {
+	var turn codexproto.TurnStartedNotification
+	err := json.Unmarshal(params, &turn)
+
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchFirstTurnObserved {
+		return
+	}
+	c.dispatchFirstTurnObserved = true
+	if c.dispatchInput.FirstProviderTurnID == "" && !c.dispatchFirstTurnResponseObserved && err == nil {
+		c.dispatchInput.FirstProviderTurnID = turn.Turn.ID
+	}
+
+	provider := c.dispatchInput.ProviderSelected
+	provider.ProviderTurnID = turn.Turn.ID
+	c.dispatchInput.ProviderSelected = provider
+	c.dispatchInput.ObservedFirstTurn = ports.ChatDispatchEvidence{
+		Values:                 provider.Values,
+		Provenance:             ports.ChatDispatchProvenanceCodexFirstTurn,
+		SessionID:              c.dispatchInput.SessionID,
+		ProviderConversationID: turn.ThreadID,
+		ProviderTurnID:         turn.Turn.ID,
+		Fresh:                  err == nil,
+		Correlated:             err == nil,
+		ProviderRejected:       provider.ProviderRejected,
+	}
+	c.dispatchResult = VerifyDispatchConformance(c.dispatchInput)
+}
+
+func (c *conversation) recordProviderRejection(err error) {
+	var rejection *rpcError
+	if !errors.As(err, &rejection) {
+		return
+	}
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.dispatchFirstTurnObserved {
+		return
+	}
+	c.dispatchInput.ProviderSelected.ProviderRejected = true
+	c.dispatchResult = VerifyDispatchConformance(c.dispatchInput)
+}
+
 // ProviderConversationID is the Codex thread id AO persists for resume.
 func (c *conversation) ProviderConversationID() string { return c.threadID }
 
@@ -144,7 +268,63 @@ func (c *conversation) PreservesProviderOnClose() bool { return c.proc.terminate
 func (c *conversation) ReconnectedLive() bool { return c.proc.reconnected }
 
 // Capabilities reports what this conversation can do.
-func (c *conversation) Capabilities() ports.ChatCapabilities { return capabilities() }
+func (c *conversation) Capabilities() ports.ChatCapabilities {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	caps := capabilities()
+	if c.preventiveReadOnly {
+		caps[ports.ChatCapabilityPreventiveReadOnly] = true
+	}
+	return caps
+}
+
+// NativeEvidence reports only posture established by a provider response.
+func (c *conversation) NativeEvidence() ports.ChatNativeEvidence {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nativeEvidence
+}
+
+func (c *conversation) setNativeEvidence(requested ports.PermissionMode, approvalPolicy, threadSandbox string) {
+	verified := effectiveReadOnly(requested, approvalPolicy, threadSandbox)
+	effective := "unknown"
+	turnSandbox := "unknown"
+	proof := "UNPROVEN"
+	if verified {
+		effective = string(ports.PermissionModeReadOnly)
+		turnSandbox = "readOnly"
+		proof = "PROVEN"
+	}
+	c.mu.Lock()
+	c.preventiveReadOnly = verified
+	c.nativeEvidence = ports.ChatNativeEvidence{
+		Provider:             "codex",
+		RequestedPermission:  string(requested),
+		EffectivePermission:  effective,
+		ApprovalPolicy:       approvalPolicy,
+		ThreadSandbox:        threadSandbox,
+		TurnSandbox:          turnSandbox,
+		PreventiveCapability: verified,
+		ProofStatus:          proof,
+	}
+	c.mu.Unlock()
+}
+
+// invalidateNativeEvidence clears the last provider-confirmed effective posture
+// when a turn supplies a new approval/sandbox policy. The turn/start response
+// carries only the turn id, so retaining thread-start evidence would claim the
+// old posture was still effective for the new turn.
+func (c *conversation) invalidateNativeEvidence(requested ports.PermissionMode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.preventiveReadOnly = false
+	c.nativeEvidence.RequestedPermission = string(requested)
+	c.nativeEvidence.EffectivePermission = "unknown"
+	c.nativeEvidence.ApprovalPolicy = "unknown"
+	c.nativeEvidence.TurnSandbox = "unknown"
+	c.nativeEvidence.PreventiveCapability = false
+	c.nativeEvidence.ProofStatus = "UNPROVEN"
+}
 
 // Events is the normalized stream. It closes when the conversation ends.
 func (c *conversation) Events() <-chan ports.ChatEvent { return c.events }
@@ -162,6 +342,9 @@ func (c *conversation) pump() {
 	retries := make(map[string]ports.ChatEvent)
 
 	for n := range c.conn.notifs() {
+		if n.Method == codexproto.MethodTurnStarted {
+			c.observeFirstTurn(n.Params)
+		}
 		// Before normalizing, because a token-usage report is the only place the
 		// context position is stated and a compaction event that arrives in the same
 		// batch has to be able to read it.
@@ -311,6 +494,9 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		params["clientUserMessageId"] = msg.ClientMessageID
 	}
 	applyTurnSettings(params, msg.Settings)
+	if msg.Settings.Approval != "" {
+		c.invalidateNativeEvidence(msg.Settings.Approval)
+	}
 
 	var resp struct {
 		Turn struct {
@@ -318,8 +504,10 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		} `json:"turn"`
 	}
 	if err := c.conn.request(ctx, "turn/start", params, &resp); err != nil {
+		c.recordProviderRejection(err)
 		return ports.ChatTurnRef{}, fmt.Errorf("turn/start: %w", err)
 	}
+	c.recordDispatchedFirstTurn(resp.Turn.ID, msg.Settings)
 
 	c.mu.Lock()
 	c.activeTurn = resp.Turn.ID
@@ -337,7 +525,7 @@ func applyTurnSettings(params map[string]any, settings ports.ChatTurnSettings) {
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
-	if settings.Effort != "" {
+	if settings.EffortOverride || settings.Effort != "" {
 		params["effort"] = settings.Effort
 	}
 	if settings.Approval != "" {

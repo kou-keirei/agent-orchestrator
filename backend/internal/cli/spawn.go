@@ -30,6 +30,8 @@ type spawnOptions struct {
 	issue           string
 	name            string
 	model           string
+	effort          string
+	permission      string
 	claimPR         string
 	noTakeover      bool
 	skipAgentCheck  bool
@@ -39,17 +41,19 @@ type spawnOptions struct {
 // spawnRequest mirrors the daemon's SpawnSessionRequest body for
 // POST /api/v1/sessions. The CLI keeps its own copy so it need not import httpd.
 type spawnRequest struct {
-	ProjectID       string `json:"projectId,omitempty"`
-	IssueID         string `json:"issueId,omitempty"`
-	ParentSessionID string `json:"parentSessionId,omitempty"`
-	TrackerProvider string `json:"trackerProvider,omitempty"`
-	Kind            string `json:"kind,omitempty"`
-	Mode            string `json:"mode,omitempty"`
-	Harness         string `json:"harness,omitempty"`
-	Branch          string `json:"branch,omitempty"`
-	Prompt          string `json:"prompt,omitempty"`
-	Model           string `json:"model,omitempty"`
-	DisplayName     string `json:"displayName"`
+	ProjectID       string  `json:"projectId,omitempty"`
+	IssueID         string  `json:"issueId,omitempty"`
+	ParentSessionID string  `json:"parentSessionId,omitempty"`
+	TrackerProvider string  `json:"trackerProvider,omitempty"`
+	Kind            string  `json:"kind,omitempty"`
+	Mode            string  `json:"mode,omitempty"`
+	Harness         string  `json:"harness,omitempty"`
+	Branch          string  `json:"branch,omitempty"`
+	Prompt          string  `json:"prompt,omitempty"`
+	Model           string  `json:"model,omitempty"`
+	Effort          *string `json:"effort,omitempty"`
+	Permissions     string  `json:"permissions,omitempty"`
+	DisplayName     string  `json:"displayName"`
 }
 
 type spawnResult struct {
@@ -93,6 +97,18 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			}
 			if opts.kind != "" && opts.kind != "worker" && opts.kind != "orchestrator" {
 				return usageError{fmt.Errorf(`--kind must be "worker" or "orchestrator"`)}
+			}
+			permission := strings.TrimSpace(opts.permission)
+			if permission != "" && permission != "default" && permission != "read-only" &&
+				permission != "accept-edits" && permission != "auto" && permission != "bypass-permissions" {
+				return usageError{fmt.Errorf("--permission must be default, read-only, accept-edits, auto, or bypass-permissions")}
+			}
+			inheritedPermission := strings.TrimSpace(os.Getenv("AO_PERMISSION_MODE"))
+			if inheritedPermission == "read-only" {
+				if permission != "" && permission != inheritedPermission {
+					return usageError{fmt.Errorf("--permission cannot broaden inherited read-only authority")}
+				}
+				permission = inheritedPermission
 			}
 			if opts.standalone {
 				if opts.kind == "orchestrator" {
@@ -153,6 +169,10 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 					return err
 				}
 			}
+			var effort *string
+			if cmd.Flags().Changed("effort") {
+				effort = &opts.effort
+			}
 			req := spawnRequest{
 				ProjectID:       opts.project,
 				IssueID:         opts.issue,
@@ -164,6 +184,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				Branch:          opts.branch,
 				Prompt:          opts.prompt,
 				Model:           strings.TrimSpace(opts.model),
+				Effort:          effort,
+				Permissions:     permission,
 				DisplayName:     name,
 			}
 			var res spawnResult
@@ -220,6 +242,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.branch, "branch", "", "Branch for git project sessions (default: ao/<session-id>/root; unsupported for standalone or Scratch sessions)")
 	f.StringVar(&opts.prompt, "prompt", "", "Initial prompt for the agent")
 	f.StringVar(&opts.model, "model", "", "Agent model override for this session only (e.g. sonnet, gpt-5.6-sol); overrides project/role config without changing it")
+	f.StringVar(&opts.effort, "effort", "", "Model-advertised reasoning effort override for this session only (for example, low, medium, high, or max); omitted uses the provider/model default")
+	f.StringVar(&opts.permission, "permission", "", "Permission mode: default, read-only, accept-edits, auto, or bypass-permissions (read-only cannot be broadened by child sessions)")
 	f.StringVar(&opts.issue, "issue", "", "Issue id to associate with the session")
 	f.StringVar(&opts.trackerProvider, "tracker-provider", "github", "Issue tracker provider: github or gitlab (default: github)")
 	f.StringVar(&opts.name, "name", "", "Display name shown in the sidebar (required, max 20 characters)")

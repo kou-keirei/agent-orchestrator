@@ -105,6 +105,15 @@ func (m *Manager) InterfaceTransitionStatus(
 	if rec.IsTerminated {
 		status.ReasonCode = "SESSION_TERMINATED"
 		status.Reason = "Terminated sessions must be restored before switching interfaces."
+	} else if project, projectErr := m.loadProject(ctx, rec.ProjectID); projectErr != nil {
+		status.ReasonCode = "PERMISSION_MODE_UNVERIFIED"
+		status.Reason = projectErr.Error()
+	} else if permissions, permissionErr := sessionPermission(rec, project.Config); permissionErr != nil {
+		status.ReasonCode = "PERMISSION_MODE_INVALID"
+		status.Reason = permissionErr.Error()
+	} else if permissions == ports.PermissionModeReadOnly && target == domain.SessionModeTUI {
+		status.ReasonCode = "READ_ONLY_CHAT_REQUIRED"
+		status.Reason = "Read-only sessions require the Chat driver preventive permission boundary."
 	} else if target == domain.SessionModeChat && (m.chat == nil || !m.chat.SupportsChat(rec.Harness)) {
 		status.ReasonCode = "CHAT_UNSUPPORTED"
 		status.Reason = fmt.Sprintf("%s does not support Chat UI.", rec.Harness)
@@ -172,6 +181,21 @@ func (m *Manager) StartInterfaceTransition(
 	if target == source {
 		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: session %s is already in %s mode",
 			ErrInterfaceAlreadySelected, id, source)
+	}
+	project, err := m.loadProject(ctx, rec.ProjectID)
+	if err != nil {
+		return domain.SessionInterfaceTransition{}, err
+	}
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+	}
+	if target == domain.SessionModeTUI && permissions == ports.PermissionModeReadOnly {
+		// Refuse before arming or stopping Chat: read-only is a provider-enforced
+		// Chat boundary, and TUI has no approved native equivalent.
+		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: %q requires a Chat driver that advertises %s",
+			ports.ErrChatPermissionModeUnsupported, permissions,
+			ports.ChatCapabilityPreventiveReadOnly)
 	}
 	nativeID, err := m.handoffNativeConversationID(ctx, rec)
 	if err != nil {
@@ -672,8 +696,20 @@ func (m *Manager) nativeConversationNotStarted(
 		if !filepath.IsAbs(path) {
 			return false
 		}
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); err == nil {
 			return false
+		} else {
+			if !errors.Is(err, os.ErrNotExist) {
+				return false
+			}
+			// A missing leaf is safe only when its parent can be resolved as a
+			// directory. If lookup failed because an ancestor is missing or is
+			// not a directory, fail closed instead of treating the error as a
+			// fresh conversation.
+			parentInfo, parentErr := os.Stat(filepath.Dir(path))
+			if parentErr != nil || !parentInfo.IsDir() {
+				return false
+			}
 		}
 	}
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
@@ -795,8 +831,11 @@ func (m *Manager) preflightInterfaceTarget(
 		if err != nil {
 			return err
 		}
-		permissions := effectiveAgentConfig(rec.Harness, rec.Kind, project.Config).Permissions
-		return m.chat.PreflightChat(ctx, rec.Harness, permissions)
+		permissions, err := sessionPermission(rec, project.Config)
+		if err != nil {
+			return fmt.Errorf("stored permission mode is invalid: %w", err)
+		}
+		return m.chat.PreflightChat(ctx, rec.Harness, rec.Metadata.WorkspacePath, permissions)
 	}
 	agent, ok := m.agents.Agent(rec.Harness)
 	if !ok {
@@ -810,7 +849,17 @@ func (m *Manager) preflightInterfaceTarget(
 	if err != nil {
 		return err
 	}
-	config := effectiveAgentConfig(rec.Harness, rec.Kind, project.Config)
+	config := effectiveAgentConfig(rec.Kind, project.Config)
+	permissions, err := sessionPermission(rec, project.Config)
+	if err != nil {
+		return fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+	}
+	config.Permissions = permissions
+	if config.Permissions == ports.PermissionModeReadOnly {
+		return fmt.Errorf("%w: %q requires a Chat driver that advertises %s",
+			ports.ErrChatPermissionModeUnsupported, config.Permissions,
+			ports.ChatCapabilityPreventiveReadOnly)
+	}
 	var cmd []string
 	if transition.NativeConversationID == "" {
 		cmd, _, _, err = freshLaunchArgv(ctx, agent, rec.ID, rec.Metadata.WorkspacePath,
@@ -924,7 +973,6 @@ func (m *Manager) prepareSourceHandoff(
 	defer ticker.Stop()
 	idleSince := time.Time{}
 	idleSamples := 0
-	draftSamples := 0
 	unverifiedIdleSince := time.Time{}
 	for {
 		current, ok, err := m.store.GetSession(ctx, rec.ID)
@@ -976,8 +1024,6 @@ func (m *Manager) prepareSourceHandoff(
 				unverifiedIdle = current.Activity.State == domain.ActivityIdle && !idleProven
 			} else if outputErr == nil {
 				observation := surfaceInspector.InspectTerminalSurface(output)
-				draftObserved := observation.Composer == ports.TerminalComposerDraft &&
-					current.Activity.State == domain.ActivityIdle
 				switch {
 				case observation.Work == ports.TerminalSurfaceWorkWaitingInput,
 					observation.Work == ports.TerminalSurfaceWorkBlocked:
@@ -989,31 +1035,22 @@ func (m *Manager) prepareSourceHandoff(
 						cancelProbe()
 					}
 					return errDrainDecisionPending
-				case draftObserved:
-					// A stable positively identified draft is sufficient to
-					// preserve the source. Work markers are provider chrome
-					// heuristics and may also occur in transcript or draft text, so
-					// they cannot hide unsent input when the durable provider state
-					// is idle. Single captures are not enough: providers repaint
-					// non-dim chrome (banner, queue, update rows) through the
-					// composer borders mid-frame, so require the same repeated
-					// evidence as the idle decision before blocking the switch.
-					draftSamples++
-					if draftSamples >= interfaceTransitionSurfaceIdleSamples {
-						if cancelProbe != nil {
-							cancelProbe()
-						}
-						return errDrainDraftPresent
+				case observation.Composer == ports.TerminalComposerDraft &&
+					current.Activity.State == domain.ActivityIdle:
+					// A positively identified draft is sufficient to preserve the
+					// source. Work markers are provider chrome heuristics and may
+					// also occur in transcript or draft text, so they cannot hide
+					// unsent input when the durable provider state is idle.
+					if cancelProbe != nil {
+						cancelProbe()
 					}
+					return errDrainDraftPresent
 				case current.Activity.State == domain.ActivityIdle &&
 					observation.Work == ports.TerminalSurfaceWorkIdle &&
 					observation.Composer == ports.TerminalComposerEmpty:
 					idleProven = true
 				case observation.Work == ports.TerminalSurfaceWorkActive:
 					surfaceKnownBusy = true
-				}
-				if !draftObserved {
-					draftSamples = 0
 				}
 			}
 		}

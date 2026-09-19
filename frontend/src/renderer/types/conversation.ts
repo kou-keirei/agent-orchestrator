@@ -554,17 +554,18 @@ export interface ConversationActivity {
 export type ConversationItem = ConversationMessage | ConversationActivity;
 
 /** AO's permission vocabulary, applied per turn in chat mode. */
-export type ApprovalMode = "default" | "accept-edits" | "auto" | "bypass-permissions";
+export type ApprovalMode = "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
 
 /**
  * The provider choices for the next turn.
  *
- * Every field is optional and empty means the provider's own default, so clearing
- * a choice and never making one are the same thing.
+ * `reasoningEffortSet` distinguishes an explicit provider-default choice from
+ * an omitted choice that inherits AO/provider policy.
  */
 export interface TurnSettings {
 	model?: string;
 	reasoningEffort?: string;
+	reasoningEffortSet?: boolean;
 	approvalMode?: ApprovalMode;
 }
 
