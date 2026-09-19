@@ -2962,6 +2962,30 @@ func (m *Manager) ReconcileStartupSafety(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("reconcile: interface transitions: %w", err)
 	}
+	if err := m.reconcileInterruptedSpawnSeeds(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reconcileInterruptedSpawnSeeds terminates orchestrator rows left behind when
+// the daemon dies after persisting a spawn seed but before creating either its
+// workspace or runtime. Rows with either recovery anchor remain available to
+// the normal background reconciliation pass.
+func (m *Manager) reconcileInterruptedSpawnSeeds(ctx context.Context) error {
+	recs, err := m.store.ListAllSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile: list sessions for interrupted spawns: %w", err)
+	}
+	for _, rec := range recs {
+		if rec.IsTerminated || rec.Kind != domain.KindOrchestrator || rec.Metadata.WorkspacePath != "" || runtimeHandle(rec.Metadata).ID != "" {
+			continue
+		}
+		m.logger.Warn("reconcile: terminating interrupted orchestrator spawn with no workspace or runtime", "sessionID", rec.ID)
+		if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
+			return fmt.Errorf("reconcile: terminate interrupted orchestrator spawn %s: %w", rec.ID, err)
+		}
+	}
 	return nil
 }
 
