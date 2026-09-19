@@ -376,19 +376,32 @@ func TestGetAgentHooksDelegates(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(data)
+	var settings struct {
+		Hooks map[string][]hooksjson.MatcherGroup `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
-		"ao hooks continue session-start",
-		"ao hooks continue user-prompt-submit",
-		"ao hooks continue notification",
-		"ao hooks continue stop",
-		"ao hooks continue session-end",
+		continueHookCommandPrefix + "session-start",
+		continueHookCommandPrefix + "user-prompt-submit",
+		continueHookCommandPrefix + "notification",
+		continueHookCommandPrefix + "stop",
+		continueHookCommandPrefix + "session-end",
 	} {
-		if !strings.Contains(body, want) {
+		if !hasContinueHookCommand(settings.Hooks, want) {
 			t.Fatalf("settings missing %q: %s", want, body)
 		}
 	}
 	if strings.Contains(body, "ao hooks claude-code") {
 		t.Fatalf("Continue hooks must use the Continue token, got: %s", body)
+	}
+	if !strings.Contains(body, "AO_CLI") || strings.Contains(body, "ao hooks continue ") {
+		t.Fatalf("Continue hooks must use canonical AO_CLI commands: %s", body)
+	}
+	hook := settings.Hooks["Stop"][0].Hooks[0]
+	if string(hook.Extra["shell"]) != `"`+continueHookShell+`"` {
+		t.Fatalf("Continue hook shell = %s, want %q", hook.Extra["shell"], continueHookShell)
 	}
 }
 
@@ -409,7 +422,7 @@ func TestGetAgentHooksIncludesSupportedSessionStartSources(t *testing.T) {
 	}
 	for _, group := range settings.Hooks["SessionStart"] {
 		for _, hook := range group.Hooks {
-			if hook.Command == "ao hooks continue session-start" {
+			if hook.Command == continueHookCommandPrefix+"session-start" {
 				if group.Matcher == nil || *group.Matcher != "startup|resume|clear|compact" {
 					t.Fatalf("SessionStart matcher = %v, want startup|resume|clear|compact", group.Matcher)
 				}
@@ -446,7 +459,7 @@ func TestGetAgentHooksMigratesLegacyClaudeHooks(t *testing.T) {
 	if !strings.Contains(body, "user stop hook") {
 		t.Fatalf("user hook was not preserved: %s", body)
 	}
-	if !strings.Contains(body, "ao hooks continue stop") || !strings.Contains(body, "ao hooks continue notification") {
+	if !strings.Contains(body, "hooks continue stop") || !strings.Contains(body, "hooks continue notification") {
 		t.Fatalf("new Continue hooks missing: %s", body)
 	}
 }
@@ -475,7 +488,7 @@ func TestClaudeInstallReplacesContinueHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(data)
-	if strings.Contains(body, "ao hooks continue ") {
+	if strings.Contains(body, "hooks continue ") {
 		t.Fatalf("Continue hooks were retained after Claude install: %s", body)
 	}
 	if !strings.Contains(body, "hooks claude-code stop") {
@@ -484,6 +497,64 @@ func TestClaudeInstallReplacesContinueHooks(t *testing.T) {
 	if !strings.Contains(body, "user stop hook") {
 		t.Fatalf("user hook was not preserved: %s", body)
 	}
+}
+
+func TestUninstallHooksPreservesClaudeSiblingHooks(t *testing.T) {
+	ws := t.TempDir()
+	plugin := &Plugin{}
+	cfg := ports.WorkspaceHookConfig{WorkspacePath: ws}
+	if err := plugin.GetAgentHooks(context.Background(), cfg); err != nil {
+		t.Fatalf("install Continue hooks: %v", err)
+	}
+	settingsPath := filepath.Join(ws, ".claude", "settings.local.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Hooks map[string][]hooksjson.MatcherGroup `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	settings.Hooks["Stop"][0].Hooks = append(settings.Hooks["Stop"][0].Hooks, hooksjson.HookEntry{
+		Type: "command", Command: hooksjson.CanonicalAOHookPrefix("claude-code") + "stop",
+	})
+	data, err = json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := continueHooks.Uninstall(context.Background(), ws); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if strings.Contains(body, "hooks continue ") || !strings.Contains(body, "hooks claude-code stop") {
+		t.Fatalf("Continue uninstall changed Claude sibling hook: %s", body)
+	}
+	if installed, err := continueHooks.AreInstalled(context.Background(), ws); err != nil || installed {
+		t.Fatalf("AreHooksInstalled after uninstall = (%v, %v), want (false, nil)", installed, err)
+	}
+}
+
+func hasContinueHookCommand(hooks map[string][]hooksjson.MatcherGroup, want string) bool {
+	for _, groups := range hooks {
+		for _, group := range groups {
+			for _, hook := range group.Hooks {
+				if hook.Command == want {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func TestDeriveActivityStateUsesClaudeCompatiblePayload(t *testing.T) {

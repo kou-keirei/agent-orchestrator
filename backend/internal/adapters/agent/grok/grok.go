@@ -51,26 +51,28 @@ var grokBinarySpec = binaryutil.BinarySpec{
 const (
 	grokClaudeSettingsDirName  = ".claude"
 	grokClaudeSettingsFileName = "settings.local.json"
-	grokHookCommandPrefix      = "ao hooks grok "
 	grokHookTimeout            = 30
 )
+
+var grokHookCommandPrefix = hooksjson.CanonicalAOHookPrefix("grok")
+var grokHookShell = hooksjson.CanonicalAOHookShell()
 
 var grokStartupMatcher = "startup"
 
 // grokManagedHooks is Claude Code's hook event shape with Grok-specific AO
 // hook commands. Grok reads this file through its Claude compatibility layer,
-// while `ao hooks grok` keeps activity and session metadata attributed to the
-// Grok harness.
+// while the canonical AO_CLI command routes to `hooks grok`, keeping activity
+// and session metadata attributed to the Grok harness.
 var grokManagedHooks = []hooksjson.HookSpec{
-	{Event: "SessionStart", Matcher: &grokStartupMatcher, Command: grokHookCommandPrefix + "session-start"},
-	{Event: "UserPromptSubmit", Command: grokHookCommandPrefix + "user-prompt-submit"},
-	{Event: "PreToolUse", Command: grokHookCommandPrefix + "pre-tool-use"},
-	{Event: "PostToolUse", Command: grokHookCommandPrefix + "post-tool-use"},
-	{Event: "PostToolUseFailure", Command: grokHookCommandPrefix + "post-tool-use-failure"},
-	{Event: "PermissionRequest", Command: grokHookCommandPrefix + "permission-request"},
-	{Event: "Stop", Command: grokHookCommandPrefix + "stop"},
-	{Event: "Notification", Command: grokHookCommandPrefix + "notification"},
-	{Event: "SessionEnd", Command: grokHookCommandPrefix + "session-end"},
+	{Shell: grokHookShell, Event: "SessionStart", Matcher: &grokStartupMatcher, Command: grokHookCommandPrefix + "session-start"},
+	{Shell: grokHookShell, Event: "UserPromptSubmit", Command: grokHookCommandPrefix + "user-prompt-submit"},
+	{Shell: grokHookShell, Event: "PreToolUse", Command: grokHookCommandPrefix + "pre-tool-use"},
+	{Shell: grokHookShell, Event: "PostToolUse", Command: grokHookCommandPrefix + "post-tool-use"},
+	{Shell: grokHookShell, Event: "PostToolUseFailure", Command: grokHookCommandPrefix + "post-tool-use-failure"},
+	{Shell: grokHookShell, Event: "PermissionRequest", Command: grokHookCommandPrefix + "permission-request"},
+	{Shell: grokHookShell, Event: "Stop", Command: grokHookCommandPrefix + "stop"},
+	{Shell: grokHookShell, Event: "Notification", Command: grokHookCommandPrefix + "notification"},
+	{Shell: grokHookShell, Event: "SessionEnd", Command: grokHookCommandPrefix + "session-end"},
 }
 
 var grokHooks = hooksjson.Manager{

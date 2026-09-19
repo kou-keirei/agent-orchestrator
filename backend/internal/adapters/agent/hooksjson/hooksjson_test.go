@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -113,6 +114,45 @@ func TestManagerPreservesUnknownUserHookFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUnknownUserHookFields(t, hooksPath)
+}
+
+func TestManagerUninstallPreservesSiblingLegacyPrefix(t *testing.T) {
+	workspace := t.TempDir()
+	hooksPath := filepath.Join(workspace, "hooks.json")
+	original := []byte(`{"hooks":{"Stop":[{"hooks":[
+{"type":"command","command":"ao hooks current stop"},
+{"type":"command","command":"ao hooks sibling stop"},
+{"type":"command","command":"ao hooks current-legacy stop"}
+]}]}}`)
+	if err := os.WriteFile(hooksPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := Manager{
+		Label:                    "current",
+		CommandPrefix:            "ao hooks current ",
+		LegacyCommandPrefixes:    []string{"ao hooks sibling "},
+		UninstallCommandPrefixes: []string{"ao hooks current-legacy "},
+		Path:                     func(string) string { return hooksPath },
+		Managed:                  []HookSpec{{Event: "Stop", Command: "ao hooks current stop"}},
+	}
+	if err := manager.Uninstall(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if strings.Contains(body, "ao hooks current stop") || strings.Contains(body, "ao hooks current-legacy stop") {
+		t.Fatalf("current hooks survived uninstall: %s", body)
+	}
+	if !strings.Contains(body, "ao hooks sibling stop") {
+		t.Fatalf("sibling hook was removed: %s", body)
+	}
+	if installed, err := manager.AreInstalled(t.Context(), workspace); err != nil || installed {
+		t.Fatalf("AreInstalled after uninstall = (%v, %v), want (false, nil)", installed, err)
+	}
 }
 
 func TestManagerPreservesManagedHookExtensionsOnReconcile(t *testing.T) {

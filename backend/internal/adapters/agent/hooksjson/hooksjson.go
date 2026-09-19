@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
@@ -160,6 +161,24 @@ type HookSpec struct {
 	Command string
 }
 
+// CanonicalAOHookPrefix returns the shell command prefix used by AO-managed
+// hooks. Managed shells must invoke the absolute AO executable from AO_CLI;
+// falling back to a bare "ao" would let a nested shell select another install.
+func CanonicalAOHookPrefix(harness string) string {
+	if runtime.GOOS == "windows" {
+		return `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks ` + harness + " "
+	}
+	return `"${AO_CLI:?AO_CLI is not set}" hooks ` + harness + " "
+}
+
+// CanonicalAOHookShell returns the shell that interprets CanonicalAOHookPrefix.
+func CanonicalAOHookShell() string {
+	if runtime.GOOS == "windows" {
+		return "powershell"
+	}
+	return "bash"
+}
+
 // Manager installs, removes, and detects AO's hooks in one agent's matcher-group
 // hooks file. Construct one per adapter with its file path, command prefix,
 // per-hook timeout, and managed hook set.
@@ -173,6 +192,10 @@ type Manager struct {
 	// LegacyCommandPrefixes identifies AO-owned command prefixes from an older
 	// installer that should be removed while installing the current hooks.
 	LegacyCommandPrefixes []string
+	// UninstallCommandPrefixes identifies legacy prefixes this adapter may safely
+	// remove during its own uninstall. Install-time legacy prefixes can include a
+	// sibling adapter's old command and therefore are not removed by default.
+	UninstallCommandPrefixes []string
 	// Timeout is written into each installed hook entry.
 	Timeout int
 	// Path returns the hooks file path for a workspace.
@@ -282,8 +305,7 @@ func (m Manager) Uninstall(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
-		groups = removeManaged(groups, m.CommandPrefix)
-		groups = removeManagedPrefixes(groups, m.LegacyCommandPrefixes)
+		groups = removeManagedPrefixes(groups, m.uninstallCommandPrefixes())
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
@@ -321,7 +343,7 @@ func (m Manager) AreInstalled(ctx context.Context, workspacePath string) (bool, 
 		}
 		for _, group := range groups {
 			for _, hook := range group.Hooks {
-				for _, prefix := range append([]string{m.CommandPrefix}, m.LegacyCommandPrefixes...) {
+				for _, prefix := range m.uninstallCommandPrefixes() {
 					if strings.HasPrefix(hook.Command, prefix) {
 						return true, nil
 					}
@@ -330,6 +352,12 @@ func (m Manager) AreInstalled(ctx context.Context, workspacePath string) (bool, 
 		}
 	}
 	return false, nil
+}
+
+func (m Manager) uninstallCommandPrefixes() []string {
+	prefixes := make([]string, 0, 1+len(m.UninstallCommandPrefixes))
+	prefixes = append(prefixes, m.CommandPrefix)
+	return append(prefixes, m.UninstallCommandPrefixes...)
 }
 
 // groupByEvent groups the managed specs by event so each event array is
@@ -482,26 +510,6 @@ func addHook(groups []MatcherGroup, hook HookEntry, matcher *string) []MatcherGr
 		}
 	}
 	return append(groups, MatcherGroup{Matcher: matcher, Hooks: []HookEntry{hook}})
-}
-
-// removeManaged strips AO hook entries (matched by command prefix) from every
-// group, dropping any group left without hooks so the event array doesn't
-// accumulate empty matcher objects.
-func removeManaged(groups []MatcherGroup, prefix string) []MatcherGroup {
-	result := make([]MatcherGroup, 0, len(groups))
-	for _, group := range groups {
-		kept := make([]HookEntry, 0, len(group.Hooks))
-		for _, hook := range group.Hooks {
-			if !strings.HasPrefix(hook.Command, prefix) {
-				kept = append(kept, hook)
-			}
-		}
-		if len(kept) > 0 {
-			group.Hooks = kept
-			result = append(result, group)
-		}
-	}
-	return result
 }
 
 func matchersEqual(a, b *string) bool {

@@ -93,6 +93,48 @@ func TestLegacyHooksRemainDetectableAndRemovable(t *testing.T) {
 	}
 }
 
+func TestUninstallPreservesContinueSiblingHooks(t *testing.T) {
+	workspace := t.TempDir()
+	path := claudeSettingsPath(workspace)
+	p := &Plugin{}
+	if err := p.GetAgentHooks(t.Context(), ports.WorkspaceHookConfig{WorkspacePath: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Hooks map[string][]hooksjson.MatcherGroup `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	settings.Hooks["Stop"][0].Hooks = append(settings.Hooks["Stop"][0].Hooks, hooksjson.HookEntry{
+		Type: "command", Command: "ao hooks continue stop",
+	})
+	data, err = json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.UninstallHooks(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), claudeHookCommandPrefix+"stop") || !strings.Contains(string(data), "ao hooks continue stop") {
+		t.Fatalf("adapter uninstall changed sibling hooks: %s", data)
+	}
+	if installed, err := p.AreHooksInstalled(t.Context(), workspace); err != nil || installed {
+		t.Fatalf("AreHooksInstalled after uninstall = (%v, %v), want (false, nil)", installed, err)
+	}
+}
+
 func TestManagedHookRefreshSelectsShellAndPreservesExtras(t *testing.T) {
 	workspace := t.TempDir()
 	p := &Plugin{}

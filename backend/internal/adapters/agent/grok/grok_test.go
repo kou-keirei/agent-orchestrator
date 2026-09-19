@@ -382,7 +382,17 @@ func TestGetAgentHooksInstallsGrokCommandsInClaudeSettings(t *testing.T) {
 		if got := countGrokHookCommand(config.Hooks[spec.Event], spec.Command); got != 1 {
 			t.Fatalf("%s command %q count = %d, want 1", spec.Event, spec.Command, got)
 		}
-		claudeCommand := strings.Replace(spec.Command, "ao hooks grok ", "ao hooks claude-code ", 1)
+		if !strings.Contains(spec.Command, "AO_CLI") || strings.HasPrefix(spec.Command, "ao hooks ") {
+			t.Fatalf("%s command is not canonical AO_CLI invocation: %q", spec.Event, spec.Command)
+		}
+		for _, group := range config.Hooks[spec.Event] {
+			for _, hook := range group.Hooks {
+				if hook.Command == spec.Command && string(hook.Extra["shell"]) != `"`+grokHookShell+`"` {
+					t.Fatalf("%s hook shell = %s, want %q", spec.Event, hook.Extra["shell"], grokHookShell)
+				}
+			}
+		}
+		claudeCommand := hooksjson.CanonicalAOHookPrefix("claude-code") + strings.TrimPrefix(spec.Command, grokHookCommandPrefix)
 		if spec.Event != "Stop" && countGrokHookCommand(config.Hooks[spec.Event], claudeCommand) != 0 {
 			t.Fatalf("%s unexpectedly installed Claude command %q", spec.Event, claudeCommand)
 		}
@@ -396,13 +406,13 @@ func TestGetAgentHooksInstallsGrokCommandsInClaudeSettings(t *testing.T) {
 	if len(config.Permissions) == 0 {
 		t.Fatalf("unrelated settings clobbered: %s", data)
 	}
-	if m := grokMatcherForCommand(config.Hooks["SessionStart"], "ao hooks grok session-start"); m == nil || *m != "startup" {
+	if m := grokMatcherForCommand(config.Hooks["SessionStart"], grokHookCommandPrefix+"session-start"); m == nil || *m != "startup" {
 		t.Fatalf("SessionStart matcher = %v, want startup", m)
 	}
-	if m := grokMatcherForCommand(config.Hooks["UserPromptSubmit"], "ao hooks grok user-prompt-submit"); m != nil {
+	if m := grokMatcherForCommand(config.Hooks["UserPromptSubmit"], grokHookCommandPrefix+"user-prompt-submit"); m != nil {
 		t.Fatalf("UserPromptSubmit matcher = %v, want none", m)
 	}
-	if m := grokMatcherForCommand(config.Hooks["Notification"], "ao hooks grok notification"); m != nil {
+	if m := grokMatcherForCommand(config.Hooks["Notification"], grokHookCommandPrefix+"notification"); m != nil {
 		t.Fatalf("Notification matcher = %v, want none", m)
 	}
 

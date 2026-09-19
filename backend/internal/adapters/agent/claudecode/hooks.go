@@ -20,19 +20,8 @@ const (
 	claudeHookTimeout       = 30
 )
 
-var claudeHookCommandPrefix = func() string {
-	if runtime.GOOS == "windows" {
-		return claudeWindowsHookPrefix
-	}
-	return claudePOSIXHookPrefix
-}()
-
-var claudeHookShell = func() string {
-	if runtime.GOOS == "windows" {
-		return "powershell"
-	}
-	return "bash"
-}()
+var claudeHookCommandPrefix = hooksjson.CanonicalAOHookPrefix("claude-code")
+var claudeHookShell = hooksjson.CanonicalAOHookShell()
 
 // claudeSessionStartMatcher is referenced by pointer so SessionStart serializes
 // with Claude's documented source matcher. "startup" alone misses --resume
@@ -74,7 +63,14 @@ var claudeHooks = hooksjson.Manager{
 	Label:         "claude-code",
 	CommandPrefix: claudeHookCommandPrefix,
 	LegacyCommandPrefixes: func() []string {
-		prefixes := []string{"ao hooks continue ", "ao hooks claude-code "}
+		prefixes := []string{"ao hooks continue ", hooksjson.CanonicalAOHookPrefix("continue"), "ao hooks claude-code "}
+		if runtime.GOOS == "windows" {
+			return append(prefixes, claudePOSIXHookPrefix)
+		}
+		return append(prefixes, claudeWindowsHookPrefix)
+	}(),
+	UninstallCommandPrefixes: func() []string {
+		prefixes := []string{"ao hooks claude-code "}
 		if runtime.GOOS == "windows" {
 			return append(prefixes, claudePOSIXHookPrefix)
 		}

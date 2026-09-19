@@ -42,9 +42,11 @@ const adapterID = "continue"
 const (
 	continueClaudeSettingsDirName  = ".claude"
 	continueClaudeSettingsFileName = "settings.local.json"
-	continueHookCommandPrefix      = "ao hooks continue "
 	continueHookTimeout            = 30
 )
+
+var continueHookCommandPrefix = hooksjson.CanonicalAOHookPrefix(adapterID)
+var continueHookShell = hooksjson.CanonicalAOHookShell()
 
 var continueBinarySpec = binaryutil.BinarySpec{
 	Label:         "cn",
@@ -66,16 +68,16 @@ var continueSessionStartMatcher = "startup|resume|clear|compact"
 // layer, while `ao hooks continue` keeps activity and session metadata
 // attributed to the Continue harness.
 var continueManagedHooks = []hooksjson.HookSpec{
-	{Event: "SessionStart", Matcher: &continueSessionStartMatcher, Command: continueHookCommandPrefix + "session-start"},
-	{Event: "UserPromptSubmit", Command: continueHookCommandPrefix + "user-prompt-submit"},
-	{Event: "PreToolUse", Command: continueHookCommandPrefix + "pre-tool-use"},
-	{Event: "PostToolUse", Command: continueHookCommandPrefix + "post-tool-use"},
-	{Event: "PostToolUseFailure", Command: continueHookCommandPrefix + "post-tool-use-failure"},
-	{Event: "PermissionRequest", Command: continueHookCommandPrefix + "permission-request"},
-	{Event: "Stop", Command: continueHookCommandPrefix + "stop"},
-	{Event: "Notification", Command: continueHookCommandPrefix + "notification"},
-	{Event: "SubagentStop", Command: continueHookCommandPrefix + "subagent-stop"},
-	{Event: "SessionEnd", Command: continueHookCommandPrefix + "session-end"},
+	{Shell: continueHookShell, Event: "SessionStart", Matcher: &continueSessionStartMatcher, Command: continueHookCommandPrefix + "session-start"},
+	{Shell: continueHookShell, Event: "UserPromptSubmit", Command: continueHookCommandPrefix + "user-prompt-submit"},
+	{Shell: continueHookShell, Event: "PreToolUse", Command: continueHookCommandPrefix + "pre-tool-use"},
+	{Shell: continueHookShell, Event: "PostToolUse", Command: continueHookCommandPrefix + "post-tool-use"},
+	{Shell: continueHookShell, Event: "PostToolUseFailure", Command: continueHookCommandPrefix + "post-tool-use-failure"},
+	{Shell: continueHookShell, Event: "PermissionRequest", Command: continueHookCommandPrefix + "permission-request"},
+	{Shell: continueHookShell, Event: "Stop", Command: continueHookCommandPrefix + "stop"},
+	{Shell: continueHookShell, Event: "Notification", Command: continueHookCommandPrefix + "notification"},
+	{Shell: continueHookShell, Event: "SubagentStop", Command: continueHookCommandPrefix + "subagent-stop"},
+	{Shell: continueHookShell, Event: "SessionEnd", Command: continueHookCommandPrefix + "session-end"},
 }
 
 var continueHooks = hooksjson.Manager{
@@ -161,9 +163,9 @@ func (p *Plugin) GetPromptDeliveryStrategy(ctx context.Context, cfg ports.Launch
 // GetAgentHooks installs Claude Code-shaped hooks because the Continue CLI
 // natively reads Claude Code hook settings.
 //
-// The installed commands are "ao hooks continue <evt>". Continue still fires
-// Claude-format events, but the Continue token makes AO store activity under the
-// actual harness instead of under claude-code.
+// The installed commands invoke AO_CLI with "hooks continue <evt>". Continue
+// still fires Claude-format events, but the Continue token makes AO store
+// activity under the actual harness instead of under claude-code.
 func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
 	if err := ctx.Err(); err != nil {
 		return err
