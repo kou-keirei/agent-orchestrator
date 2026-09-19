@@ -26,6 +26,17 @@ trigger: "Using the ao CLI in an AO workspace: spawning workers, managing sessio
 | `version` | Print version information | Checking installed version | - |
 | `completion` | Generate shell completion scripts | Setting up tab completion | - |
 
+## Canonical executable
+
+Inside an AO-managed session, `ao` in this catalog is command notation. Invoke
+the CLI through AO's absolute identity: `"$AO_CLI"` in POSIX shells (including
+Git Bash), or `& $env:AO_CLI` in PowerShell.
+
+AO supplies `AO_CLI` from the daemon executable. Do not replace it with
+`which ao`, `command -v ao`, an npm shim, or a hard-coded install path. Login
+shell startup files can reorder PATH after AO pins it; if `AO_CLI` is missing,
+report the failure instead of silently falling back to bare `ao`.
+
 ## Conventions
 
 - Most read commands accept `--json` for machine-readable output.

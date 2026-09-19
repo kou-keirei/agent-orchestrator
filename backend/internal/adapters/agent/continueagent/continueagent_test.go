@@ -478,7 +478,7 @@ func TestClaudeInstallReplacesContinueHooks(t *testing.T) {
 	if strings.Contains(body, "ao hooks continue ") {
 		t.Fatalf("Continue hooks were retained after Claude install: %s", body)
 	}
-	if !strings.Contains(body, "ao hooks claude-code stop") {
+	if !strings.Contains(body, "hooks claude-code stop") {
 		t.Fatalf("Claude hooks missing after switch: %s", body)
 	}
 	if !strings.Contains(body, "user stop hook") {

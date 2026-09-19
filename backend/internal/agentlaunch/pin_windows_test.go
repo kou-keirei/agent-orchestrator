@@ -61,8 +61,11 @@ func TestSharedWindowsInstallSelectsOnlyCanonicalAO(t *testing.T) {
 	if err != nil {
 		t.Fatal("Windows regression requires Git Bash: ", err)
 	}
+	if !isNativeWindowsBash(t, bash) {
+		t.Skip("Windows regression requires native Git Bash; discovered a non-Windows bash shim")
+	}
 	bashCmd := exec.CommandContext(context.Background(), bash, "--noprofile", "--norc", "-c", "ao -test.run=^TestSharedWindowsInstallSelectsOnlyCanonicalAO$")
-	bashCmd.Env = cmd.Env
+	bashCmd.Env = bashEnvironment(cmd.Env)
 	bashCmd.Dir = t.TempDir()
 	bashOutput, err := bashCmd.CombinedOutput()
 	if err != nil || !containsSameExecutable(t, string(bashOutput), canonical) {
@@ -111,6 +114,9 @@ func TestWindowsAOExecutableFallsBackToCopyAcrossFilesystems(t *testing.T) {
 	if err != nil {
 		t.Fatal("Windows regression requires Git Bash: ", err)
 	}
+	if !isNativeWindowsBash(t, bash) {
+		t.Skip("Windows regression requires native Git Bash; discovered a non-Windows bash shim")
+	}
 	cmd := exec.CommandContext(context.Background(), bash, "--noprofile", "--norc", "-c", "ao -test.run=^TestWindowsAOExecutableFallsBackToCopyAcrossFilesystems$")
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -119,9 +125,111 @@ func TestWindowsAOExecutableFallsBackToCopyAcrossFilesystems(t *testing.T) {
 		}
 	}
 	cmd.Env = append(cmd.Env, "PATH="+shimDir+";"+os.Getenv("PATH"), "AO_TEST_PIN_CHILD=1")
+	cmd.Env = bashEnvironment(cmd.Env)
 	output, err := cmd.CombinedOutput()
 	if err != nil || !strings.Contains(strings.ToLower(string(output)), strings.ToLower("IDENTITY="+shim)) {
 		t.Fatalf("Git Bash copied AO selection: %v\n%s", err, output)
+	}
+}
+
+func bashEnvironment(env []string) []string {
+	result := make([]string, 0, len(env))
+	path := ""
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(key, "PATH") {
+			path = value
+			continue
+		}
+		result = append(result, entry)
+	}
+	result = append(result, "PATH="+bashPath(path))
+	return result
+}
+
+func bashPath(path string) string {
+	parts := strings.Split(path, ";")
+	for i, part := range parts {
+		part = filepath.ToSlash(part)
+		if len(part) >= 2 && part[1] == ':' {
+			part = "/" + strings.ToLower(string(part[0])) + part[2:]
+		}
+		parts[i] = part
+	}
+	return strings.Join(parts, ":")
+}
+
+func isNativeWindowsBash(t *testing.T, bash string) bool {
+	t.Helper()
+	out, err := exec.Command(bash, "--noprofile", "--norc", "-c", "uname -s").Output()
+	if err != nil {
+		return false
+	}
+	kind := strings.ToUpper(strings.TrimSpace(string(out)))
+	return strings.Contains(kind, "MINGW") || strings.Contains(kind, "MSYS") || strings.Contains(kind, "CYGWIN")
+}
+
+func TestCanonicalWindowsCLIIgnoresShellPATH(t *testing.T) {
+	if os.Getenv("AO_TEST_CANONICAL_CHILD") == "1" {
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("IDENTITY=" + exe)
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := filepath.Join(t.TempDir(), "AO install's bin")
+	if err := os.MkdirAll(install, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonical := filepath.Join(install, "ao.exe")
+	if err := os.WriteFile(canonical, binary, 0o700); err != nil { //nolint:gosec // executable test fixture
+		t.Fatal(err)
+	}
+	foreign := t.TempDir()
+	if err := os.WriteFile(filepath.Join(foreign, "ao.cmd"), []byte("@echo FOREIGN\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"ao_cli": "foreign", EnvCLI: "foreign"}
+	if err := PinCLI(env, func() (string, error) { return canonical, nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, shell := range []struct {
+		name string
+		args []string
+	}{
+		{name: "powershell", args: []string{"-NoProfile", "-Command", `$env:PATH = $env:FOREIGN_DIR + ';' + $env:PATH; & $env:AO_CLI`}},
+		{name: "bash", args: []string{"--noprofile", "--norc", "-c", `export PATH="$FOREIGN_DIR:$PATH"; "$AO_CLI"`}},
+	} {
+		t.Run(shell.name, func(t *testing.T) {
+			shellPath, err := exec.LookPath(shell.name)
+			if err != nil {
+				t.Skipf("%s unavailable", shell.name)
+			}
+			if shell.name == "bash" && !isNativeWindowsBash(t, shellPath) {
+				t.Skip("native Git Bash unavailable")
+			}
+			cmd := exec.CommandContext(t.Context(), shellPath, shell.args...)
+			for _, entry := range os.Environ() {
+				key, _, _ := strings.Cut(entry, "=")
+				if !strings.EqualFold(key, EnvCLI) {
+					cmd.Env = append(cmd.Env, entry)
+				}
+			}
+			cmd.Env = append(cmd.Env, EnvCLI+"="+env[EnvCLI], "FOREIGN_DIR="+filepath.ToSlash(foreign), "AO_TEST_CANONICAL_CHILD=1")
+			output, err := cmd.CombinedOutput()
+			if err != nil || !containsSameExecutable(t, string(output), canonical) {
+				t.Fatalf("canonical selection: %v: %s", err, output)
+			}
+		})
 	}
 }
 

@@ -178,6 +178,38 @@ func TestRuntimeEnvPinsHooksToDaemonRunFile(t *testing.T) {
 	}
 }
 
+func TestRuntimeEnvPinsCanonicalCLIAgainstProjectAndPATHOverrides(t *testing.T) {
+	canonical := filepath.Join(t.TempDir(), "AO install", "ao")
+	stale := filepath.Join(t.TempDir(), "stale-install")
+	manager := &Manager{
+		dataDir:    filepath.Dir(canonical),
+		executable: func() (string, error) { return canonical, nil },
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	env := manager.runtimeEnv("mer-1", "mer", "", map[string]string{
+		"AO_CLI": "foreign",
+		"PATH":   stale,
+	})
+	if got := env["AO_CLI"]; got != filepath.ToSlash(canonical) {
+		t.Fatalf("AO_CLI = %q, want canonical absolute executable %q", got, filepath.ToSlash(canonical))
+	}
+	if env["PATH"] == stale || env["PATH"] == "" {
+		t.Fatalf("PATH was not independently pinned: %q", env["PATH"])
+	}
+}
+
+func TestRuntimeEnvClearsCanonicalCLIWhenResolutionFails(t *testing.T) {
+	manager := &Manager{
+		dataDir:    t.TempDir(),
+		executable: func() (string, error) { return "", errors.New("unavailable") },
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	env := manager.runtimeEnv("mer-1", "mer", "", map[string]string{"AO_CLI": "foreign"})
+	if got := env["AO_CLI"]; got != "" {
+		t.Fatalf("AO_CLI = %q, want explicit empty fail-closed value", got)
+	}
+}
+
 func TestHookPATH(t *testing.T) {
 	sep := string(os.PathListSeparator)
 	daemonExe := filepath.Join("/opt", "aod", "ao")

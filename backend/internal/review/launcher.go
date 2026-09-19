@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
@@ -548,6 +549,9 @@ func (l *agentLauncher) runtimeEnv(ctx context.Context, spec LaunchSpec, argv []
 	env[sessionmanager.EnvDataDir] = l.dataDir
 	if strings.TrimSpace(l.runFile) != "" {
 		env[EnvRunFile] = l.runFile
+	}
+	if err := agentlaunch.PinCLI(env, l.executable); err != nil {
+		env[EnvAOCommandWarning] = strings.TrimSpace(env[EnvAOCommandWarning] + "\n" + err.Error())
 	}
 	// pinnedDir is whichever directory ends up at the head of PATH here, so the
 	// launch-binary prepend below can put it back rather than letting a foreign
