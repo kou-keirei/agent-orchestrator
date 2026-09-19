@@ -4964,6 +4964,41 @@ func TestMarkSpawnedPersistsResolvedModel(t *testing.T) {
 	}
 }
 
+func TestMarkSpawnedPersistsResolvedEffortPresence(t *testing.T) {
+	ctx := context.Background()
+	st := newFakeStore()
+	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer"}
+	m := New(st, nil)
+
+	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{
+		WorkspacePath:  "/ws",
+		Effort:         "",
+		EffortResolved: true,
+	}); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	got, _, err := st.GetSession(ctx, "mer-1")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Metadata.Effort != "" || !got.Metadata.EffortResolved {
+		t.Fatalf("effort metadata = %#v, want resolved provider default", got.Metadata)
+	}
+
+	// A later lifecycle update without a resolved effort must not erase the
+	// session-owned explicit-empty choice.
+	if err := m.MarkSpawned(ctx, "mer-1", domain.SessionMetadata{WorkspacePath: "/ws"}); err != nil {
+		t.Fatalf("second MarkSpawned: %v", err)
+	}
+	got, _, err = st.GetSession(ctx, "mer-1")
+	if err != nil {
+		t.Fatalf("GetSession after relaunch: %v", err)
+	}
+	if got.Metadata.Effort != "" || !got.Metadata.EffortResolved {
+		t.Fatalf("effort metadata after relaunch = %#v, want preserved resolved provider default", got.Metadata)
+	}
+}
+
 func TestMarkChatSpawnedKeepsPreviousOwnerWhenAtomicBoundaryCommitFails(t *testing.T) {
 	ctx := context.Background()
 	st := newFakeStore()

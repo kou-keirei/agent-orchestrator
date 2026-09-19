@@ -183,6 +183,9 @@ func (m *Manager) executeChatAgentSwitch(
 		baseAgentConfig.Effort = ""
 		baseAgentConfig.Mode = ""
 	}
+	if rec.Metadata.EffortResolved {
+		baseAgentConfig.Effort = rec.Metadata.Effort
+	}
 	agentConfig, err := m.resolveChatAgentConfig(ctx, ports.SpawnConfig{
 		ProjectID: rec.ProjectID,
 		Kind:      rec.Kind,
@@ -405,6 +408,7 @@ func (m *Manager) executeChatAgentSwitch(
 		Env:                     targetLaunchEnv,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		EffortOverride:          rec.Metadata.EffortResolved && agentConfig.Effort == "",
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            finalSystemPrompt,
 		AdditionalDirectories:   additionalDirectories,

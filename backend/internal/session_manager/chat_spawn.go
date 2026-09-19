@@ -172,6 +172,8 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 				ControllerGeneration:      started.ControllerGeneration,
 				BrowserCapabilityVerifier: in.record.Metadata.BrowserCapabilityVerifier,
 				Model:                     agentConfig.Model,
+				Effort:                    agentConfig.Effort,
+				EffortResolved:            true,
 			}
 			committedConversation, commitErr := m.markChatControllerSpawned(
 				ctx, id, metadata, started.Conversation, started.ProviderBoundary,
@@ -366,6 +368,7 @@ func (m *Manager) resumeChatController(
 		Env:                     env,
 		Model:                   agentConfig.Model,
 		Effort:                  agentConfig.Effort,
+		EffortOverride:          rec.Metadata.EffortResolved && agentConfig.Effort == "",
 		Permissions:             agentConfig.Permissions,
 		SystemPrompt:            systemPrompt,
 		AdditionalDirectories:   additionalDirectories,

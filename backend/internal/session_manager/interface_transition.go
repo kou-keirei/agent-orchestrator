@@ -850,6 +850,9 @@ func (m *Manager) preflightInterfaceTarget(
 		return err
 	}
 	config := effectiveAgentConfig(rec.Harness, rec.Kind, project.Config)
+	if rec.Metadata.EffortResolved {
+		config.Effort = rec.Metadata.Effort
+	}
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
 		return fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)

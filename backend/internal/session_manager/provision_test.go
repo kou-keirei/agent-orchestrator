@@ -402,6 +402,55 @@ func TestResolveChatAgentConfigPreservesEffortPresence(t *testing.T) {
 	}
 }
 
+func TestResolvedSpawnAgentConfigPinsEffortPresence(t *testing.T) {
+	project := domain.ProjectConfig{
+		Worker: domain.RoleOverride{AgentConfig: domain.AgentConfig{Effort: "high"}},
+	}
+	tests := []struct {
+		name           string
+		effort         string
+		effortOverride bool
+		want           string
+	}{
+		{name: "omitted inherits project effort", want: "high"},
+		{name: "explicit empty selects provider default", effortOverride: true},
+		{name: "explicit value pins session effort", effort: "low", effortOverride: true, want: "low"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolved := resolvedSpawnAgentConfig(ports.SpawnConfig{
+				Kind: domain.KindWorker, Harness: domain.HarnessCodex,
+				AgentConfig: ports.AgentConfig{Effort: test.effort}, EffortOverride: test.effortOverride,
+			}, project)
+			if resolved.Effort != test.want {
+				t.Fatalf("resolved effort = %q, want %q", resolved.Effort, test.want)
+			}
+		})
+	}
+}
+
+func TestRestoredAgentConfigUsesSessionEffortWhenResolved(t *testing.T) {
+	project := domain.ProjectConfig{
+		Worker: domain.RoleOverride{AgentConfig: domain.AgentConfig{Effort: "high"}},
+	}
+	for _, test := range []struct {
+		name     string
+		metadata domain.SessionMetadata
+		want     string
+	}{
+		{name: "legacy row falls back to project", want: "high"},
+		{name: "resolved empty remains provider default", metadata: domain.SessionMetadata{EffortResolved: true}, want: ""},
+		{name: "resolved value remains pinned", metadata: domain.SessionMetadata{Effort: "low", EffortResolved: true}, want: "low"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := restoredAgentConfig(domain.SessionRecord{Harness: domain.HarnessCodex, Kind: domain.KindWorker, Metadata: test.metadata}, project)
+			if got.Effort != test.want {
+				t.Fatalf("restored effort = %q, want %q", got.Effort, test.want)
+			}
+		})
+	}
+}
+
 func TestResolveChatAgentConfigDropsEffortForNonCodexHarnesses(t *testing.T) {
 	catalogCalls := 0
 	m := &Manager{modelCatalog: tuningCatalog{calls: &catalogCalls, catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{

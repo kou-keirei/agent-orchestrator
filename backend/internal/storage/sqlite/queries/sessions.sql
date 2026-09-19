@@ -19,9 +19,10 @@ INSERT INTO sessions (
     native_transcript_path,
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
     session_mode, provider_conversation_id, controller_generation, model, session_permissions,
-    created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci
+    created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
+    effort, effort_resolved
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 );
 
 -- name: UpdateSession :exec
@@ -37,7 +38,7 @@ UPDATE sessions SET
     preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
     cleanup_generation = ?, browser_capability_verifier = ?,
     provider_conversation_id = ?, controller_generation = ?, model = ?, updated_at = ?,
-    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?
+    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?, effort = ?, effort_resolved = ?
 WHERE id = ?;
 
 -- name: UpdateBrowserCapabilityVerifier :execrows
@@ -173,7 +174,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
 FROM sessions WHERE id = ?;
 
 -- name: ListSessionsByProject :many
@@ -188,7 +189,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
 FROM sessions WHERE project_id IS ? ORDER BY num;
 
 -- name: ListAllSessions :many
@@ -203,7 +204,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
 FROM sessions ORDER BY project_id, num;
 
 

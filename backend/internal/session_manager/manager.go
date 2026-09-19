@@ -1122,7 +1122,8 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		// The user-visible resolved selection is Model for regular harnesses and
 		// Mode for adapters whose catalog is a mode list (e.g. Amp). If an explicit
 		// Model override exists it wins; otherwise fall back to the resolved Mode.
-		Model: resolvedModelForMetadata(cfg.Harness, agentConfig, adapterConfig),
+		Model:  resolvedModelForMetadata(cfg.Harness, agentConfig, adapterConfig),
+		Effort: agentConfig.Effort, EffortResolved: true,
 	}
 	if prompt != "" {
 		metadata.LatestUserPromptAt = m.clock()
@@ -1578,7 +1579,7 @@ func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, 
 	if harnessMatches && override.Model != "" {
 		merged.Model = override.Model
 	}
-	if harnessMatches && override.Effort != "" {
+	if override.Effort != "" {
 		merged.Effort = override.Effort
 	}
 	if harnessMatches && override.Mode != "" {
@@ -1610,7 +1611,21 @@ func restoredAgentConfig(rec domain.SessionRecord, cfg domain.ProjectConfig) por
 	if rec.Harness == domain.HarnessClaudeCode {
 		merged.Model = rec.Metadata.Model
 	}
+	if rec.Metadata.EffortResolved {
+		merged.Effort = rec.Metadata.Effort
+	}
 	return merged
+}
+
+func resolvedSpawnAgentConfig(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig) ports.AgentConfig {
+	if cfg.AgentConfigResolved {
+		return cfg.AgentConfig
+	}
+	resolved := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig)
+	if cfg.EffortOverride {
+		resolved.Effort = cfg.AgentConfig.Effort
+	}
+	return resolved
 }
 
 func applySpawnAgentConfig(base, override ports.AgentConfig) ports.AgentConfig {
@@ -4029,6 +4044,7 @@ func (m *Manager) cleanupRecords(ctx context.Context, project domain.ProjectID) 
 // ---- helpers ----
 
 func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now time.Time) domain.SessionRecord {
+	agentConfig := resolvedSpawnAgentConfig(cfg, projectConfig)
 	return domain.SessionRecord{
 		ProjectID:   cfg.ProjectID,
 		IssueID:     cfg.IssueID,
@@ -4040,8 +4056,12 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		Activity:    domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
-		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
-		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
+		Mode: domain.NormalizeSessionMode(cfg.RequestedMode),
+		Metadata: domain.SessionMetadata{
+			Permissions:    agentConfig.Permissions,
+			Effort:         agentConfig.Effort,
+			EffortResolved: true,
+		},
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,

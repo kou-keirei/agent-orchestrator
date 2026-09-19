@@ -140,6 +140,14 @@ type SessionMetadata struct {
 	// Model is the agent model this session resolved to at spawn time, including
 	// any per-spawn --model override. Empty means the agent's default model.
 	Model string `json:"model,omitempty"`
+	// Effort is the session-owned reasoning level resolved at spawn time. It is
+	// deliberately separate from conversation turn settings: a Chat turn may
+	// override it, but restore and interface/provider transitions must not
+	// silently re-read the project's current default.
+	Effort string `json:"effort,omitempty"`
+	// EffortResolved distinguishes a durable provider-default resolution (empty
+	// Effort) from legacy rows that never persisted a session effort.
+	EffortResolved bool `json:"-"`
 	// BrowserCapabilityVerifier is a one-way verifier for the random browser
 	// capability held by this session's worker process. The bearer token itself
 	// is never persisted, so reading the database cannot grant access to another
