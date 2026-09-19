@@ -5299,3 +5299,77 @@ func TestRuntimeObservationOrchestratorRequiresConsecutiveDeadProbes(t *testing.
 		})
 	}
 }
+
+func TestRuntimeObservation_RelaunchResetsDeadProbeSequence(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	m, st, _ := newManager()
+	m.clock = func() time.Time { return now }
+	rec := working("mer-1")
+	rec.Kind = domain.KindOrchestrator
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-90 * time.Second)}
+	rec.Metadata.RuntimeLaunchID = "launch-old"
+	st.sessions[rec.ID] = rec
+
+	dead := func(launchID string, observedAt time.Time) error {
+		return m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{
+			Runtime: ports.ProbeDead, LaunchID: launchID, ObservedAt: observedAt,
+		})
+	}
+	if err := dead("launch-old", now); err != nil {
+		t.Fatal(err)
+	}
+	if st.sessions[rec.ID].IsTerminated {
+		t.Fatal("first dead probe terminated the orchestrator")
+	}
+
+	if err := m.MarkSpawned(ctx, rec.ID, domain.SessionMetadata{RuntimeLaunchID: "launch-new"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dead("launch-new", now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if st.sessions[rec.ID].IsTerminated {
+		t.Fatal("one dead probe in the new launch generation terminated the orchestrator")
+	}
+	if err := dead("launch-new", now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if !st.sessions[rec.ID].IsTerminated {
+		t.Fatal("two dead probes in the new launch generation did not terminate the orchestrator")
+	}
+}
+
+func TestRuntimeObservation_NonDeadProbeDuringFinalizationSuppressesTermination(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	m, st, _ := newManager()
+	m.clock = func() time.Time { return now }
+	rec := working("mer-1")
+	rec.Kind = domain.KindOrchestrator
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-90 * time.Second)}
+	rec.Metadata.RuntimeLaunchID = "launch-1"
+	st.sessions[rec.ID] = rec
+	finalizer := &fakeUsageFinalizer{store: st}
+	finalizer.onFinalize = func(id domain.SessionID, launchID string, _ int64) error {
+		return m.ApplyRuntimeObservation(ctx, id, ports.RuntimeFacts{
+			Runtime: ports.ProbeAlive, Workload: ports.ProbeAlive,
+			LaunchID: launchID, ObservedAt: now.Add(2 * time.Minute),
+		})
+	}
+	m.SetUsageFinalizer(finalizer)
+	facts := ports.RuntimeFacts{
+		Runtime: ports.ProbeDead, LaunchID: "launch-1", ObservedAt: now,
+	}
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, facts); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, facts); err != nil {
+		t.Fatal(err)
+	}
+	if finalizer.calls != 1 {
+		t.Fatalf("finalizer calls = %d, want 1", finalizer.calls)
+	}
+	if st.sessions[rec.ID].IsTerminated {
+		t.Fatal("dead observation terminated after a non-dead probe cleared its sequence")
+	}
+}

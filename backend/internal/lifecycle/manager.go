@@ -476,7 +476,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 			return cur, false
 		}
 		m.consecutiveDeadProbes[id]++
-		if cur.Kind == domain.KindOrchestrator && m.consecutiveDeadProbes[id] < orchestratorDeadProbeThreshold {
+		if m.consecutiveDeadProbes[id] < deadProbeThreshold(cur.Kind) {
 			return cur, false
 		}
 		finalizer = m.usageFinalizer
@@ -494,7 +494,9 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated || cur.Revision != terminationRevision ||
 			cur.Metadata.RuntimeLaunchID != terminationLaunch || !matchesLaunch(cur) ||
-			!runtimeClearlyDead(f, cur.Activity, now, m.window) || m.sessionMutationInProgress(id) {
+			!runtimeClearlyDead(f, cur.Activity, now, m.window) ||
+			m.consecutiveDeadProbes[id] < deadProbeThreshold(cur.Kind) ||
+			m.sessionMutationInProgress(id) {
 			return cur, false
 		}
 		next := cur
@@ -533,6 +535,13 @@ const maxActivitySignalProjectionRetries = 3
 // observations required before a long-lived orchestrator may be terminated.
 // Other session kinds retain the historical single-sample verdict.
 const orchestratorDeadProbeThreshold = 2
+
+func deadProbeThreshold(kind domain.SessionKind) int {
+	if kind == domain.KindOrchestrator {
+		return orchestratorDeadProbeThreshold
+	}
+	return 1
+}
 
 // ApplyActivitySignal records an authoritative agent activity signal and any
 // native agent session id carried alongside it. Metadata-only hooks leave the
@@ -1535,6 +1544,7 @@ func (m *Manager) markSpawned(
 			return nil, fmt.Errorf("lifecycle: MarkSpawned for unknown session %q", id)
 		}
 		now := m.clock()
+		previousLaunchID := rec.Metadata.RuntimeLaunchID
 		rec.IsTerminated = false
 		rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
 		// Each spawn/restore must re-prove its hook pipeline: clear the receipt so
@@ -1542,6 +1552,7 @@ func (m *Manager) markSpawned(
 		// a stale "signals worked once" fact.
 		rec.FirstSignalAt = time.Time{}
 		rec.Metadata = mergeMetadata(rec.Metadata, metadata)
+		launchGenerationChanged := rec.Metadata.RuntimeLaunchID != previousLaunchID
 		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat &&
 			strings.TrimSpace(metadata.ControllerGeneration) != "" {
 			// A committed Chat controller is the sole session owner. Clear any
@@ -1571,6 +1582,9 @@ func (m *Manager) markSpawned(
 			if err := writer.CommitChatSpawnPrepared(ctx, rec, *boundary, handoff, prepare); err != nil {
 				return nil, err
 			}
+		}
+		if launchGenerationChanged {
+			delete(m.consecutiveDeadProbes, id)
 		}
 		return m.usageReactivator, nil
 	}()
