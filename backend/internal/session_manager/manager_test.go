@@ -8341,13 +8341,21 @@ func TestReconcileStartupSafety_TerminatesInterruptedOrchestratorSeed(t *testing
 		Harness:  domain.HarnessClaudeCode,
 		Metadata: domain.SessionMetadata{RuntimeHandleID: "mer-3"},
 	}
-	workerSeed := domain.SessionRecord{
-		ID: "mer-4", ProjectID: "mer", Kind: domain.KindWorker,
+	withWorktreeMarker := domain.SessionRecord{
+		ID: "mer-4", ProjectID: "mer", Kind: domain.KindOrchestrator,
 		Harness: domain.HarnessClaudeCode,
 	}
-	for _, rec := range []domain.SessionRecord{interrupted, withWorkspace, withRuntime, workerSeed} {
+	workerSeed := domain.SessionRecord{
+		ID: "mer-5", ProjectID: "mer", Kind: domain.KindWorker,
+		Harness: domain.HarnessClaudeCode,
+	}
+	for _, rec := range []domain.SessionRecord{interrupted, withWorkspace, withRuntime, withWorktreeMarker, workerSeed} {
 		st.sessions[rec.ID] = rec
 	}
+	st.worktrees[withWorktreeMarker.ID] = []domain.SessionWorktreeRecord{{
+		SessionID: withWorktreeMarker.ID,
+		RepoName:  domain.RootWorkspaceRepoName,
+	}}
 
 	if err := m.ReconcileStartupSafety(context.Background()); err != nil {
 		t.Fatalf("ReconcileStartupSafety: %v", err)
@@ -8355,7 +8363,7 @@ func TestReconcileStartupSafety_TerminatesInterruptedOrchestratorSeed(t *testing
 	if !st.sessions[interrupted.ID].IsTerminated || lcm.terminated[interrupted.ID] != 1 {
 		t.Fatalf("interrupted seed = %+v; terminated calls = %v, want one termination", st.sessions[interrupted.ID], lcm.terminated)
 	}
-	for _, id := range []domain.SessionID{withWorkspace.ID, withRuntime.ID, workerSeed.ID} {
+	for _, id := range []domain.SessionID{withWorkspace.ID, withRuntime.ID, withWorktreeMarker.ID, workerSeed.ID} {
 		if st.sessions[id].IsTerminated || lcm.terminated[id] != 0 {
 			t.Fatalf("recoverable or non-orchestrator session %s was terminated: row=%+v calls=%v", id, st.sessions[id], lcm.terminated)
 		}
