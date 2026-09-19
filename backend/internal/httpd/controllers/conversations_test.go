@@ -244,6 +244,46 @@ func TestConversationSnapshotExposesSafeEditContentAndBranchMetadata(t *testing.
 	}
 }
 
+func TestConversationSnapshotSerializesNativeEvidenceAndDispatchConformance(t *testing.T) {
+	body := conversationSnapshotBody(t, chatsvc.Snapshot{
+		Conversation: domain.ConversationRecord{ID: "conversation-1"},
+		SessionID:    "p1-1",
+		NativeEvidence: ports.ChatNativeEvidence{
+			SessionID:              "p1-1",
+			ControllerGeneration:   "generation-7",
+			ProviderConversationID: "thread-1",
+			ProviderTurnID:         "turn-1",
+			Provider:               "codex",
+			ProofStatus:            "PROVEN",
+		},
+		DispatchConformance: ports.ChatDispatchConformance{
+			Status:           ports.ChatDispatchConformanceVerified,
+			ChildResultValid: true,
+			Requested: ports.ChatDispatchEvidence{
+				Values:                 ports.ChatDispatchValues{Model: "gpt-5.6", Effort: "high"},
+				Provenance:             ports.ChatDispatchProvenanceAORequested,
+				SessionID:              "p1-1",
+				ProviderConversationID: "thread-1",
+				ProviderTurnID:         "turn-1",
+				Fresh:                  true,
+				Correlated:             true,
+			},
+		},
+	})
+	native := body["nativeEvidence"].(map[string]any)
+	if native["sessionId"] != "p1-1" || native["controllerGeneration"] != "generation-7" || native["providerTurnId"] != "turn-1" {
+		t.Fatalf("nativeEvidence = %#v", native)
+	}
+	dispatch := body["dispatchConformance"].(map[string]any)
+	if dispatch["status"] != string(ports.ChatDispatchConformanceVerified) || dispatch["childResultValid"] != true {
+		t.Fatalf("dispatchConformance = %#v", dispatch)
+	}
+	requested := dispatch["requested"].(map[string]any)
+	if requested["model"] != "gpt-5.6" || requested["providerConversationId"] != "thread-1" || requested["correlated"] != true {
+		t.Fatalf("requested dispatch evidence = %#v", requested)
+	}
+}
+
 func TestConversationSnapshotScopesEditAvailabilityToActiveProviderBinding(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	body := conversationSnapshotBody(t, chatsvc.Snapshot{

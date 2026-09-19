@@ -914,6 +914,7 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 		Controller:                       string(s.Controller),
 		PermissionFloor:                  string(s.PermissionFloor),
 		NativeEvidence:                   nativePermissionEvidencePayload(s.NativeEvidence),
+		DispatchConformance:              dispatchConformancePayload(s.DispatchConformance),
 		LatestSequence:                   s.Conversation.LatestSequence,
 		OldestSequence:                   s.OldestSequence,
 		HasMoreBefore:                    s.HasMoreBefore,
@@ -997,6 +998,10 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 
 func nativePermissionEvidencePayload(evidence ports.ChatNativeEvidence) NativePermissionEvidence {
 	return NativePermissionEvidence{
+		SessionID:              string(evidence.SessionID),
+		ControllerGeneration:   evidence.ControllerGeneration,
+		ProviderConversationID: evidence.ProviderConversationID,
+		ProviderTurnID:         evidence.ProviderTurnID,
 		Provider:             evidence.Provider,
 		RequestedPermission:  evidence.RequestedPermission,
 		EffectivePermission:  evidence.EffectivePermission,
@@ -1005,6 +1010,34 @@ func nativePermissionEvidencePayload(evidence ports.ChatNativeEvidence) NativePe
 		TurnSandbox:          evidence.TurnSandbox,
 		PreventiveCapability: evidence.PreventiveCapability,
 		ProofStatus:          evidence.ProofStatus,
+	}
+}
+
+func dispatchConformancePayload(conformance ports.ChatDispatchConformance) ChatDispatchConformance {
+	return ChatDispatchConformance{
+		Status:           string(conformance.Status),
+		Reason:           conformance.Reason,
+		ChildResultValid: conformance.ChildResultValid,
+		EffortOverride:   conformance.EffortOverride,
+		Requested:        dispatchEvidencePayload(conformance.Requested),
+		Configured:       dispatchEvidencePayload(conformance.Configured),
+		Dispatched:       dispatchEvidencePayload(conformance.Dispatched),
+		ProviderSelected: dispatchEvidencePayload(conformance.ProviderSelected),
+		ObservedFirstTurn: dispatchEvidencePayload(conformance.ObservedFirstTurn),
+		Variant: ChatDispatchVariant{
+			Value: conformance.Variant.Value, Availability: conformance.Variant.Availability,
+			Provenance: string(conformance.Variant.Provenance),
+		},
+	}
+}
+
+func dispatchEvidencePayload(evidence ports.ChatDispatchEvidence) ChatDispatchEvidence {
+	return ChatDispatchEvidence{
+		Model: evidence.Values.Model, Effort: evidence.Values.Effort,
+		Provenance: string(evidence.Provenance), SessionID: string(evidence.SessionID),
+		ProviderConversationID: evidence.ProviderConversationID,
+		ProviderTurnID: evidence.ProviderTurnID, Fresh: evidence.Fresh,
+		Correlated: evidence.Correlated, ProviderRejected: evidence.ProviderRejected,
 	}
 }
 

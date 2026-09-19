@@ -1305,9 +1305,30 @@ func (c *Controller) Capabilities() ports.ChatCapabilities {
 // it, otherwise an explicit unproven record.
 func (c *Controller) NativeEvidence() ports.ChatNativeEvidence {
 	if reader, ok := c.conv.(ports.ChatNativeEvidenceReader); ok {
-		return reader.NativeEvidence()
+		evidence := reader.NativeEvidence()
+		evidence.SessionID = c.sessionID
+		evidence.ControllerGeneration = c.generation
+		evidence.ProviderConversationID = c.conv.ProviderConversationID()
+		return evidence
 	}
-	return unprovenNativeEvidence(c.harness, c.permissionFloor)
+	evidence := unprovenNativeEvidence(c.harness, c.permissionFloor)
+	evidence.SessionID = c.sessionID
+	evidence.ControllerGeneration = c.generation
+	evidence.ProviderConversationID = c.conv.ProviderConversationID()
+	return evidence
+}
+
+// DispatchConformance reports the provider-native dispatch evidence when the
+// driver exposes it. AO carries the evidence through the service boundary; it
+// does not decide ECP authorization or acceptance.
+func (c *Controller) DispatchConformance() ports.ChatDispatchConformance {
+	if reporter, ok := c.conv.(ports.ChatDispatchConformanceReporter); ok {
+		return reporter.DispatchConformance()
+	}
+	return ports.ChatDispatchConformance{
+		Status: ports.ChatDispatchEvidenceMissing,
+		Reason: "the active provider does not expose dispatch-conformance evidence",
+	}
 }
 
 // Send records a message and dispatches it, or queues it if the agent is busy.

@@ -176,7 +176,7 @@ func (m *Manager) executeChatAgentSwitch(
 	if !ok {
 		return result, fmt.Errorf("switch Chat agent %s: %w", id, ErrInterfaceHandoffUnsupported)
 	}
-	baseAgentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	baseAgentConfig := effectiveAgentConfig(cfg.TargetHarness, rec.Kind, project.Config)
 	baseAgentConfig.Permissions = permissions
 	if roleOverride(rec.Kind, project.Config).Harness != cfg.TargetHarness {
 		baseAgentConfig.Model = ""
@@ -640,7 +640,7 @@ func (m *Manager) rollbackStoppedChatAgentSwitchSource(
 	if err != nil {
 		return err
 	}
-	agentConfig := effectiveAgentConfig(rec.Kind, project.Config)
+	agentConfig := effectiveAgentConfig(rec.Harness, rec.Kind, project.Config)
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
 		return fmt.Errorf("stored permission mode is invalid: %w", err)

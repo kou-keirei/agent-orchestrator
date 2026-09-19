@@ -1351,7 +1351,7 @@ func (m *Manager) prepareTargetActivation(ctx context.Context, store ports.Agent
 	if err != nil {
 		return preparedTargetActivation{}, fmt.Errorf("system prompt file: %w", err)
 	}
-	config := effectiveAgentConfig(rec.Kind, project.Config)
+	config := effectiveAgentConfig(harness, rec.Kind, project.Config)
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
 		return preparedTargetActivation{}, fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)

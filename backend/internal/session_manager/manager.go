@@ -880,7 +880,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// Resolve the effective agent config (project base + role override + spawn
 	// override) and validate the model before any durable state is created. A
 	// model the harness cannot honor should not leave a seed row behind.
-	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Kind, project.Config), cfg.AgentConfig)
+	agentConfig := applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, project.Config), cfg.AgentConfig)
 	// Effort is the one spawn setting whose empty value is meaningful. Keep the
 	// request-presence bit separate from the value-only agent config merge so an
 	// explicit --effort= clears an inherited project effort before either Chat or
@@ -1156,7 +1156,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 }
 
 func (m *Manager) resolveChatAgentConfig(ctx context.Context, cfg ports.SpawnConfig, project domain.ProjectConfig) (ports.AgentConfig, error) {
-	base := effectiveAgentConfig(cfg.Kind, project)
+	base := effectiveAgentConfig(cfg.Harness, cfg.Kind, project)
 	requested := cfg.AgentConfig
 	resolved := applySpawnAgentConfig(base, requested)
 	if cfg.EffortOverride {
@@ -1568,17 +1568,20 @@ func roleConfigName(kind domain.SessionKind) string {
 }
 
 // effectiveAgentConfig merges the role override's agent config over the
-// project's base agent config; set override fields win.
-func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig) ports.AgentConfig {
+// project's base agent config when that role is pinned to the requested
+// harness; permissions remain harness-neutral.
+func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, cfg domain.ProjectConfig) ports.AgentConfig {
 	merged := cfg.AgentConfig
-	override := roleOverride(kind, cfg).AgentConfig
-	if override.Model != "" {
+	role := roleOverride(kind, cfg)
+	override := role.AgentConfig
+	harnessMatches := role.Harness == "" || role.Harness == harness
+	if harnessMatches && override.Model != "" {
 		merged.Model = override.Model
 	}
-	if override.Effort != "" {
+	if harnessMatches && override.Effort != "" {
 		merged.Effort = override.Effort
 	}
-	if override.Mode != "" {
+	if harnessMatches && override.Mode != "" {
 		merged.Mode = override.Mode
 	}
 	if override.Permissions != "" {
@@ -1591,7 +1594,7 @@ func effectiveAgentConfig(kind domain.SessionKind, cfg domain.ProjectConfig) por
 // interface switch, and agent switch. Session metadata is the immutable floor;
 // project settings are only the fallback for legacy rows that have none.
 func sessionPermission(rec domain.SessionRecord, cfg domain.ProjectConfig) (domain.PermissionMode, error) {
-	permission := effectiveAgentConfig(rec.Kind, cfg).Permissions
+	permission := effectiveAgentConfig(rec.Harness, rec.Kind, cfg).Permissions
 	if rec.Metadata.Permissions != "" {
 		permission = rec.Metadata.Permissions
 	}
@@ -1603,7 +1606,7 @@ func sessionPermission(rec domain.SessionRecord, cfg domain.ProjectConfig) (doma
 }
 
 func restoredAgentConfig(rec domain.SessionRecord, cfg domain.ProjectConfig) ports.AgentConfig {
-	merged := effectiveAgentConfig(rec.Kind, cfg)
+	merged := effectiveAgentConfig(rec.Harness, rec.Kind, cfg)
 	if rec.Harness == domain.HarnessClaudeCode {
 		merged.Model = rec.Metadata.Model
 	}
@@ -4006,7 +4009,7 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
 		Mode:              domain.NormalizeSessionMode(cfg.RequestedMode),
-		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
+		Metadata:          domain.SessionMetadata{Permissions: applySpawnAgentConfig(effectiveAgentConfig(cfg.Harness, cfg.Kind, projectConfig), cfg.AgentConfig).Permissions},
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
 		AutoInjectCI:      true,

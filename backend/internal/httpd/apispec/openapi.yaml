@@ -7647,6 +7647,73 @@ components:
       - ok
       - sessionId
       type: object
+    ChatDispatchConformance:
+      properties:
+        childResultValid:
+          type: boolean
+        configured:
+          $ref: '#/components/schemas/ChatDispatchEvidence'
+        dispatched:
+          $ref: '#/components/schemas/ChatDispatchEvidence'
+        effortOverride:
+          type: boolean
+        observedFirstTurn:
+          $ref: '#/components/schemas/ChatDispatchEvidence'
+        providerSelected:
+          $ref: '#/components/schemas/ChatDispatchEvidence'
+        reason:
+          type: string
+        requested:
+          $ref: '#/components/schemas/ChatDispatchEvidence'
+        status:
+          type: string
+        variant:
+          $ref: '#/components/schemas/ChatDispatchVariant'
+      required:
+      - status
+      - childResultValid
+      - effortOverride
+      - requested
+      - configured
+      - dispatched
+      - providerSelected
+      - observedFirstTurn
+      - variant
+      type: object
+    ChatDispatchEvidence:
+      properties:
+        correlated:
+          type: boolean
+        effort:
+          type: string
+        fresh:
+          type: boolean
+        model:
+          type: string
+        provenance:
+          type: string
+        providerConversationId:
+          type: string
+        providerRejected:
+          type: boolean
+        providerTurnId:
+          type: string
+        sessionId:
+          type: string
+      required:
+      - fresh
+      - correlated
+      - providerRejected
+      type: object
+    ChatDispatchVariant:
+      properties:
+        availability:
+          type: string
+        provenance:
+          type: string
+        value:
+          type: string
+      type: object
     ClaimPRRequest:
       properties:
         allowTakeover:
@@ -8997,6 +9064,8 @@ components:
           type: string
         conversationId:
           type: string
+        dispatchConformance:
+          $ref: '#/components/schemas/ChatDispatchConformance'
         harness:
           type: string
         hasMoreBefore:
@@ -9058,6 +9127,7 @@ components:
       - mode
       - controller
       - nativeEvidence
+      - dispatchConformance
       - latestSequence
       - hasMoreBefore
       - nativeForkAvailableAfterSequence
@@ -10253,6 +10323,8 @@ components:
       properties:
         approvalPolicy:
           type: string
+        controllerGeneration:
+          type: string
         effectivePermission:
           type: string
         preventiveCapability:
@@ -10265,7 +10337,13 @@ components:
           type: string
         provider:
           type: string
+        providerConversationId:
+          type: string
+        providerTurnId:
+          type: string
         requestedPermission:
+          type: string
+        sessionId:
           type: string
         threadSandbox:
           type: string

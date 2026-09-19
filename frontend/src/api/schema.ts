@@ -2972,6 +2972,34 @@ export interface components {
         ControllersUpdateCloudOfferingRequest: {
             enabled: null | boolean;
         };
+        ChatDispatchConformance: {
+            childResultValid: boolean;
+            configured: components["schemas"]["ChatDispatchEvidence"];
+            dispatched: components["schemas"]["ChatDispatchEvidence"];
+            effortOverride: boolean;
+            observedFirstTurn: components["schemas"]["ChatDispatchEvidence"];
+            providerSelected: components["schemas"]["ChatDispatchEvidence"];
+            reason?: string;
+            requested: components["schemas"]["ChatDispatchEvidence"];
+            status: string;
+            variant: components["schemas"]["ChatDispatchVariant"];
+        };
+        ChatDispatchEvidence: {
+            correlated: boolean;
+            effort?: string;
+            fresh: boolean;
+            model?: string;
+            providerConversationId?: string;
+            providerRejected: boolean;
+            providerTurnId?: string;
+            provenance?: string;
+            sessionId?: string;
+        };
+        ChatDispatchVariant: {
+            availability?: string;
+            provenance?: string;
+            value?: string;
+        };
         ConversationAccountPayload: {
             authMode?: string;
             planLabel?: string;
@@ -3146,6 +3174,7 @@ export interface components {
             /** @enum {string} */
             controller: "connecting" | "ready" | "busy" | "recovering" | "stopped";
             conversationId: string;
+            dispatchConformance: components["schemas"]["ChatDispatchConformance"];
             harness?: string;
             hasMoreBefore: boolean;
             /** Format: int64 */
@@ -3600,12 +3629,16 @@ export interface components {
         };
         NativePermissionEvidence: {
             approvalPolicy?: string;
+            controllerGeneration?: string;
             effectivePermission?: string;
             preventiveCapability: boolean;
             /** @enum {string} */
             proofStatus: "PROVEN" | "UNPROVEN" | "DEFERRED_WITH_EXACT_REASON";
             provider?: string;
+            providerConversationId?: string;
+            providerTurnId?: string;
             requestedPermission?: string;
+            sessionId?: string;
             threadSandbox?: string;
             turnSandbox?: string;
         };

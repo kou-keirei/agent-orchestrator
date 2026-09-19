@@ -73,36 +73,32 @@ func windowsBatchCommandLine(executable string, args []string) string {
 }
 
 func quoteWindowsBatchArg(value string) string {
-	// A batch command line treats every percent token as syntax: paired
-	// percent signs can name an environment variable, while leading percent
-	// forms can be batch parameters (including %% and %0/%*/%~1). Escape all
-	// percent signs before cmd gets a chance to classify the token. This also
-	// covers mixed values where a literal percent is adjacent to quotes,
-	// carets, metacharacters, or trailing slashes.
-	if strings.Contains(value, `%`) {
+	// Only a percent-delimited environment name is expanded by cmd in this
+	// boundary. Leave literal percent and batch-parameter forms on the native
+	// quoting path; they are not syntax until they occur in a batch source line.
+	if windowsBatchEnvReference(value) {
 		trailingSlashes := 0
 		for i := len(value) - 1; i >= 0 && value[i] == '\\'; i-- {
 			trailingSlashes++
 		}
 		var quoted strings.Builder
 		quoted.WriteByte('"')
-		remainder := value
+		remainder := strings.TrimRight(value, `\`)
 		for {
-			index := strings.IndexByte(remainder, '%')
-			if index < 0 {
+			start, end := windowsBatchEnvReferenceBounds(remainder)
+			if start < 0 {
 				quoted.WriteString(strings.ReplaceAll(remainder, `"`, `\"`))
-				quoted.WriteString(strings.Repeat(`\`, trailingSlashes))
+				quoted.WriteString(strings.Repeat(`\`, trailingSlashes*2))
 				quoted.WriteByte('"')
 				return quoted.String()
 			}
-			quoted.WriteString(strings.ReplaceAll(remainder[:index], `"`, `\"`))
+			quoted.WriteString(strings.ReplaceAll(remainder[:start], `"`, `\"`))
 			quoted.WriteByte('"')
 			quoted.WriteString(`^%`)
-			remainder = remainder[index+1:]
-			if remainder == "" {
-				return quoted.String()
-			}
+			quoted.WriteString(remainder[start+1 : end-1])
+			quoted.WriteString(`^%`)
 			quoted.WriteByte('"')
+			remainder = remainder[end:]
 		}
 	}
 	if strings.Contains(value, `^`) && strings.ContainsAny(value, `"&|<>()`) {
@@ -117,6 +113,35 @@ func quoteWindowsBatchArg(value string) string {
 		return strings.ReplaceAll(value, `^`, `^^^^`)
 	}
 	return quoteWindowsNativeArg(value)
+}
+
+func windowsBatchEnvReference(value string) bool {
+	start, _ := windowsBatchEnvReferenceBounds(value)
+	return start >= 0
+}
+
+func windowsBatchEnvReferenceBounds(value string) (int, int) {
+	for start := 0; start < len(value); start++ {
+		if value[start] != '%' || start+2 >= len(value) || !isWindowsBatchEnvNameStart(value[start+1]) {
+			continue
+		}
+		end := start + 2
+		for end < len(value) && isWindowsBatchEnvNameChar(value[end]) {
+			end++
+		}
+		if end < len(value) && value[end] == '%' {
+			return start, end + 1
+		}
+	}
+	return -1, -1
+}
+
+func isWindowsBatchEnvNameStart(char byte) bool {
+	return char == '_' || char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z'
+}
+
+func isWindowsBatchEnvNameChar(char byte) bool {
+	return isWindowsBatchEnvNameStart(char) || char >= '0' && char <= '9'
 }
 
 func quoteWindowsNativeArg(value string) string {

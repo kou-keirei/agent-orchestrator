@@ -81,6 +81,8 @@ func TestCommandContextPreservesCmdSensitiveShimArgv(t *testing.T) {
 		`prefix %0 suffix`,
 		`%0\`,
 		`%%\`,
+		`final%`,
+		`final%\`,
 		`prefix %*\`,
 		`%0 "quoted"`,
 		`%* &pipe`,
@@ -133,15 +135,18 @@ func TestCommandContextPreservesShellMetacharShimArgv(t *testing.T) {
 
 func TestCommandContextPreservesPairedPercentExpansionAndMixedShimArgv(t *testing.T) {
 	t.Setenv("AO_PROCESS_PERCENT_VALUE", "expanded")
+	t.Setenv("AO_PROCESS_SECOND_PERCENT_VALUE", "expanded-second")
 	want := []string{
 		"before%AO_PROCESS_PERCENT_VALUE%after",
 		`^caret^ "quoted" &pipe|%AO_PROCESS_PERCENT_VALUE%`,
 		`%AO_PROCESS_PERCENT_VALUE%\`,
+		"before%AO_PROCESS_SECOND_PERCENT_VALUE%after",
 	}
 	input := []string{
 		"before%AO_PROCESS_PERCENT_VALUE%after",
 		`^caret^ "quoted" &pipe|%AO_PROCESS_PERCENT_VALUE%`,
 		`%AO_PROCESS_PERCENT_VALUE%\`,
+		"before%AO_PROCESS_SECOND_PERCENT_VALUE%after",
 	}
 	if got := runWindowsShimArgv(t, input); !reflect.DeepEqual(got, want) {
 		t.Fatalf("shim argv = %#v, want %#v", got, want)

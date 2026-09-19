@@ -94,6 +94,20 @@ type fakeConversation struct {
 	closeOnce          sync.Once
 }
 
+type evidenceConversation struct {
+	*fakeConversation
+	nativeEvidence      ports.ChatNativeEvidence
+	dispatchConformance ports.ChatDispatchConformance
+}
+
+func (c *evidenceConversation) NativeEvidence() ports.ChatNativeEvidence {
+	return c.nativeEvidence
+}
+
+func (c *evidenceConversation) DispatchConformance() ports.ChatDispatchConformance {
+	return c.dispatchConformance
+}
+
 type nativeHistoryConversation struct {
 	*fakeConversation
 	events []ports.ChatEvent
@@ -491,6 +505,46 @@ func TestReadOnlyFloorSurvivesSettingsAndDispatch(t *testing.T) {
 	}
 	if snapshot.PermissionFloor != ports.PermissionModeReadOnly {
 		t.Fatalf("snapshot permission floor = %q, want read-only", snapshot.PermissionFloor)
+	}
+}
+
+func TestSnapshotCarriesNativeExecutionCorrelationAndDispatchEvidence(t *testing.T) {
+	conv := &evidenceConversation{
+		fakeConversation: newFakeConversation(),
+		nativeEvidence: ports.ChatNativeEvidence{
+			Provider:            "codex",
+			EffectivePermission: "read-only",
+			ProofStatus:         "PROVEN",
+		},
+		dispatchConformance: ports.ChatDispatchConformance{
+			Status:           ports.ChatDispatchConformanceVerified,
+			ChildResultValid: true,
+			Requested: ports.ChatDispatchEvidence{
+				Values:                 ports.ChatDispatchValues{Model: "gpt-5.6", Effort: "high"},
+				Provenance:             ports.ChatDispatchProvenanceAORequested,
+				SessionID:              testSession,
+				ProviderConversationID: "thread-1",
+				ProviderTurnID:         "turn-1",
+				Fresh:                  true,
+				Correlated:             true,
+			},
+		},
+	}
+	h := newHarnessWithConversation(t, conv)
+	snapshot, err := h.svc.Snapshot(context.Background(), testSession)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.NativeEvidence.SessionID != testSession ||
+		snapshot.NativeEvidence.ControllerGeneration == "" ||
+		snapshot.NativeEvidence.ProviderConversationID != "thread-1" {
+		t.Fatalf("native evidence correlation = %+v", snapshot.NativeEvidence)
+	}
+	if snapshot.DispatchConformance.Status != ports.ChatDispatchConformanceVerified ||
+		!snapshot.DispatchConformance.ChildResultValid ||
+		snapshot.DispatchConformance.Requested.Values.Model != "gpt-5.6" ||
+		snapshot.DispatchConformance.Requested.ProviderTurnID != "turn-1" {
+		t.Fatalf("dispatch conformance = %+v", snapshot.DispatchConformance)
 	}
 }
 
@@ -3020,8 +3074,9 @@ func newHarnessWithConversationAndStoreForHarness(
 	)
 	chatStore := wrapStore(st)
 	svc := chatsvc.New(chatsvc.Options{
-		Store:    chatStore,
-		Sessions: st,
+		Store:      chatStore,
+		Reader:     fullSnapshotReader(st),
+		Sessions:   st,
 		StopProviderHost: func(context.Context, domain.SessionID) error {
 			h.hostStops.Add(1)
 			return nil

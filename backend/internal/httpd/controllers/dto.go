@@ -2255,12 +2255,13 @@ type ConversationSnapshotResponse struct {
 	Mode                       string `json:"mode" enum:"chat,tui"`
 	// Controller is reported separately from history so a client can tell "no
 	// messages yet" apart from "the agent is not running".
-	Controller      string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
-	PermissionFloor string                   `json:"permissionFloor,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
-	NativeEvidence  NativePermissionEvidence `json:"nativeEvidence"`
-	LatestSequence  int64                    `json:"latestSequence"`
-	OldestSequence  int64                    `json:"oldestSequence,omitempty"`
-	HasMoreBefore   bool                     `json:"hasMoreBefore"`
+	Controller          string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
+	PermissionFloor     string                   `json:"permissionFloor,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
+	NativeEvidence      NativePermissionEvidence `json:"nativeEvidence"`
+	DispatchConformance ChatDispatchConformance `json:"dispatchConformance"`
+	LatestSequence      int64                    `json:"latestSequence"`
+	OldestSequence      int64                    `json:"oldestSequence,omitempty"`
+	HasMoreBefore       bool                     `json:"hasMoreBefore"`
 	// NativeForkAvailableAfterSequence is the first provider-backed human prompt
 	// in the active provider scope. It keeps edit gating exact across bounded pages.
 	NativeForkAvailableAfterSequence int64                             `json:"nativeForkAvailableAfterSequence"`
@@ -2322,14 +2323,53 @@ type ConversationSnapshotResponse struct {
 // conversation. Unknown fields are intentional when the provider cannot expose
 // effective state, especially across a persistent-host reconnect.
 type NativePermissionEvidence struct {
-	Provider             string `json:"provider,omitempty"`
-	RequestedPermission  string `json:"requestedPermission,omitempty"`
-	EffectivePermission  string `json:"effectivePermission,omitempty"`
-	ApprovalPolicy       string `json:"approvalPolicy,omitempty"`
-	ThreadSandbox        string `json:"threadSandbox,omitempty"`
-	TurnSandbox          string `json:"turnSandbox,omitempty"`
-	PreventiveCapability bool   `json:"preventiveCapability"`
-	ProofStatus          string `json:"proofStatus" enum:"PROVEN,UNPROVEN,DEFERRED_WITH_EXACT_REASON"`
+	SessionID                 string `json:"sessionId,omitempty"`
+	ControllerGeneration      string `json:"controllerGeneration,omitempty"`
+	ProviderConversationID    string `json:"providerConversationId,omitempty"`
+	ProviderTurnID            string `json:"providerTurnId,omitempty"`
+	Provider                  string `json:"provider,omitempty"`
+	RequestedPermission       string `json:"requestedPermission,omitempty"`
+	EffectivePermission       string `json:"effectivePermission,omitempty"`
+	ApprovalPolicy            string `json:"approvalPolicy,omitempty"`
+	ThreadSandbox             string `json:"threadSandbox,omitempty"`
+	TurnSandbox               string `json:"turnSandbox,omitempty"`
+	PreventiveCapability      bool   `json:"preventiveCapability"`
+	ProofStatus               string `json:"proofStatus" enum:"PROVEN,UNPROVEN,DEFERRED_WITH_EXACT_REASON"`
+}
+
+// ChatDispatchConformance is provider-native dispatch evidence carried through
+// the snapshot so an external contract verifier can reconcile AO observations
+// with provider-selected and first-turn values. AO does not authorize or accept
+// the dispatch here.
+type ChatDispatchConformance struct {
+	Status           string                    `json:"status"`
+	Reason           string                    `json:"reason,omitempty"`
+	ChildResultValid bool                      `json:"childResultValid"`
+	EffortOverride   bool                      `json:"effortOverride"`
+	Requested         ChatDispatchEvidence     `json:"requested"`
+	Configured        ChatDispatchEvidence     `json:"configured"`
+	Dispatched        ChatDispatchEvidence     `json:"dispatched"`
+	ProviderSelected  ChatDispatchEvidence     `json:"providerSelected"`
+	ObservedFirstTurn ChatDispatchEvidence     `json:"observedFirstTurn"`
+	Variant           ChatDispatchVariant      `json:"variant"`
+}
+
+type ChatDispatchEvidence struct {
+	Model                  string `json:"model,omitempty"`
+	Effort                 string `json:"effort,omitempty"`
+	Provenance             string `json:"provenance,omitempty"`
+	SessionID              string `json:"sessionId,omitempty"`
+	ProviderConversationID string `json:"providerConversationId,omitempty"`
+	ProviderTurnID         string `json:"providerTurnId,omitempty"`
+	Fresh                  bool   `json:"fresh"`
+	Correlated             bool   `json:"correlated"`
+	ProviderRejected       bool   `json:"providerRejected"`
+}
+
+type ChatDispatchVariant struct {
+	Value        string `json:"value,omitempty"`
+	Availability string `json:"availability,omitempty"`
+	Provenance   string `json:"provenance,omitempty"`
 }
 
 // ConversationBranchMaterializationResponse describes the fidelity of the

@@ -1199,6 +1199,7 @@ type Snapshot struct {
 	Controller                       ports.ChatControllerState
 	PermissionFloor                  ports.PermissionMode
 	NativeEvidence                   ports.ChatNativeEvidence
+	DispatchConformance              ports.ChatDispatchConformance
 	Turns                            []domain.ConversationTurn
 	Messages                         []domain.ConversationMessage
 	Activities                       []domain.ConversationActivity
@@ -1265,17 +1266,18 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 	}
 
 	conversation, err := s.store.ConversationForSession(ctx, id)
-	if errors.Is(err, domain.ErrNoConversation) {
+	if errors.Is(err, domain.ErrNoConversation) || conversation.ID == "" {
 		// A chat session has no conversation until its controller first starts.
 		// That is an empty conversation, not a failure — returning an error here
 		// would make a brand-new session look broken.
 		return Snapshot{
-			SessionID:       id,
-			Harness:         record.Harness,
-			Mode:            domain.NormalizeSessionMode(record.Mode),
-			Controller:      ports.ChatControllerStopped,
-			PermissionFloor: record.Metadata.Permissions,
-			NativeEvidence:  unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
+			SessionID:           id,
+			Harness:             record.Harness,
+			Mode:                domain.NormalizeSessionMode(record.Mode),
+			Controller:          ports.ChatControllerStopped,
+			PermissionFloor:     record.Metadata.Permissions,
+			NativeEvidence:      unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
+			DispatchConformance: unprovenDispatchConformance(),
 		}, nil
 	}
 	if err != nil {
@@ -1291,11 +1293,13 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
 	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
+	dispatchConformance := unprovenDispatchConformance()
 	if controller, err := s.Controller(id); err == nil {
 		state = controller.State()
 		caps = controller.Capabilities()
 		permissionFloor = controller.PermissionFloor()
 		nativeEvidence = controller.NativeEvidence()
+		dispatchConformance = controller.DispatchConformance()
 	}
 
 	return Snapshot{
@@ -1309,6 +1313,7 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 		Controller:                       state,
 		PermissionFloor:                  permissionFloor,
 		NativeEvidence:                   nativeEvidence,
+		DispatchConformance:              dispatchConformance,
 		Turns:                            rows.Turns,
 		Messages:                         rows.Messages,
 		Activities:                       rows.Activities,
@@ -1330,12 +1335,13 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 	conversation, err := s.store.ConversationForSession(ctx, id)
 	if errors.Is(err, domain.ErrNoConversation) {
 		return Snapshot{
-			SessionID:       id,
-			Harness:         record.Harness,
-			Mode:            domain.NormalizeSessionMode(record.Mode),
-			Controller:      ports.ChatControllerStopped,
-			PermissionFloor: record.Metadata.Permissions,
-			NativeEvidence:  unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
+			SessionID:           id,
+			Harness:             record.Harness,
+			Mode:                domain.NormalizeSessionMode(record.Mode),
+			Controller:          ports.ChatControllerStopped,
+			PermissionFloor:     record.Metadata.Permissions,
+			NativeEvidence:      unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
+			DispatchConformance: unprovenDispatchConformance(),
 		}, nil
 	}
 	if err != nil {
@@ -1354,11 +1360,13 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
 	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
+	dispatchConformance := unprovenDispatchConformance()
 	if controller, err := s.Controller(id); err == nil {
 		state = controller.State()
 		caps = controller.Capabilities()
 		permissionFloor = controller.PermissionFloor()
 		nativeEvidence = controller.NativeEvidence()
+		dispatchConformance = controller.DispatchConformance()
 	}
 	return Snapshot{
 		Conversation:                     rows.Conversation,
@@ -1371,6 +1379,7 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 		Controller:                       state,
 		PermissionFloor:                  permissionFloor,
 		NativeEvidence:                   nativeEvidence,
+		DispatchConformance:              dispatchConformance,
 		Turns:                            rows.Turns,
 		Messages:                         rows.Messages,
 		Activities:                       rows.Activities,
@@ -1394,6 +1403,13 @@ func unprovenNativeEvidence(harness domain.AgentHarness, requested ports.Permiss
 		TurnSandbox:          "unknown",
 		PreventiveCapability: false,
 		ProofStatus:          "UNPROVEN",
+	}
+}
+
+func unprovenDispatchConformance() ports.ChatDispatchConformance {
+	return ports.ChatDispatchConformance{
+		Status: ports.ChatDispatchEvidenceMissing,
+		Reason: "dispatch-conformance evidence is not available",
 	}
 }
 

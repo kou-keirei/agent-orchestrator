@@ -233,6 +233,13 @@ func (c ChatCapabilities) Has(capability ChatCapability) bool { return c[capabil
 // normal conversation read model. Unknown values are explicit: AO must not
 // derive effective permission from persisted settings or a static capability.
 type ChatNativeEvidence struct {
+	// These identities bind the posture to the current AO execution generation.
+	// A reconnect or replacement controller must not be allowed to present an
+	// older provider observation as evidence for the current execution.
+	SessionID              domain.SessionID
+	ControllerGeneration   string
+	ProviderConversationID string
+	ProviderTurnID         string
 	Provider             string
 	RequestedPermission  string
 	EffectivePermission  string
