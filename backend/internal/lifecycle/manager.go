@@ -265,6 +265,11 @@ type Manager struct {
 	// adapter via WithUrgentNudgeGate; the default answers false, so an unknown
 	// harness never takes an urgent write while waiting_input.
 	urgentNudgeWaitingInputSafe func(domain.AgentHarness) bool
+	// consecutiveDeadProbes tracks reaper dead observations per session. It is
+	// reset by any non-dead probe or launch mismatch; orchestrators require two
+	// consecutive dead readings while workers retain the single-sample policy.
+	// The counter is memory-only and guarded by mu.
+	consecutiveDeadProbes map[domain.SessionID]int
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.
@@ -281,6 +286,7 @@ func New(store sessionStore, messenger ports.AgentMessenger, opts ...Option) *Ma
 		react:                       newReactionState(),
 		flights:                     map[domain.SessionID]*toolFlight{},
 		pendingLaunches:             map[domain.SessionID]pendingLaunch{},
+		consecutiveDeadProbes:       map[domain.SessionID]int{},
 		steerActive:                 func(domain.AgentHarness) bool { return false },
 		startupSignalGatesInput:     func(domain.AgentHarness) bool { return false },
 		urgentNudgeWaitingInputSafe: func(domain.AgentHarness) bool { return false },
@@ -448,10 +454,12 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	)
 	if err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated || !matchesLaunch(cur) {
+			delete(m.consecutiveDeadProbes, id)
 			return cur, false
 		}
 		currentLaunch := cur.Metadata.RuntimeLaunchID
 		if currentLaunch != "" && f.Runtime == ports.ProbeAlive && f.Workload == ports.ProbeDead {
+			delete(m.consecutiveDeadProbes, id)
 			if cur.Activity.State == domain.ActivityExited {
 				return cur, false
 			}
@@ -461,9 +469,14 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 			return next, true
 		}
 		if !runtimeClearlyDead(f, cur.Activity, now, m.window) {
+			delete(m.consecutiveDeadProbes, id)
 			return cur, false
 		}
 		if m.sessionMutationInProgress(id) {
+			return cur, false
+		}
+		m.consecutiveDeadProbes[id]++
+		if cur.Kind == domain.KindOrchestrator && m.consecutiveDeadProbes[id] < orchestratorDeadProbeThreshold {
 			return cur, false
 		}
 		finalizer = m.usageFinalizer
@@ -493,6 +506,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// (later observations return early on cur.IsTerminated). Runs under
 		// m.mu — mutate holds it across this callback.
 		delete(m.flights, id)
+		delete(m.consecutiveDeadProbes, id)
 		terminated = true
 		return next, true
 	})
@@ -514,6 +528,11 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 // number of times so the signal is reduced against the facts that actually won
 // instead of overwriting them with a stale full projection.
 const maxActivitySignalProjectionRetries = 3
+
+// orchestratorDeadProbeThreshold is the number of consecutive ProbeDead
+// observations required before a long-lived orchestrator may be terminated.
+// Other session kinds retain the historical single-sample verdict.
+const orchestratorDeadProbeThreshold = 2
 
 // ApplyActivitySignal records an authoritative agent activity signal and any
 // native agent session id carried alongside it. Metadata-only hooks leave the

@@ -471,6 +471,8 @@ func (s *Service) SpawnOrchestrator(
 		return domain.Session{}, err
 	}
 	mode := requestedMode
+	var predecessor domain.Session
+	var hasPredecessor bool
 	if clean {
 		existing, err := s.activeOrchestrators(ctx, projectID)
 		if err != nil {
@@ -498,6 +500,14 @@ func (s *Service) SpawnOrchestrator(
 		if len(existing) > 0 {
 			return newestSession(existing), nil
 		}
+		prior, ok, err := s.mostRecentTerminatedOrchestrator(ctx, projectID)
+		if err != nil {
+			return domain.Session{}, fmt.Errorf("locate predecessor orchestrator: %w", err)
+		}
+		if ok {
+			predecessor = prior
+			hasPredecessor = true
+		}
 	}
 	sess, _, _, err := s.spawn(ctx, ports.SpawnConfig{
 		ProjectID:     projectID,
@@ -509,6 +519,9 @@ func (s *Service) SpawnOrchestrator(
 	}
 	if err := s.verifyOrchestratorReplacement(project, sess); err != nil {
 		return domain.Session{}, err
+	}
+	if hasPredecessor {
+		_ = s.sendContinuityNotice(ctx, sess.ID, predecessor)
 	}
 	return sess, nil
 }
@@ -525,6 +538,59 @@ func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) err
 		return fmt.Errorf("send retire notice to %s: %w", id, err)
 	}
 	return nil
+}
+
+// orchestratorPredecessorStaleWindow bounds continuity notices to recent
+// replacement races; older terminated sessions represent deliberate cold starts.
+const orchestratorPredecessorStaleWindow = 30 * time.Minute
+
+// orchestratorReplacementContinuityNotice gives a replacement orchestrator
+// explicit predecessor and transcript provenance without inventing native
+// provider history.
+const orchestratorReplacementContinuityNotice = "" +
+	"AO notice: the previous orchestrator for this project (%s) appears to have ended unexpectedly " +
+	"at %s. Its transcript is available at %s. If you were in the middle of coordinated work, " +
+	"continue by summarising what the prior session had done before picking up new tasks."
+
+func (s *Service) sendContinuityNotice(ctx context.Context, newSession domain.SessionID, predecessor domain.Session) error {
+	when := predecessor.UpdatedAt.Format(time.RFC3339)
+	path := predecessor.Metadata.NativeTranscriptPath
+	if path == "" {
+		path = "(unavailable — transcript was never written)"
+	}
+	msg := fmt.Sprintf(orchestratorReplacementContinuityNotice, predecessor.ID, when, path)
+	if err := s.manager.Send(ctx, newSession, msg, nil); err != nil {
+		return fmt.Errorf("send continuity notice to %s: %w", newSession, err)
+	}
+	return nil
+}
+
+// mostRecentTerminatedOrchestrator finds a recent terminated orchestrator for
+// the project. No eligible predecessor means the new session starts cold.
+func (s *Service) mostRecentTerminatedOrchestrator(ctx context.Context, projectID domain.ProjectID) (domain.Session, bool, error) {
+	inactive := false
+	all, err := s.List(ctx, ListFilter{ProjectID: projectID, Active: &inactive, OrchestratorOnly: true})
+	if err != nil {
+		return domain.Session{}, false, fmt.Errorf("list terminated orchestrators: %w", err)
+	}
+	cutoff := s.now().Add(-orchestratorPredecessorStaleWindow)
+	var (
+		best    domain.Session
+		found   bool
+		bestRec domain.SessionRecord
+	)
+	for _, sess := range all {
+		if !sess.IsTerminated || sess.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		rec := sess.SessionRecord
+		if !found || sessionNewer(rec, bestRec) {
+			best = sess
+			bestRec = rec
+			found = true
+		}
+	}
+	return best, found, nil
 }
 
 func (s *Service) verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Session) error {
