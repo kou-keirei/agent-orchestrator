@@ -564,6 +564,19 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		}
 	}
 
+	// Allocate the AO execution fence before connecting the provider. Persistent
+	// hosts receive these expected generations during attachment; deriving them
+	// after connect would let a surviving host present evidence for an older
+	// controller generation.
+	generation := strings.TrimSpace(cfg.ControllerGeneration)
+	if generation == "" {
+		generation = s.newID()
+		cfg.ControllerGeneration = generation
+	}
+	if strings.TrimSpace(cfg.RuntimeGeneration) == "" {
+		cfg.RuntimeGeneration = generation
+	}
+
 	var prepareEnv func(context.Context) (map[string]string, error)
 	if cfg.PrepareControllerEnv != nil {
 		prepareEnv = func(prepareCtx context.Context) (map[string]string, error) {
@@ -579,6 +592,8 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	if cfg.ProviderConversationID != "" {
 		conv, err = driver.Resume(ctx, ports.ChatResumeConfig{
 			SessionID:              cfg.SessionID,
+			RuntimeGeneration:      cfg.RuntimeGeneration,
+			ControllerGeneration:   cfg.ControllerGeneration,
 			ProviderConversationID: cfg.ProviderConversationID,
 			DataDir:                cfg.DataDir,
 			WorkspacePath:          cfg.WorkspacePath,
@@ -598,6 +613,8 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		conv, err = driver.Start(ctx, ports.ChatStartConfig{
 			ProviderIDsScoped:     providerBoundaryID != "" || activeBranch.ProviderIDsScoped,
 			SessionID:             cfg.SessionID,
+			RuntimeGeneration:     cfg.RuntimeGeneration,
+			ControllerGeneration:  cfg.ControllerGeneration,
 			DataDir:               cfg.DataDir,
 			WorkspacePath:         cfg.WorkspacePath,
 			Env:                   cfg.Env,
@@ -683,10 +700,6 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	// pending provider boundary claims it in ControllerReady's atomic ownership
 	// commit instead, so a failed provider connect or callback cannot split the
 	// session owner from the conversation head.
-	generation := strings.TrimSpace(cfg.ControllerGeneration)
-	if generation == "" {
-		generation = s.newID()
-	}
 	if providerBoundaryID == "" {
 		if err := s.store.ClaimChatControllerGeneration(ctx, cfg.SessionID, generation); err != nil {
 			_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")

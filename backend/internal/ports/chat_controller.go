@@ -51,6 +51,10 @@ type ChatControllerStart struct {
 	// ControllerGeneration is supplied by a durable replacement saga that must
 	// fence the target before starting it. Ordinary starts leave it empty.
 	ControllerGeneration string
+	// RuntimeGeneration is the expected AO runtime fence for persistent provider
+	// evidence. Chat currently uses the controller generation for both fences
+	// when the caller does not supply a separate runtime identity.
+	RuntimeGeneration string
 	// HistoryMode chooses ordinary replay, required replay, or deferred import.
 	HistoryMode ChatHistoryMode
 	// HistoryPolicy carries explicit, attempt-scoped consent to ignore only

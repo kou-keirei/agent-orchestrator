@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -321,7 +322,7 @@ func TestPersistentConnectUsesWorkspaceResolvedCodexBinary(t *testing.T) {
 	conv, _, err := d.connectSession(context.Background(), "ao-workspace", t.TempDir(), workspace, nil,
 		func(context.Context) (map[string]string, error) {
 			return map[string]string{"PATH": os.Getenv("PATH")}, nil
-		}, "")
+		}, "", "runtime-test", "controller-test")
 	if err != nil {
 		t.Fatalf("connectSession: %v", err)
 	}
@@ -395,8 +396,9 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	}
 
 	conv, err := d.Resume(context.Background(), ports.ChatResumeConfig{
-		SessionID: "ao-reconnect", ProviderConversationID: "thread-survived",
-		DataDir: t.TempDir(), WorkspacePath: "/tmp/ws", Permissions: ports.PermissionModeReadOnly,
+		SessionID: "ao-reconnect", RuntimeGeneration: "runtime-1", ControllerGeneration: "2",
+		ProviderConversationID: "thread-survived",
+		DataDir:                t.TempDir(), WorkspacePath: "/tmp/ws", Permissions: ports.PermissionModeReadOnly,
 		PrepareEnv: func(context.Context) (map[string]string, error) {
 			prepareCalls++
 			return map[string]string{"AO_BROWSER_CAPABILITY": "rotated"}, nil
@@ -419,7 +421,7 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
 	if evidence.ProofStatus != "PROVEN" || evidence.SessionID != "ao-reconnect" ||
 		evidence.ProviderConversationID != "thread-survived" || evidence.EffectivePermission != "read-only" ||
-		evidence.ApprovalPolicy != "never" || evidence.ThreadSandbox != "readOnly" {
+		evidence.ApprovalPolicy != "never" || evidence.ThreadSandbox != "readOnly" || evidence.ProviderTurnID != "" {
 		t.Fatalf("reconnect native evidence = %+v", evidence)
 	}
 
@@ -430,6 +432,37 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	request := srv.awaitFrame(func(f frame) bool { return f.Method == "model/list" })
 	if request.ID == nil || string(*request.ID) != "42" {
 		t.Fatalf("first request id after reconnect = %v, want 42", request.ID)
+	}
+}
+
+func TestReadOnlyReconnectRejectsProofFromAnotherAOGeneration(t *testing.T) {
+	d, srv := newTestDriver(t)
+	proc, err := d.spawn(context.Background(), "codex", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.persistent = true
+	d.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{
+			Stdin: proc.stdin, Stdout: proc.stdout, Reconnected: true,
+			CodexReadOnly: []persistenthost.CodexReadOnlyProof{{
+				SessionID: "ao-reconnect", ThreadID: "thread-survived",
+				RuntimeGeneration: "old-runtime", ControllerGeneration: "old-controller",
+				PermissionConfigGeneration: 3, ApprovalPolicy: "never", Sandbox: "readOnly",
+			}},
+		}, nil
+	}
+
+	_, err = d.Resume(context.Background(), ports.ChatResumeConfig{
+		SessionID: "ao-reconnect", RuntimeGeneration: "current-runtime", ControllerGeneration: "current-controller",
+		ProviderConversationID: "thread-survived", DataDir: t.TempDir(), WorkspacePath: t.TempDir(),
+		Permissions: ports.PermissionModeReadOnly,
+	})
+	if !errors.Is(err, ports.ErrChatRecoveryInconclusive) {
+		t.Fatalf("Resume error = %v, want ErrChatRecoveryInconclusive", err)
+	}
+	if srv.sentMethod("thread/resume") {
+		t.Fatal("generation mismatch must fail before native resume")
 	}
 }
 
@@ -1456,9 +1489,33 @@ func TestFixedReadOnlyTurnsRetainNativeEvidence(t *testing.T) {
 			t.Fatalf("SendTurn %d: %v", turn, err)
 		}
 		evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
-		if !conv.Capabilities().Has(ports.ChatCapabilityPreventiveReadOnly) || evidence.ProofStatus != "PROVEN" {
+		wantTurnID := fmt.Sprintf("turn-%d", turn)
+		if !conv.Capabilities().Has(ports.ChatCapabilityPreventiveReadOnly) || evidence.ProofStatus != "PROVEN" || evidence.ProviderTurnID != wantTurnID {
 			t.Fatalf("turn %d native evidence = %+v, capabilities = %v; want proven preventive read-only", turn, evidence, conv.Capabilities())
 		}
+	}
+}
+
+func TestTurnStartWithoutProviderTurnIDFailsClosed(t *testing.T) {
+	d, srv := newTestDriver(t)
+	srv.reply("thread/start", `{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}`)
+	srv.reply("turn/start", `{"turn":{}}`)
+	conv, err := d.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conv.Close() }()
+
+	if _, err := conv.SendTurn(context.Background(), ports.ChatUserMessage{
+		Text: "continue", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeReadOnly},
+	}); err == nil || !strings.Contains(err.Error(), "no turn id") {
+		t.Fatalf("SendTurn error = %v, want missing turn id", err)
+	}
+	evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
+	if evidence.ProofStatus != "UNPROVEN" || evidence.PreventiveCapability || evidence.ProviderTurnID != "" {
+		t.Fatalf("native evidence after empty turn response = %+v, want fail-closed", evidence)
 	}
 }
 

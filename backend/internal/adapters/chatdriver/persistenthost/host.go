@@ -92,7 +92,12 @@ type Descriptor struct {
 
 // Config identifies one provider process and its AO session ownership.
 type Config struct {
+	// RuntimeGeneration and ControllerGeneration are AO-owned expected
+	// generations carried on the authenticated attachment. They are deliberately
+	// not inferred from host-local process or attachment counters.
 	SessionID            string
+	RuntimeGeneration    string
+	ControllerGeneration string
 	DataDir              string
 	Workdir              string
 	Env                  []string
@@ -150,9 +155,11 @@ type CodexReadOnlyProof struct {
 }
 
 type hello struct {
-	Version int    `json:"version"`
-	Token   string `json:"token"`
-	Action  string `json:"action"`
+	Version              int    `json:"version"`
+	Token                string `json:"token"`
+	Action               string `json:"action"`
+	RuntimeGeneration    string `json:"runtimeGeneration,omitempty"`
+	ControllerGeneration string `json:"controllerGeneration,omitempty"`
 }
 
 type helloResponse struct {
@@ -310,7 +317,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		if err := validateDescriptor(cfg, d); err != nil && processalive.Alive(d.PID) {
 			return nil, err
 		}
-		transport, attachErr := attach(ctx, d, true)
+		transport, attachErr := attachWithGenerations(ctx, d, true, cfg.RuntimeGeneration, cfg.ControllerGeneration)
 		if attachErr == nil {
 			return transport, nil
 		}
@@ -327,7 +334,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 					return nil, ctx.Err()
 				case <-timer.C:
 				}
-				transport, attachErr = attach(ctx, d, true)
+				transport, attachErr = attachWithGenerations(ctx, d, true, cfg.RuntimeGeneration, cfg.ControllerGeneration)
 				if attachErr == nil {
 					return transport, nil
 				}
@@ -379,7 +386,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 			if compatibleErr := validateDescriptor(cfg, d); compatibleErr != nil {
 				return nil, compatibleErr
 			}
-			transport, attachErr := attach(ctx, d, false)
+			transport, attachErr := attachWithGenerations(ctx, d, false, cfg.RuntimeGeneration, cfg.ControllerGeneration)
 			if attachErr == nil {
 				return transport, nil
 			}
@@ -444,6 +451,15 @@ func Reconcile(ctx context.Context, dataDir string, keep map[string]struct{}) er
 }
 
 func attach(ctx context.Context, d Descriptor, reconnected bool) (*Transport, error) {
+	return attachWithGenerations(ctx, d, reconnected, "", "")
+}
+
+func attachWithGenerations(
+	ctx context.Context,
+	d Descriptor,
+	reconnected bool,
+	runtimeGeneration, controllerGeneration string,
+) (*Transport, error) {
 	if d.Version != ProtocolVersion {
 		return nil, fmt.Errorf("%w: host=%d daemon=%d", ErrIncompatible, d.Version, ProtocolVersion)
 	}
@@ -456,7 +472,10 @@ func attach(ctx context.Context, d Descriptor, reconnected bool) (*Transport, er
 	}
 	finishHandshake := bindConnToContext(handshakeCtx, conn)
 	reader := bufio.NewReader(conn)
-	if err := json.NewEncoder(conn).Encode(hello{Version: ProtocolVersion, Token: d.Token, Action: "attach"}); err != nil {
+	if err := json.NewEncoder(conn).Encode(hello{
+		Version: ProtocolVersion, Token: d.Token, Action: "attach",
+		RuntimeGeneration: runtimeGeneration, ControllerGeneration: controllerGeneration,
+	}); err != nil {
 		_ = conn.Close()
 		return nil, finishHandshake(err)
 	}
@@ -674,14 +693,15 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 type host struct {
-	ctx               context.Context
-	listener          net.Listener
-	child             *exec.Cmd
-	stdin             io.WriteCloser
-	token             string
-	sessionID         string
-	runtimeGeneration string
-	acp               *acpRelay
+	ctx                  context.Context
+	listener             net.Listener
+	child                *exec.Cmd
+	stdin                io.WriteCloser
+	token                string
+	sessionID            string
+	runtimeGeneration    string
+	controllerGeneration string
+	acp                  *acpRelay
 
 	mu                        sync.Mutex
 	cond                      *sync.Cond
@@ -715,12 +735,13 @@ type codexPermissionRequest struct {
 }
 
 type codexReadOnlyReceipt struct {
-	threadID          string
-	turnID            string
-	generation        uint64
-	approvalPolicy    string
-	sandbox           string
-	runtimeGeneration string
+	threadID             string
+	turnID               string
+	generation           uint64
+	approvalPolicy       string
+	sandbox              string
+	runtimeGeneration    string
+	controllerGeneration string
 }
 
 func (h *host) accept() error {
@@ -772,6 +793,10 @@ func (h *host) handle(conn net.Conn) {
 	h.client = conn
 	h.clientGeneration++
 	generation := h.clientGeneration
+	// The attachment carries the current AO fence. Missing values deliberately
+	// clear the host's evidence identity instead of inheriting a prior attach.
+	h.runtimeGeneration = request.RuntimeGeneration
+	h.controllerGeneration = request.ControllerGeneration
 	response := helloResponse{
 		OK: true, NextRequestID: h.maxRequestID,
 		CodexReadOnly: h.codexReadOnlySnapshotLocked(),
@@ -1077,7 +1102,7 @@ func (h *host) observeCodexReadOnly(frame []byte) {
 	h.codexReadOnly[threadID] = codexReadOnlyReceipt{
 		threadID: threadID, generation: request.generation,
 		approvalPolicy: approvalPolicy, sandbox: sandbox,
-		runtimeGeneration: h.runtimeGeneration,
+		runtimeGeneration: h.runtimeGeneration, controllerGeneration: h.controllerGeneration,
 	}
 }
 
@@ -1114,6 +1139,7 @@ func (h *host) observeCodexTurnResponseLocked(request codexPermissionRequest, ra
 	receipt.turnID = turn.ID
 	receipt.generation = request.generation
 	receipt.runtimeGeneration = h.runtimeGeneration
+	receipt.controllerGeneration = h.controllerGeneration
 	h.codexReadOnly[request.threadID] = receipt
 }
 
@@ -1160,11 +1186,15 @@ func (h *host) ensureCodexMapsLocked() {
 
 func (h *host) codexReadOnlySnapshotLocked() []CodexReadOnlyProof {
 	h.ensureCodexMapsLocked()
+	if h.runtimeGeneration == "" || h.controllerGeneration == "" {
+		return nil
+	}
 	threadIDs := make([]string, 0, len(h.codexReadOnly))
 	for threadID, receipt := range h.codexReadOnly {
 		if threadID == "" || receipt.generation == 0 ||
 			h.codexThreadGeneration[threadID] != receipt.generation ||
-			receipt.runtimeGeneration == "" || receipt.approvalPolicy != "never" ||
+			receipt.runtimeGeneration == "" || receipt.runtimeGeneration != h.runtimeGeneration ||
+			receipt.controllerGeneration == "" || receipt.controllerGeneration != h.controllerGeneration || receipt.approvalPolicy != "never" ||
 			receipt.sandbox != "readOnly" {
 			continue
 		}
@@ -1179,7 +1209,7 @@ func (h *host) codexReadOnlySnapshotLocked() []CodexReadOnlyProof {
 			ThreadID:                   receipt.threadID,
 			TurnID:                     receipt.turnID,
 			RuntimeGeneration:          receipt.runtimeGeneration,
-			ControllerGeneration:       strconv.FormatUint(h.clientGeneration, 10),
+			ControllerGeneration:       h.controllerGeneration,
 			PermissionConfigGeneration: receipt.generation,
 			ApprovalPolicy:             receipt.approvalPolicy,
 			Sandbox:                    receipt.sandbox,

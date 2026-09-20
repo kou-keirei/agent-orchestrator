@@ -356,6 +356,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 
 	conv, reconnected, err := d.connectSession(
 		ctx, cfg.SessionID, cfg.DataDir, cfg.WorkspacePath, cfg.Env, cfg.PrepareEnv, cfg.ProviderScopeID,
+		cfg.RuntimeGeneration, cfg.ControllerGeneration,
 	)
 	if err != nil {
 		return nil, err
@@ -446,6 +447,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 
 	conv, reconnected, err := d.connectSession(
 		ctx, cfg.SessionID, cfg.DataDir, cfg.WorkspacePath, cfg.Env, cfg.PrepareEnv, cfg.ProviderScopeID,
+		cfg.RuntimeGeneration, cfg.ControllerGeneration,
 	)
 	if err != nil {
 		return nil, err
@@ -457,13 +459,17 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		if cfg.Permissions == ports.PermissionModeReadOnly {
 			proof, ok := readOnlyProofForThread(
 				conv.proc.codexReadOnly, string(cfg.SessionID), cfg.ProviderConversationID,
+				cfg.RuntimeGeneration, cfg.ControllerGeneration,
 			)
 			if !ok {
 				_ = conv.Close()
 				return nil, fmt.Errorf("%w: surviving Codex host has no confirmed read-only posture", ports.ErrChatRecoveryInconclusive)
 			}
 			conv.setNativeEvidence(cfg.Permissions, proof.ApprovalPolicy, proof.Sandbox)
-			bindNativeEvidenceCorrelation(conv, string(cfg.SessionID), proof.ThreadID, proof.TurnID)
+			// A surviving host receipt proves the thread posture, not that an old
+			// turn is still the current AO turn. Reconnect must not carry stale turn
+			// identity into the new controller.
+			bindNativeEvidenceCorrelation(conv, string(cfg.SessionID), proof.ThreadID, "")
 		}
 		conv.configureDispatch(newDispatchConformanceInput(
 			cfg.SessionID,
@@ -570,6 +576,7 @@ func (d *Driver) connectSession(
 	env map[string]string,
 	prepareEnv func(context.Context) (map[string]string, error),
 	providerScopeID string,
+	runtimeGeneration, controllerGeneration string,
 ) (*conversation, bool, error) {
 	// Injected driver tests intentionally retain the direct pipe launcher. The
 	// shipped driver uses spawnAppServer and therefore the persistent host.
@@ -593,11 +600,13 @@ func (d *Driver) connectSession(
 		return nil, false, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 	}
 	hostConfig := persistenthost.Config{
-		SessionID: string(sessionID),
-		DataDir:   dataDir,
-		Workdir:   contract.WorkspacePath,
-		Env:       contract.Environment,
-		Argv:      []string{contract.Executable, "app-server"},
+		SessionID:            string(sessionID),
+		RuntimeGeneration:    runtimeGeneration,
+		ControllerGeneration: controllerGeneration,
+		DataDir:              dataDir,
+		Workdir:              contract.WorkspacePath,
+		Env:                  contract.Environment,
+		Argv:                 []string{contract.Executable, "app-server"},
 	}
 	if prepareEnv != nil {
 		hostConfig.Prepare = func(prepareCtx context.Context) (persistenthost.PreparedProvider, error) {
@@ -700,9 +709,9 @@ func approvalReviewer(mode ports.PermissionMode) string {
 
 func readOnlyProofForThread(
 	proofs []persistenthost.CodexReadOnlyProof,
-	sessionID, threadID string,
+	sessionID, threadID, runtimeGeneration, controllerGeneration string,
 ) (persistenthost.CodexReadOnlyProof, bool) {
-	if sessionID == "" || threadID == "" {
+	if sessionID == "" || threadID == "" || runtimeGeneration == "" || controllerGeneration == "" {
 		return persistenthost.CodexReadOnlyProof{}, false
 	}
 	var match persistenthost.CodexReadOnlyProof
@@ -713,6 +722,7 @@ func readOnlyProofForThread(
 		}
 		if proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" ||
 			proof.RuntimeGeneration == "" || proof.ControllerGeneration == "" ||
+			proof.RuntimeGeneration != runtimeGeneration || proof.ControllerGeneration != controllerGeneration ||
 			proof.PermissionConfigGeneration == 0 {
 			return persistenthost.CodexReadOnlyProof{}, false
 		}

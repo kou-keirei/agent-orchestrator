@@ -318,6 +318,7 @@ func (c *conversation) invalidateNativeEvidence(requested ports.PermissionMode) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.preventiveReadOnly = false
+	c.nativeEvidence.ProviderTurnID = ""
 	c.nativeEvidence.RequestedPermission = string(requested)
 	c.nativeEvidence.EffectivePermission = "unknown"
 	c.nativeEvidence.ApprovalPolicy = "unknown"
@@ -326,13 +327,43 @@ func (c *conversation) invalidateNativeEvidence(requested ports.PermissionMode) 
 	c.nativeEvidence.ProofStatus = "UNPROVEN"
 }
 
-func (c *conversation) preservesNativeReadOnlyEvidence(requested ports.PermissionMode) bool {
+// beginTurnNativeEvidence fences the previous turn before every new turn. A
+// successful fixed read-only turn may restore the posture, but a provider
+// error or an empty turn id must leave it unproven instead of reusing stale
+// evidence.
+func (c *conversation) beginTurnNativeEvidence(requested ports.PermissionMode) (ports.ChatNativeEvidence, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return requested == ports.PermissionModeReadOnly &&
+	previous := c.nativeEvidence
+	retain := (requested == "" || requested == ports.PermissionModeReadOnly) &&
 		c.preventiveReadOnly &&
 		c.nativeEvidence.RequestedPermission == string(ports.PermissionModeReadOnly) &&
 		c.nativeEvidence.ProofStatus == "PROVEN"
+	c.preventiveReadOnly = false
+	c.nativeEvidence.ProviderTurnID = ""
+	c.nativeEvidence.EffectivePermission = "unknown"
+	c.nativeEvidence.ApprovalPolicy = "unknown"
+	c.nativeEvidence.TurnSandbox = "unknown"
+	c.nativeEvidence.PreventiveCapability = false
+	c.nativeEvidence.ProofStatus = "UNPROVEN"
+	if requested != "" {
+		c.nativeEvidence.RequestedPermission = string(requested)
+	}
+	return previous, retain
+}
+
+func (c *conversation) finishTurnNativeEvidence(previous ports.ChatNativeEvidence, retain bool, providerTurnID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if retain {
+		previous.ProviderTurnID = providerTurnID
+		c.nativeEvidence = previous
+		c.preventiveReadOnly = true
+		return
+	}
+	if c.nativeEvidence.Provider != "" {
+		c.nativeEvidence.ProviderTurnID = providerTurnID
+	}
 }
 
 // Events is the normalized stream. It closes when the conversation ends.
@@ -503,11 +534,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		params["clientUserMessageId"] = msg.ClientMessageID
 	}
 	applyTurnSettings(params, msg.Settings)
-	if msg.Settings.Approval != "" {
-		if !c.preservesNativeReadOnlyEvidence(msg.Settings.Approval) {
-			c.invalidateNativeEvidence(msg.Settings.Approval)
-		}
-	}
+	previousEvidence, retainEvidence := c.beginTurnNativeEvidence(msg.Settings.Approval)
 
 	var resp struct {
 		Turn struct {
@@ -518,7 +545,11 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		c.recordProviderRejection(err)
 		return ports.ChatTurnRef{}, fmt.Errorf("turn/start: %w", err)
 	}
+	if resp.Turn.ID == "" {
+		return ports.ChatTurnRef{}, errors.New("turn/start returned no turn id")
+	}
 	c.recordDispatchedFirstTurn(resp.Turn.ID, msg.Settings)
+	c.finishTurnNativeEvidence(previousEvidence, retainEvidence, resp.Turn.ID)
 
 	c.mu.Lock()
 	c.activeTurn = resp.Turn.ID

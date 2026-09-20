@@ -290,6 +290,9 @@ func (s *Service) EditMessage(
 	var replayContent ports.ChatContent
 	var replayTruncated bool
 	var providerScopeID string
+	// The replacement generation must be known before provider attachment so a
+	// persistent host cannot return evidence for the controller being replaced.
+	replacementGeneration := s.newID()
 	operationCtx := ctx
 	sourceStopInitiated := false
 	if msg.ClientMessageID != "" {
@@ -319,7 +322,8 @@ func (s *Service) EditMessage(
 					err = prepareErr
 				} else {
 					provider, err = driver.Resume(operationCtx, ports.ChatResumeConfig{
-						SessionID: cfg.SessionID, ProviderConversationID: providerConversationID,
+						SessionID: cfg.SessionID, RuntimeGeneration: replacementGeneration,
+						ControllerGeneration: replacementGeneration, ProviderConversationID: providerConversationID,
 						DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
 						Model: cfg.Model, Effort: cfg.Effort,
 						EffortOverride: cfg.EffortOverride,
@@ -360,7 +364,8 @@ func (s *Service) EditMessage(
 				err = prepareErr
 			} else {
 				provider, err = driver.Start(operationCtx, ports.ChatStartConfig{
-					SessionID: cfg.SessionID, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
+					SessionID: cfg.SessionID, RuntimeGeneration: replacementGeneration,
+					ControllerGeneration: replacementGeneration, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath,
 					Env: launchEnv, Model: cfg.Model, Effort: cfg.Effort,
 					EffortOverride: cfg.EffortOverride,
 					Permissions:    cfg.Permissions,
@@ -416,7 +421,7 @@ func (s *Service) EditMessage(
 	}
 
 	branchID := s.newID()
-	generation := s.newID()
+	generation := replacementGeneration
 	branch := domain.ConversationBranch{
 		ID: branchID, ConversationID: source.conversation.ID, SessionID: id,
 		ProviderConversationID: providerConversationID, ParentBranchID: anchor.SourceBranchID,
@@ -901,8 +906,10 @@ func (s *Service) activateBranchLocked(ctx context.Context, id domain.SessionID,
 		}
 		return "", err
 	}
+	generation := s.newID()
 	provider, err := driver.Resume(operationCtx, ports.ChatResumeConfig{
-		SessionID: cfg.SessionID, ProviderConversationID: branch.ProviderConversationID,
+		SessionID: cfg.SessionID, RuntimeGeneration: generation,
+		ControllerGeneration: generation, ProviderConversationID: branch.ProviderConversationID,
 		DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
 		Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride,
 		Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
@@ -920,7 +927,6 @@ func (s *Service) activateBranchLocked(ctx context.Context, id domain.SessionID,
 		}
 		return "", resumeErr
 	}
-	generation := s.newID()
 	conversation := source.conversation
 	conversation.ActiveBranchID = branch.ID
 	replacement := newController(id, conversation, generation, source.harness, source.permissionFloor, provider, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged)
@@ -997,12 +1003,14 @@ func (s *Service) restoreClosedSourceController(
 		return fmt.Errorf("confirm source stopped before failed native edit recovery: %w", err)
 	}
 	providerConversationID := source.ProviderConversationID()
+	generation := s.newID()
 	launchEnv, err := s.prepareBranchControllerEnv(recoveryCtx, cfg)
 	if err != nil {
 		return fmt.Errorf("rotate source browser capability after failed native edit: %w", err)
 	}
 	provider, err := driver.Resume(recoveryCtx, ports.ChatResumeConfig{
-		SessionID: cfg.SessionID, ProviderConversationID: providerConversationID,
+		SessionID: cfg.SessionID, RuntimeGeneration: generation,
+		ControllerGeneration: generation, ProviderConversationID: providerConversationID,
 		DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: launchEnv,
 		Model: cfg.Model, Effort: cfg.Effort, EffortOverride: cfg.EffortOverride,
 		Permissions: cfg.Permissions, SystemPrompt: cfg.SystemPrompt,
@@ -1013,7 +1021,6 @@ func (s *Service) restoreClosedSourceController(
 	if err != nil {
 		return fmt.Errorf("resume source after failed native edit: %w", err)
 	}
-	generation := s.newID()
 	conversation := source.conversation
 	conversation.ActiveBranchID = branch.ID
 	replacement := newController(

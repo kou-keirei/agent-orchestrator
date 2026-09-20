@@ -280,7 +280,7 @@ func readFrame(t *testing.T, reader *bufio.Reader) []byte {
 
 func newCodexEvidenceHost() *host {
 	return &host{
-		sessionID: "session-1", runtimeGeneration: "runtime-1", clientGeneration: 3,
+		sessionID: "session-1", runtimeGeneration: "runtime-1", controllerGeneration: "controller-1", clientGeneration: 3,
 		codexReadOnly:         make(map[string]codexReadOnlyReceipt),
 		codexPermissions:      make(map[string]codexPermissionRequest),
 		codexThreadGeneration: make(map[string]uint64),
@@ -316,7 +316,7 @@ func TestCodexReadOnlyProofCarriesHostDriverCorrelation(t *testing.T) {
 		t.Fatal("matching read-only receipt was not promoted")
 	}
 	if proof.SessionID != "session-1" || proof.ThreadID != "thread-1" || proof.TurnID != "" ||
-		proof.RuntimeGeneration != "runtime-1" || proof.ControllerGeneration != "3" ||
+		proof.RuntimeGeneration != "runtime-1" || proof.ControllerGeneration != "controller-1" ||
 		proof.PermissionConfigGeneration == 0 || proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" {
 		t.Fatalf("typed host proof = %+v", proof)
 	}
@@ -359,7 +359,7 @@ func TestCodexReadOnlyProofRejectsStalePermissionResponse(t *testing.T) {
 
 func TestHostRetainsTypedCodexReadOnlyProofAcrossAttachments(t *testing.T) {
 	cfg := Config{
-		SessionID: "typed-proof-host", DataDir: t.TempDir(), Workdir: t.TempDir(),
+		SessionID: "typed-proof-host", RuntimeGeneration: "runtime-1", ControllerGeneration: "controller-1", DataDir: t.TempDir(), Workdir: t.TempDir(),
 		Env:  append(os.Environ(), "AO_CHAT_HOST_PROVIDER_HELPER=1"),
 		Argv: []string{os.Args[0], "-test.run=TestProviderHelper"},
 	}
@@ -375,7 +375,7 @@ func TestHostRetainsTypedCodexReadOnlyProofAcrossAttachments(t *testing.T) {
 		}
 	})
 
-	first := awaitAttach(t, d)
+	first := awaitAttachWithGenerations(t, d, cfg.RuntimeGeneration, cfg.ControllerGeneration)
 	if len(first.CodexReadOnly) != 0 {
 		t.Fatal("new host invented read-only proof")
 	}
@@ -387,13 +387,13 @@ func TestHostRetainsTypedCodexReadOnlyProofAcrossAttachments(t *testing.T) {
 	}
 	_ = first.Stdin.Close()
 
-	second := awaitAttach(t, d)
+	second := awaitAttachWithGenerations(t, d, cfg.RuntimeGeneration, cfg.ControllerGeneration)
 	if len(second.CodexReadOnly) != 1 {
 		t.Fatalf("typed proofs after reconnect = %+v", second.CodexReadOnly)
 	}
 	proof := second.CodexReadOnly[0]
 	if proof.SessionID != cfg.SessionID || proof.ThreadID != "readonly-thread" ||
-		proof.RuntimeGeneration == "" || proof.ControllerGeneration != "2" ||
+		proof.RuntimeGeneration != cfg.RuntimeGeneration || proof.ControllerGeneration != cfg.ControllerGeneration ||
 		proof.PermissionConfigGeneration == 0 || proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" {
 		t.Fatalf("reconnected typed proof = %+v", proof)
 	}
@@ -1073,10 +1073,14 @@ func awaitDescriptor(t *testing.T, dataDir, sessionID string) Descriptor {
 }
 
 func awaitAttach(t *testing.T, d Descriptor) *Transport {
+	return awaitAttachWithGenerations(t, d, "", "")
+}
+
+func awaitAttachWithGenerations(t *testing.T, d Descriptor, runtimeGeneration, controllerGeneration string) *Transport {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		transport, err := attach(context.Background(), d, true)
+		transport, err := attachWithGenerations(context.Background(), d, true, runtimeGeneration, controllerGeneration)
 		if err == nil {
 			return transport
 		}
