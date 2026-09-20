@@ -5373,3 +5373,80 @@ func TestRuntimeObservation_NonDeadProbeDuringFinalizationSuppressesTermination(
 		t.Fatal("dead observation terminated after a non-dead probe cleared its sequence")
 	}
 }
+
+func TestMarkSpawned_ControllerGenerationTransitionResetsDeadProbeSequence(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	m, st, _ := newManager()
+	m.clock = func() time.Time { return now }
+	rec := working("mer-1")
+	rec.Mode = domain.SessionModeChat
+	rec.Metadata.RuntimeLaunchID = "old-runtime"
+	rec.Metadata.ControllerGeneration = "old-controller"
+	st.sessions[rec.ID] = rec
+	m.consecutiveDeadProbes[rec.ID] = 1
+
+	if err := m.MarkSpawned(ctx, rec.ID, domain.SessionMetadata{
+		ControllerGeneration:   "new-controller",
+		ProviderConversationID: "provider-new",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.consecutiveDeadProbes[rec.ID]; ok {
+		t.Fatal("controller generation transition retained the stale dead-probe streak")
+	}
+}
+
+func TestActivateAgentSwitchTargetResetsDeadProbeSequence(t *testing.T) {
+	activatedAt := time.Unix(1_700_000_500, 0).UTC()
+	store := newFakeAgentSwitchLifecycleStore()
+	rec := working("mer-1")
+	rec.Kind = domain.KindOrchestrator
+	rec.Harness = domain.HarnessClaudeCode
+	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: activatedAt.Add(-time.Minute)}
+	rec.Metadata.RuntimeLaunchID = "source-generation"
+	store.setSession(rec)
+	store.setActiveSwitch(domain.AgentSwitch{
+		ID: "switch-1", SessionID: rec.ID, FromHarness: domain.HarnessClaudeCode,
+		TargetHarness: domain.HarnessCodex, State: domain.AgentSwitchStartingTarget,
+		SourceGenerationID: "source-generation", TargetGenerationID: "target-generation",
+	})
+	m := New(store, &fakeMessenger{})
+	m.consecutiveDeadProbes[rec.ID] = 1
+	m.clock = func() time.Time { return activatedAt.Add(2 * time.Minute) }
+
+	activated, err := m.ActivateAgentSwitchTarget(ctx, domain.AgentSwitchTargetActivation{
+		SwitchID: "switch-1", SessionID: rec.ID, SourceHarness: domain.HarnessClaudeCode,
+		SourceGenerationID: "source-generation", ExpectedSourceRuntimeLaunchID: "source-generation",
+		TargetHarness: domain.HarnessCodex, TargetGenerationID: "target-generation",
+		RuntimeHandleID: "runtime-1", ActivatedAt: activatedAt,
+	})
+	if err != nil || !activated {
+		t.Fatalf("ActivateAgentSwitchTarget = (%v, %v), want (true, nil)", activated, err)
+	}
+	if _, ok := m.consecutiveDeadProbes[rec.ID]; ok {
+		t.Fatal("agent-switch activation retained the source dead-probe streak")
+	}
+
+	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{
+		Runtime: ports.ProbeDead, LaunchID: "target-generation", ObservedAt: activatedAt.Add(2 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.session(rec.ID); got.IsTerminated {
+		t.Fatal("one dead probe in the activated orchestrator generation terminated the session")
+	}
+}
+
+func TestMarkTerminatedClearsDeadProbeSequence(t *testing.T) {
+	m, st, _ := newManager()
+	rec := working("mer-1")
+	st.sessions[rec.ID] = rec
+	m.consecutiveDeadProbes[rec.ID] = 1
+
+	if err := m.MarkTerminated(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.consecutiveDeadProbes[rec.ID]; ok {
+		t.Fatal("terminal replacement retained the dead-probe streak")
+	}
+}

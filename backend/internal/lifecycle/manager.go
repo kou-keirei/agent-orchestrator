@@ -344,6 +344,10 @@ func (m *Manager) sessionMutationInProgress(id domain.SessionID) bool {
 	return gate != nil && gate.SessionMutationInProgress(id)
 }
 
+func (m *Manager) resetDeadProbeStreakLocked(id domain.SessionID) {
+	delete(m.consecutiveDeadProbes, id)
+}
+
 // PrepareLaunch registers a supervised generation before the runtime starts.
 // Hooks from that exact generation wait until MarkSpawned commits the generation
 // instead of racing the old durable generation and being discarded as stale.
@@ -454,12 +458,12 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	)
 	if err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
 		if cur.IsTerminated || !matchesLaunch(cur) {
-			delete(m.consecutiveDeadProbes, id)
+			m.resetDeadProbeStreakLocked(id)
 			return cur, false
 		}
 		currentLaunch := cur.Metadata.RuntimeLaunchID
 		if currentLaunch != "" && f.Runtime == ports.ProbeAlive && f.Workload == ports.ProbeDead {
-			delete(m.consecutiveDeadProbes, id)
+			m.resetDeadProbeStreakLocked(id)
 			if cur.Activity.State == domain.ActivityExited {
 				return cur, false
 			}
@@ -469,7 +473,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 			return next, true
 		}
 		if !runtimeClearlyDead(f, cur.Activity, now, m.window) {
-			delete(m.consecutiveDeadProbes, id)
+			m.resetDeadProbeStreakLocked(id)
 			return cur, false
 		}
 		if m.sessionMutationInProgress(id) {
@@ -508,7 +512,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		// (later observations return early on cur.IsTerminated). Runs under
 		// m.mu — mutate holds it across this callback.
 		delete(m.flights, id)
-		delete(m.consecutiveDeadProbes, id)
+		m.resetDeadProbeStreakLocked(id)
 		terminated = true
 		return next, true
 	})
@@ -1545,6 +1549,7 @@ func (m *Manager) markSpawned(
 		}
 		now := m.clock()
 		previousLaunchID := rec.Metadata.RuntimeLaunchID
+		previousControllerGeneration := rec.Metadata.ControllerGeneration
 		rec.IsTerminated = false
 		rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
 		// Each spawn/restore must re-prove its hook pipeline: clear the receipt so
@@ -1553,6 +1558,7 @@ func (m *Manager) markSpawned(
 		rec.FirstSignalAt = time.Time{}
 		rec.Metadata = mergeMetadata(rec.Metadata, metadata)
 		launchGenerationChanged := rec.Metadata.RuntimeLaunchID != previousLaunchID
+		controllerGenerationChanged := rec.Metadata.ControllerGeneration != previousControllerGeneration
 		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat &&
 			strings.TrimSpace(metadata.ControllerGeneration) != "" {
 			// A committed Chat controller is the sole session owner. Clear any
@@ -1583,8 +1589,8 @@ func (m *Manager) markSpawned(
 				return nil, err
 			}
 		}
-		if launchGenerationChanged {
-			delete(m.consecutiveDeadProbes, id)
+		if launchGenerationChanged || controllerGenerationChanged {
+			m.resetDeadProbeStreakLocked(id)
 		}
 		return m.usageReactivator, nil
 	}()
@@ -1708,6 +1714,7 @@ func (m *Manager) changeControllerEpoch(
 	next.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: now}
 	next.UpdatedAt = now
 	delete(m.flights, id)
+	m.resetDeadProbeStreakLocked(id)
 	resolutions := needsInputResolutions(previous, next, now)
 	waitingEvents := m.waitingInputEvents(
 		next, previous.Activity.State, previous.Activity.LastActivityAt, now,
@@ -1735,7 +1742,11 @@ func (m *Manager) ConfirmAgentSwitchSourceStopped(
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return writer.ConfirmAgentSwitchSourceStopped(ctx, confirmation)
+	changed, err := writer.ConfirmAgentSwitchSourceStopped(ctx, confirmation)
+	if changed {
+		m.resetDeadProbeStreakLocked(confirmation.SessionID)
+	}
+	return changed, err
 }
 
 // ActivateAgentSwitchTarget atomically transfers the session owner to the
@@ -1752,7 +1763,11 @@ func (m *Manager) ActivateAgentSwitchTarget(
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return writer.ActivateAgentSwitchTarget(ctx, activation)
+	changed, err := writer.ActivateAgentSwitchTarget(ctx, activation)
+	if changed {
+		m.resetDeadProbeStreakLocked(activation.SessionID)
+	}
+	return changed, err
 }
 
 // ActivateChatAgentSwitchTarget atomically transfers a stopped Chat session
@@ -1767,7 +1782,11 @@ func (m *Manager) ActivateChatAgentSwitchTarget(
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return writer.ActivateChatAgentSwitchTarget(ctx, activation)
+	changed, err := writer.ActivateChatAgentSwitchTarget(ctx, activation)
+	if changed {
+		m.resetDeadProbeStreakLocked(activation.SessionID)
+	}
+	return changed, err
 }
 
 // MarkTerminated marks a session terminated. Runtime/workspace teardown is the
@@ -1784,6 +1803,9 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 			return err
 		}
 		if rec.IsTerminated {
+			m.mu.Lock()
+			m.resetDeadProbeStreakLocked(id)
+			m.mu.Unlock()
 			m.reapSessionContainers(ctx, id)
 			return nil
 		}
@@ -1816,6 +1838,7 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 				cur.IsTerminated = true
 				cur.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: now}
 				delete(m.flights, id) // runs under m.mu (mutate holds it)
+				m.resetDeadProbeStreakLocked(id)
 				outcome = terminationApplied
 				return cur, true
 			}

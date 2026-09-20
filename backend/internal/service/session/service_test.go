@@ -5261,3 +5261,63 @@ func TestSpawnOrchestratorNoCleanIdempotentDoesNotDoubleNotice(t *testing.T) {
 		t.Fatalf("second call issued duplicate continuity notice: %q", fc.sentMessages)
 	}
 }
+
+func TestSpawnOrchestratorContinuityRetriesAfterStartupPending(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 10, 0, 0, time.UTC)
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	st.sessions["mer-old"] = domain.SessionRecord{
+		ID: "mer-old", ProjectID: "mer", Kind: domain.KindOrchestrator,
+		IsTerminated: true, UpdatedAt: base.Add(-3 * time.Minute),
+	}
+	fc := &fakeCommander{spawnRecord: domain.SessionRecord{
+		ID: "mer-new", ProjectID: "mer", Kind: domain.KindOrchestrator,
+	}}
+	var sends int
+	fc.sendFunc = func(id domain.SessionID, message string) error {
+		sends++
+		fc.sent = append(fc.sent, id)
+		fc.sentMessages = append(fc.sentMessages, message)
+		if sends == 1 {
+			return sessionmanager.ErrStartupPending
+		}
+		return nil
+	}
+	svc := &Service{manager: fc, store: st, clock: func() time.Time { return base }}
+
+	got, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
+	if err != nil {
+		t.Fatalf("SpawnOrchestrator: %v", err)
+	}
+	if got.ID != "mer-new" || sends != 2 || len(fc.ready) != 1 || fc.ready[0] != "mer-new" {
+		t.Fatalf("continuity sends = %d, ready = %v, result = %q; want two sends, one readiness wait, mer-new", sends, fc.ready, got.ID)
+	}
+}
+
+func TestSpawnOrchestratorContinuityFailureIsRetryable(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 15, 0, 0, time.UTC)
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	st.sessions["mer-old"] = domain.SessionRecord{
+		ID: "mer-old", ProjectID: "mer", Kind: domain.KindOrchestrator,
+		IsTerminated: true, UpdatedAt: base.Add(-3 * time.Minute),
+	}
+	fc := &fakeCommander{
+		spawnRecord: domain.SessionRecord{ID: "mer-new", ProjectID: "mer", Kind: domain.KindOrchestrator},
+		sendErr:     sessionmanager.ErrStartupPending,
+		readyErr:    errors.New("startup readiness timed out"),
+	}
+	svc := &Service{manager: fc, store: st, clock: func() time.Time { return base }}
+
+	_, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
+	if err == nil {
+		t.Fatal("SpawnOrchestrator returned nil after bounded continuity delivery failure")
+	}
+	var apiErr *apierr.Error
+	if !errors.As(err, &apiErr) || apiErr.Kind != apierr.KindUnavailable || apiErr.Code != "ORCHESTRATOR_CONTINUITY_RETRYABLE" {
+		t.Fatalf("continuity error = %v, want unavailable ORCHESTRATOR_CONTINUITY_RETRYABLE", err)
+	}
+	if len(fc.ready) != 1 || fc.ready[0] != "mer-new" {
+		t.Fatalf("readiness waits = %v, want one bounded wait for mer-new", fc.ready)
+	}
+}
