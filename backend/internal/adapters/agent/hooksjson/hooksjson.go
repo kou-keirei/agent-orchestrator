@@ -165,7 +165,15 @@ type HookSpec struct {
 // hooks. Managed shells must invoke the absolute AO executable from AO_CLI;
 // falling back to a bare "ao" would let a nested shell select another install.
 func CanonicalAOHookPrefix(harness string) string {
-	if runtime.GOOS == "windows" {
+	return CanonicalAOHookPrefixForOS(harness, runtime.GOOS == "windows")
+}
+
+// CanonicalAOHookPrefixForOS returns the canonical AO hook command for the
+// target shell family. Keeping the target explicit lets adapters reconcile
+// hooks written on the other operating system after a workspace moves between
+// Windows and POSIX hosts.
+func CanonicalAOHookPrefixForOS(harness string, windows bool) string {
+	if windows {
 		return `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks ` + harness + " "
 	}
 	return `"${AO_CLI:?AO_CLI is not set}" hooks ` + harness + " "
@@ -173,10 +181,27 @@ func CanonicalAOHookPrefix(harness string) string {
 
 // CanonicalAOHookShell returns the shell that interprets CanonicalAOHookPrefix.
 func CanonicalAOHookShell() string {
-	if runtime.GOOS == "windows" {
+	return CanonicalAOHookShellForOS(runtime.GOOS == "windows")
+}
+
+// CanonicalAOHookShellForOS returns the shell name paired with
+// CanonicalAOHookPrefixForOS.
+func CanonicalAOHookShellForOS(windows bool) string {
+	if windows {
 		return "powershell"
 	}
 	return "bash"
+}
+
+// CanonicalAOHookPrefixes returns both shell-specific canonical command forms
+// for one harness. Both forms are AO-owned and may be left behind when a
+// workspace is installed on one operating system and later reconciled on the
+// other.
+func CanonicalAOHookPrefixes(harness string) []string {
+	return []string{
+		CanonicalAOHookPrefixForOS(harness, false),
+		CanonicalAOHookPrefixForOS(harness, true),
+	}
 }
 
 // Manager installs, removes, and detects AO's hooks in one agent's matcher-group
@@ -228,7 +253,11 @@ func (m Manager) Install(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.GetAgentHooks: %w", m.Label, err)
 		}
-		groups = removeManagedPrefixes(groups, m.LegacyCommandPrefixes)
+		managedCommands := make(map[string]struct{}, len(specs))
+		for _, spec := range specs {
+			managedCommands[spec.Command] = struct{}{}
+		}
+		groups = removeManagedPrefixes(groups, m.LegacyCommandPrefixes, managedCommands)
 		for _, spec := range specs {
 			entry := HookEntry{Type: "command", Command: spec.Command, Timeout: m.Timeout}
 			if spec.Shell != "" {
@@ -254,7 +283,7 @@ func (m Manager) Install(ctx context.Context, workspacePath string) error {
 	return nil
 }
 
-func removeManagedPrefixes(groups []MatcherGroup, prefixes []string) []MatcherGroup {
+func removeManagedPrefixes(groups []MatcherGroup, prefixes []string, protectedCommands map[string]struct{}) []MatcherGroup {
 	if len(prefixes) == 0 {
 		return groups
 	}
@@ -262,6 +291,10 @@ func removeManagedPrefixes(groups []MatcherGroup, prefixes []string) []MatcherGr
 	for _, group := range groups {
 		kept := make([]HookEntry, 0, len(group.Hooks))
 		for _, hook := range group.Hooks {
+			if _, protected := protectedCommands[hook.Command]; protected {
+				kept = append(kept, hook)
+				continue
+			}
 			legacy := false
 			for _, prefix := range prefixes {
 				if strings.HasPrefix(hook.Command, prefix) {
@@ -305,7 +338,7 @@ func (m Manager) Uninstall(ctx context.Context, workspacePath string) error {
 		if err := parseEvent(rawHooks, event, &groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}
-		groups = removeManagedPrefixes(groups, m.uninstallCommandPrefixes())
+		groups = removeManagedPrefixes(groups, m.uninstallCommandPrefixes(), nil)
 		if err := marshalEvent(rawHooks, event, groups); err != nil {
 			return fmt.Errorf("%s.UninstallHooks: %w", m.Label, err)
 		}

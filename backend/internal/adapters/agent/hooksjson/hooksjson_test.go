@@ -5,9 +5,111 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestCanonicalAOHookFormsAreShellAwareAndCrossPlatform(t *testing.T) {
+	posix := CanonicalAOHookPrefixForOS("demo", false)
+	windows := CanonicalAOHookPrefixForOS("demo", true)
+	if posix != `"${AO_CLI:?AO_CLI is not set}" hooks demo ` {
+		t.Fatalf("POSIX prefix = %q", posix)
+	}
+	if windows != `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks demo ` {
+		t.Fatalf("Windows prefix = %q", windows)
+	}
+	if CanonicalAOHookShellForOS(false) != "bash" || CanonicalAOHookShellForOS(true) != "powershell" {
+		t.Fatalf("shells = (%q, %q), want (bash, powershell)", CanonicalAOHookShellForOS(false), CanonicalAOHookShellForOS(true))
+	}
+	if got := CanonicalAOHookPrefixes("demo"); !reflect.DeepEqual(got, []string{posix, windows}) {
+		t.Fatalf("prefixes = %#v, want %#v", got, []string{posix, windows})
+	}
+	wantCurrent := posix
+	if runtime.GOOS == "windows" {
+		wantCurrent = windows
+	}
+	if got := CanonicalAOHookPrefix("demo"); got != wantCurrent {
+		t.Fatalf("current prefix = %q, want %q", got, wantCurrent)
+	}
+}
+
+func TestManagerMigratesBothCanonicalPlatformsAndOwnsUninstall(t *testing.T) {
+	workspace := t.TempDir()
+	hooksPath := filepath.Join(workspace, "hooks.json")
+	prefixes := CanonicalAOHookPrefixes("current")
+	current := CanonicalAOHookPrefix("current")
+	opposite := prefixes[0]
+	if opposite == current {
+		opposite = prefixes[1]
+	}
+	managed := current + "stop"
+	original := map[string]any{
+		"hooks": map[string]any{
+			"Stop": []any{map[string]any{
+				"hooks": []any{
+					map[string]any{"type": "command", "command": prefixes[0] + "stop"},
+					map[string]any{"type": "command", "command": prefixes[1] + "stop"},
+					map[string]any{"type": "command", "command": "ao hooks sibling stop"},
+				},
+			}},
+		},
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooksPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := Manager{
+		Label:                    "current",
+		CommandPrefix:            CanonicalAOHookPrefix("current"),
+		LegacyCommandPrefixes:    prefixes,
+		UninstallCommandPrefixes: prefixes,
+		Path:                     func(string) string { return hooksPath },
+		Managed:                  []HookSpec{{Event: "Stop", Command: managed}},
+	}
+	if err := manager.Install(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	assertHookCommandCount(t, hooksPath, current+"stop", 1)
+	assertHookCommandCount(t, hooksPath, opposite+"stop", 0)
+	assertHookCommandCount(t, hooksPath, "ao hooks sibling stop", 1)
+
+	if err := manager.Uninstall(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	assertHookCommandCount(t, hooksPath, current+"stop", 0)
+	assertHookCommandCount(t, hooksPath, opposite+"stop", 0)
+	assertHookCommandCount(t, hooksPath, "ao hooks sibling stop", 1)
+}
+
+func assertHookCommandCount(t *testing.T, hooksPath, command string, want int) {
+	t.Helper()
+	data, err := os.ReadFile(hooksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Hooks map[string][]MatcherGroup `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatal(err)
+	}
+	got := 0
+	for _, group := range settings.Hooks["Stop"] {
+		for _, hook := range group.Hooks {
+			if hook.Command == command {
+				got++
+			}
+		}
+	}
+	if got != want {
+		t.Fatalf("command %q count = %d, want %d", command, got, want)
+	}
+}
 
 func TestReconcileHookMovesCommandToDeclaredMatcher(t *testing.T) {
 	oldMatcher := "old"

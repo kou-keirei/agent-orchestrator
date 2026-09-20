@@ -78,11 +78,15 @@ var grokManagedHooks = []hooksjson.HookSpec{
 var grokHooks = hooksjson.Manager{
 	Label:                    "grok",
 	CommandPrefix:            grokHookCommandPrefix,
-	LegacyCommandPrefixes:    []string{"ao hooks grok "},
-	UninstallCommandPrefixes: []string{"ao hooks grok "},
+	LegacyCommandPrefixes:    grokHookPrefixes(),
+	UninstallCommandPrefixes: grokHookPrefixes(),
 	Timeout:                  grokHookTimeout,
 	Path:                     grokClaudeSettingsPath,
 	Managed:                  grokManagedHooks,
+}
+
+func grokHookPrefixes() []string {
+	return append([]string{"ao hooks grok "}, hooksjson.CanonicalAOHookPrefixes("grok")...)
 }
 
 // Plugin is the Grok Build agent adapter.

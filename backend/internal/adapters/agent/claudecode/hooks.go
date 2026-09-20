@@ -3,7 +3,6 @@ package claudecode
 import (
 	"context"
 	"path/filepath"
-	"runtime"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hooksjson"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -12,12 +11,7 @@ import (
 const (
 	claudeSettingsDirName  = ".claude"
 	claudeSettingsFileName = "settings.local.json"
-	// Claude shell-form hooks use a POSIX shell on Unix and an explicitly
-	// selected PowerShell on Windows. Both forms fail closed when AO_CLI is
-	// absent rather than falling back to a stale PATH installation.
-	claudePOSIXHookPrefix   = `"${AO_CLI:?AO_CLI is not set}" hooks claude-code `
-	claudeWindowsHookPrefix = `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks claude-code `
-	claudeHookTimeout       = 30
+	claudeHookTimeout      = 30
 )
 
 var claudeHookCommandPrefix = hooksjson.CanonicalAOHookPrefix("claude-code")
@@ -60,25 +54,22 @@ var claudeManagedHooks = []hooksjson.HookSpec{
 // claudeHooks manages AO's hooks in the workspace-local
 // .claude/settings.local.json file.
 var claudeHooks = hooksjson.Manager{
-	Label:         "claude-code",
-	CommandPrefix: claudeHookCommandPrefix,
-	LegacyCommandPrefixes: func() []string {
-		prefixes := []string{"ao hooks continue ", hooksjson.CanonicalAOHookPrefix("continue"), "ao hooks claude-code "}
-		if runtime.GOOS == "windows" {
-			return append(prefixes, claudePOSIXHookPrefix)
-		}
-		return append(prefixes, claudeWindowsHookPrefix)
-	}(),
-	UninstallCommandPrefixes: func() []string {
-		prefixes := []string{"ao hooks claude-code "}
-		if runtime.GOOS == "windows" {
-			return append(prefixes, claudePOSIXHookPrefix)
-		}
-		return append(prefixes, claudeWindowsHookPrefix)
-	}(),
+	Label:                 "claude-code",
+	CommandPrefix:         claudeHookCommandPrefix,
+	LegacyCommandPrefixes: claudeLegacyHookPrefixes(),
+	UninstallCommandPrefixes: append(
+		[]string{"ao hooks claude-code "},
+		hooksjson.CanonicalAOHookPrefixes("claude-code")...,
+	),
 	Timeout: claudeHookTimeout,
 	Path:    claudeSettingsPath,
 	Managed: claudeManagedHooks,
+}
+
+func claudeLegacyHookPrefixes() []string {
+	prefixes := []string{"ao hooks continue ", "ao hooks claude-code "}
+	prefixes = append(prefixes, hooksjson.CanonicalAOHookPrefixes("continue")...)
+	return append(prefixes, hooksjson.CanonicalAOHookPrefixes("claude-code")...)
 }
 
 func claudeSettingsPath(workspacePath string) string {
