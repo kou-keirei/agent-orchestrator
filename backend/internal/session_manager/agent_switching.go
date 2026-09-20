@@ -751,6 +751,9 @@ func (m *Manager) executeAgentSwitch(ctx context.Context, admitted *admittedAgen
 	// source snapshot above therefore cannot contain target preflight artifacts.
 	// A pre-activation failure removes this provider-owned state.
 	recorder.boundary(domain.AgentSwitchFailureTargetWorkspacePrepare)
+	if err := m.admitExecutionBase(ctx, workspaceInfo(stoppedSession)); err != nil {
+		return result, fmt.Errorf("switch agent %s: execution base: %w", id, err)
+	}
 	if err := m.prepareWorkspace(ctx, target.agent, rec.ID, rec.Metadata.WorkspacePath, target.launch.SystemPrompt, target.launch.SystemPromptFile, target.launch.Config, target.env); err != nil {
 		return result, fmt.Errorf("switch agent %s: prepare target workspace: %w", id, err)
 	}
@@ -1023,10 +1026,12 @@ func (m *Manager) rollbackStoppedAgentSwitchSource(
 		return ErrIncompleteHandle
 	}
 	ws := ports.WorkspaceInfo{
-		Path:      rec.Metadata.WorkspacePath,
-		Branch:    rec.Metadata.Branch,
-		SessionID: rec.ID,
-		ProjectID: rec.ProjectID,
+		Path:             rec.Metadata.WorkspacePath,
+		Branch:           rec.Metadata.Branch,
+		ExecutionBaseSHA: rec.Metadata.ExecutionBaseSHA,
+		SessionID:        rec.ID,
+		ProjectID:        rec.ProjectID,
+		RepoPath:         rec.Metadata.WorkspaceRepoPath,
 	}
 	handle := ports.RuntimeHandle{ID: rec.Metadata.RuntimeHandleID}
 	_, err = m.relaunchSession(ctx, "agent switch rollback", rec, project, ws, &handle)

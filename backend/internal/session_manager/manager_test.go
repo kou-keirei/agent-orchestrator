@@ -1921,6 +1921,93 @@ func newExitedResumeManager(t *testing.T, runtime runtimeController, agent ports
 	return m, st, ws
 }
 
+type resumeExecutionBaseAgent struct {
+	supervisedLaunchAgent
+	hookCalls    int
+	restoreCalls int
+}
+
+func (a *resumeExecutionBaseAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error {
+	a.hookCalls++
+	return nil
+}
+
+func (a *resumeExecutionBaseAgent) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig) ([]string, bool, error) {
+	a.restoreCalls++
+	return a.supervisedLaunchAgent.GetRestoreCommand(ctx, cfg)
+}
+
+type resumeExecutionBaseWorkspace struct {
+	*fakeWorkspace
+	attester ports.WorkspaceExecutionBaseAttester
+}
+
+func (w resumeExecutionBaseWorkspace) AttestExecutionBase(ctx context.Context, info ports.WorkspaceInfo) error {
+	return w.attester.AttestExecutionBase(ctx, info)
+}
+
+func configureResumeExecutionBase(t *testing.T, manager *Manager, store *fakeStore, workspace, repo, executionBase string, attester ports.WorkspaceExecutionBaseAttester) {
+	t.Helper()
+	rec := store.sessions["mer-1"]
+	rec.Metadata.WorkspacePath = workspace
+	rec.Metadata.WorkspaceRepoPath = repo
+	rec.Metadata.ExecutionBaseSHA = executionBase
+	store.sessions[rec.ID] = rec
+	fake := manager.workspace.(*fakeWorkspace)
+	manager.workspace = resumeExecutionBaseWorkspace{fakeWorkspace: fake, attester: attester}
+}
+
+func TestResumeAgentWithModeRejectsExecutionBaseMismatchBeforePreparation(t *testing.T) {
+	attester, repo, workspace, effectiveA, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	runtime := &fakeRestartRuntime{fakeRuntime: &fakeRuntime{aliveByHandle: map[string]bool{"tmux-mer-1": true}}}
+	agent := &resumeExecutionBaseAgent{supervisedLaunchAgent: supervisedLaunchAgent{launchArgvAgent{argv: []string{"codex", "resume", "agent-x"}}}}
+	manager, store, _ := newExitedResumeManager(t, runtime, agent)
+	configureResumeExecutionBase(t, manager, store, workspace, repo, authorizedB, attester)
+
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	if got := runSwitchGit(t, git, workspace, "rev-parse", "HEAD"); got != effectiveA {
+		t.Fatalf("fixture HEAD = %s, want effective A %s", got, effectiveA)
+	}
+
+	if _, err := manager.ResumeAgentWithMode(context.Background(), "mer-1"); !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("ResumeAgentWithMode error = %v, want exact-base mismatch", err)
+	}
+	if agent.hookCalls != 0 || agent.restoreCalls != 0 {
+		t.Fatalf("resume preparation reached: hooks=%d restore-command=%d, want 0/0", agent.hookCalls, agent.restoreCalls)
+	}
+	if runtime.restarted != 0 || runtime.created != 0 {
+		t.Fatalf("resume runtime reached: restarts=%d creates=%d, want 0/0", runtime.restarted, runtime.created)
+	}
+}
+
+func TestResumeAgentWithModeAdmitsMatchingExecutionBase(t *testing.T) {
+	attester, repo, workspace, _, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	runSwitchGit(t, git, repo, "worktree", "remove", "--force", workspace)
+	runSwitchGit(t, git, repo, "worktree", "add", "--detach", workspace, authorizedB)
+
+	runtime := &fakeRestartRuntime{fakeRuntime: &fakeRuntime{aliveByHandle: map[string]bool{"tmux-mer-1": true}}}
+	agent := &resumeExecutionBaseAgent{supervisedLaunchAgent: supervisedLaunchAgent{launchArgvAgent{argv: []string{"codex", "resume", "agent-x"}}}}
+	manager, store, _ := newExitedResumeManager(t, runtime, agent)
+	configureResumeExecutionBase(t, manager, store, workspace, repo, authorizedB, attester)
+
+	if _, err := manager.ResumeAgentWithMode(context.Background(), "mer-1"); err != nil {
+		t.Fatalf("ResumeAgentWithMode: %v", err)
+	}
+	if agent.hookCalls != 1 || agent.restoreCalls != 1 {
+		t.Fatalf("resume preparation = hooks %d restore-command %d, want 1/1", agent.hookCalls, agent.restoreCalls)
+	}
+	if runtime.restarted != 1 || runtime.created != 0 {
+		t.Fatalf("resume runtime = restarts %d creates %d, want 1/0", runtime.restarted, runtime.created)
+	}
+}
+
 func TestResumeAgent_RestartsRuntimeWithManagedGeneration(t *testing.T) {
 	baseRuntime := &fakeRuntime{aliveByHandle: map[string]bool{"tmux-mer-1": true}}
 	runtime := &fakeRestartRuntime{fakeRuntime: baseRuntime}

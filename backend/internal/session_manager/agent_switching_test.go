@@ -1236,6 +1236,71 @@ func TestSwitchAgentChatTargetSwitchWithoutExecutionBasePreservesLegacyBehavior(
 	}
 }
 
+func configureNormalTUISwitchExecutionBase(t *testing.T, manager *Manager, store *switchTestStore, workspace, repo, executionBase string, attester ports.WorkspaceExecutionBaseAttester) (*switchTestAgent, *fakeRestartRuntime) {
+	t.Helper()
+	rec := store.sessions["proj-1"]
+	rec.Metadata.WorkspacePath = workspace
+	rec.Metadata.WorkspaceRepoPath = repo
+	rec.Metadata.ExecutionBaseSHA = executionBase
+	store.sessions[rec.ID] = rec
+	baseWorkspace := manager.workspace.(switchTestWorkspace)
+	manager.workspace = switchExecutionBaseWorkspace{switchTestWorkspace: baseWorkspace, attester: attester}
+	target := manager.agents.(switchTestAgents)[domain.HarnessCodex].(*switchTestAgent)
+	runtime := manager.runtime.(*fakeRestartRuntime)
+	return target, runtime
+}
+
+func TestSwitchAgentTUITargetRejectsExecutionBaseMismatchBeforePrepare(t *testing.T) {
+	attester, repo, workspace, effectiveA, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	target, runtime := configureNormalTUISwitchExecutionBase(t, manager, store, workspace, repo, authorizedB, attester)
+
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	if got := runSwitchGit(t, git, workspace, "rev-parse", "HEAD"); got != effectiveA {
+		t.Fatalf("fixture HEAD = %s, want effective A %s", got, effectiveA)
+	}
+
+	if _, err := switchAgentSynchronously(context.Background(), manager, "proj-1", SwitchAgentConfig{
+		TargetHarness: domain.HarnessCodex, IdempotencyKey: "tui-execution-base-mismatch",
+	}); !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("SwitchAgent error = %v, want exact-base mismatch", err)
+	}
+	if target.hookCalls != 0 {
+		t.Fatalf("target prepareWorkspace hook calls = %d, want 0", target.hookCalls)
+	}
+	if runtime.created != 0 || runtime.restarted != 0 {
+		t.Fatalf("target/source runtime startup = creates %d restarts %d, want 0/0", runtime.created, runtime.restarted)
+	}
+}
+
+func TestSwitchAgentTUITargetAdmitsMatchingExecutionBase(t *testing.T) {
+	attester, repo, workspace, _, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	runSwitchGit(t, git, repo, "worktree", "remove", "--force", workspace)
+	runSwitchGit(t, git, repo, "worktree", "add", "--detach", workspace, authorizedB)
+
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	target, runtime := configureNormalTUISwitchExecutionBase(t, manager, store, workspace, repo, authorizedB, attester)
+
+	if _, err := switchAgentSynchronously(context.Background(), manager, "proj-1", SwitchAgentConfig{
+		TargetHarness: domain.HarnessCodex, IdempotencyKey: "tui-execution-base-match",
+	}); err != nil {
+		t.Fatalf("SwitchAgent: %v", err)
+	}
+	if target.hookCalls != 1 {
+		t.Fatalf("target prepareWorkspace hook calls = %d, want 1", target.hookCalls)
+	}
+	if runtime.created != 1 {
+		t.Fatalf("target runtime creates = %d, want 1", runtime.created)
+	}
+}
+
 func TestAgentSwitchChatControllerReadyUsesSourceGenerationCAS(t *testing.T) {
 	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
 	rec := store.sessions["proj-1"]
