@@ -18,7 +18,7 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		{RunID: "run-2", PRURL: "https://github.com/o/r/pull/2", TargetSHA: "sha2"},
 	}
 
-	prompt, _ := reviewTexts(spec)
+	prompt, _ := reviewTextsForOS(spec, false)
 	for _, want := range []string{
 		"AO created 2 review tasks",
 		"Review every queued PR, then submit all results together",
@@ -35,5 +35,46 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestReviewTextsUsesShellAwareReviewerCommands(t *testing.T) {
+	spec := launchSpec()
+
+	for _, test := range []struct {
+		name          string
+		windows       bool
+		githubCommand string
+		submitCommand string
+		quoteRule     string
+		absent        string
+	}{
+		{
+			name:          "posix",
+			githubCommand: "printf '%s'",
+			submitCommand: `| "$AO_CLI" review submit --session mer-1 --reviews -`,
+			quoteRule:     "shell-escape any single quotes",
+			absent:        "& $env:AO_CLI",
+		},
+		{
+			name:          "windows powershell",
+			windows:       true,
+			githubCommand: "Write-Output",
+			submitCommand: `| & "$env:AO_CLI" review submit --session mer-1 --reviews -`,
+			quoteRule:     "double any single quotes",
+			absent:        `"$AO_CLI" review submit`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prompt, _ := reviewTextsForOS(spec, test.windows)
+			for _, want := range []string{test.githubCommand, test.submitCommand, test.quoteRule, "gh api --method POST", `"event": "COMMENT"`} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing %q:\n%s", want, prompt)
+				}
+			}
+			if strings.Contains(prompt, test.absent) {
+				t.Fatalf("prompt contains wrong-shell command %q:\n%s", test.absent, prompt)
+			}
+		})
 	}
 }
