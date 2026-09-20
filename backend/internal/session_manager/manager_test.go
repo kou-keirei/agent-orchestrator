@@ -4610,7 +4610,10 @@ func TestSpawnOrchestrator_UsesCoordinatorPrompt(t *testing.T) {
 		"Browser network capture is optional and off by default",
 		"never enable it for routine browser actions",
 		"relative to the session workspace root",
-		"use `ao preview README.md`, not `../README.md`",
+		`"${AO_CLI:?AO_CLI is not set}"` + "` in POSIX shells",
+		`if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI"` + "` in PowerShell",
+		"canonical shell-specific AO_CLI invocation above followed by `preview README.md`",
+		"same shell-specific AO_CLI invocation followed by `browser`",
 		"existing confined loopback preview",
 	} {
 		if !strings.Contains(systemPrompt, want) {
@@ -4767,12 +4770,16 @@ func TestSystemPrompt_AppendsConfidentialityGuard(t *testing.T) {
 			if !strings.Contains(sp, "AO desktop Browser panel") || !strings.Contains(sp, "agent.browsers.get(\"iab\")") {
 				t.Fatalf("%s: system prompt missing AO browser routing guidance:\n%s", tc.name, sp)
 			}
-			if !strings.Contains(sp, "Static file targets passed to `ao preview`") ||
+			if !strings.Contains(sp, "Static `preview` targets are relative to the session workspace root") ||
 				!strings.Contains(sp, "relative to the session workspace root") ||
-				!strings.Contains(sp, "use `ao preview README.md`, not `../README.md`") ||
+				!strings.Contains(sp, "canonical shell-specific AO_CLI invocation above followed by `preview README.md`") ||
+				!strings.Contains(sp, "use same shell-specific AO_CLI invocation followed by `browser`") ||
 				!strings.Contains(sp, "Never create or modify `package.json`") ||
-				!strings.Contains(sp, "Do not create `.ao/launch.json` unless the user asks") {
+				!strings.Contains(sp, "Do not create `.ao/launch.json` unless asked") {
 				t.Fatalf("%s: system prompt missing static-first preview safeguards:\n%s", tc.name, sp)
+			}
+			if strings.Contains(sp, "ao preview") || strings.Contains(sp, "ao browser") {
+				t.Fatalf("%s: generated system prompt contains a bare AO CLI command:\n%s", tc.name, sp)
 			}
 			if !strings.Contains(sp, "immediately after creating or materially updating it") ||
 				!strings.Contains(sp, "do not replace an active application preview with a supporting asset") {

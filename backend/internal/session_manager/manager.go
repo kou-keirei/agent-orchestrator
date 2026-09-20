@@ -4330,14 +4330,16 @@ func (m *Manager) aoSkillPointer() string {
 	commandsGlob := filepath.ToSlash(filepath.Join(dir, "commands", "*.md"))
 	browserFile := filepath.ToSlash(filepath.Join(dir, "commands", "browser.md"))
 	previewFile := filepath.ToSlash(filepath.Join(dir, "commands", "preview.md"))
+	posixAOCLI := `"${AO_CLI:?AO_CLI is not set}"`
+	powershellAOCLI := `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI"`
 	return "\n\n" + "## Using the ao CLI\n\n" +
-		"Invoke `ao`: `\"$AO_CLI\"` (POSIX) or `& $env:AO_CLI` (PowerShell), never PATH.\n\n" +
-		"Read `" + skillFile + "` and only the relevant file under `" + commandsGlob + "`; do not load unrelated command guides.\n\n" +
+		"Invoke the CLI through its canonical AO_CLI identity: `" + posixAOCLI + "` in POSIX shells, or `" + powershellAOCLI + "` in PowerShell; never use a bare executable or PATH.\n\n" +
+		"Read `" + skillFile + "` and relevant file under `" + commandsGlob + "`; do not load unrelated guides.\n\n" +
 		"## AO desktop Browser panel\n\n" +
-		"For frontend work, read `" + previewFile + "` before previewing or starting an app. Static file targets passed to `ao preview` are relative to the session workspace root, regardless of the shell's current directory: use `ao preview README.md`, not `../README.md`. AO serves workspace files through its existing confined loopback preview; do not use `file://` or start a server just to display static files. Never create or modify `package.json` or install dependencies solely to display static files. Do not create `.ao/launch.json` unless the user asks. Automatically open the primary requested browser-displayable artifact immediately after creating or materially updating it, but do not replace an active application preview with a supporting asset. " +
-		"For page inspection or interaction, read `" + browserFile + "` and use `ao browser` from this AO session. Browser network capture is optional and off by default; follow that guide and never enable it for routine browser actions. " +
-		"Do not use Codex/host in-app browser connectors, `agent.browsers.get(\"iab\")`, or a browser MCP for the AO Browser panel: those are separate browser runtimes and cannot see or control AO's session-owned page. " +
-		"`ao browser` operates the same live page the user sees in that panel."
+		"For frontend work, read `" + previewFile + "` before previewing. Static `preview` targets are relative to the session workspace root: use the canonical shell-specific AO_CLI invocation above followed by `preview README.md`, not `../README.md`. AO serves workspace files through its existing confined loopback preview; do not use `file://` or start a server for static files. Never create or modify `package.json` or install dependencies solely to display static files. Do not create `.ao/launch.json` unless asked. Open the primary browser-displayable artifact immediately after creating or materially updating it; do not replace an active application preview with a supporting asset. " +
+		"For page inspection or interaction, read `" + browserFile + "` and use same shell-specific AO_CLI invocation followed by `browser`. Browser network capture is optional and off by default; never enable it for routine browser actions. " +
+		"Do not use Codex/host browser connectors, `agent.browsers.get(\"iab\")`, or a browser MCP for this panel: those runtimes cannot see or control the session page. " +
+		"Canonical AO_CLI browser commands operate on the same live page the user sees."
 }
 
 func (m *Manager) workspaceProjectPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID) (string, error) {
