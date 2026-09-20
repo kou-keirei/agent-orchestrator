@@ -345,7 +345,7 @@ func TestGetAgentHooksInstallsGrokCommandsInClaudeSettings(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	existing := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my own stop hook","timeout":5},{"type":"command","command":"ao hooks claude-code stop","timeout":30}]}]},"permissions":{"defaultMode":"plan"}}`
+	existing := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my own stop hook","timeout":5},{"type":"command","command":"ao hooks claude-code stop","timeout":30},{"type":"command","command":"ao hooks grok stop"}]}]},"permissions":{"defaultMode":"plan"}}`
 	if err := os.WriteFile(settingsPath, []byte(existing), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -403,8 +403,21 @@ func TestGetAgentHooksInstallsGrokCommandsInClaudeSettings(t *testing.T) {
 	if countGrokHookCommand(config.Hooks["Stop"], "ao hooks claude-code stop") != 1 {
 		t.Fatalf("existing Claude AO Stop hook not preserved: %#v", config.Hooks["Stop"])
 	}
+	if countGrokHookCommand(config.Hooks["Stop"], "ao hooks grok stop") != 0 {
+		t.Fatalf("legacy Grok AO Stop hook was not migrated: %#v", config.Hooks["Stop"])
+	}
 	if len(config.Permissions) == 0 {
 		t.Fatalf("unrelated settings clobbered: %s", data)
+	}
+	config.Hooks["Stop"][0].Hooks = append(config.Hooks["Stop"][0].Hooks, hooksjson.HookEntry{
+		Type: "command", Command: "ao hooks grok stop",
+	})
+	data, err = json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if m := grokMatcherForCommand(config.Hooks["SessionStart"], grokHookCommandPrefix+"session-start"); m == nil || *m != "startup" {
 		t.Fatalf("SessionStart matcher = %v, want startup", m)
@@ -444,6 +457,9 @@ func TestGetAgentHooksInstallsGrokCommandsInClaudeSettings(t *testing.T) {
 	}
 	if countGrokHookCommand(config.Hooks["Stop"], "ao hooks claude-code stop") != 1 {
 		t.Fatalf("Claude AO Stop hook not preserved after uninstall: %#v", config.Hooks["Stop"])
+	}
+	if countGrokHookCommand(config.Hooks["Stop"], "ao hooks grok stop") != 0 {
+		t.Fatalf("legacy Grok AO Stop hook survived uninstall: %#v", config.Hooks["Stop"])
 	}
 	if len(config.Permissions) == 0 {
 		t.Fatalf("unrelated settings clobbered after uninstall: %s", data)

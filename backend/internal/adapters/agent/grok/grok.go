@@ -76,11 +76,13 @@ var grokManagedHooks = []hooksjson.HookSpec{
 }
 
 var grokHooks = hooksjson.Manager{
-	Label:         "grok",
-	CommandPrefix: grokHookCommandPrefix,
-	Timeout:       grokHookTimeout,
-	Path:          grokClaudeSettingsPath,
-	Managed:       grokManagedHooks,
+	Label:                    "grok",
+	CommandPrefix:            grokHookCommandPrefix,
+	LegacyCommandPrefixes:    []string{"ao hooks grok "},
+	UninstallCommandPrefixes: []string{"ao hooks grok "},
+	Timeout:                  grokHookTimeout,
+	Path:                     grokClaudeSettingsPath,
+	Managed:                  grokManagedHooks,
 }
 
 // Plugin is the Grok Build agent adapter.

@@ -81,12 +81,13 @@ var continueManagedHooks = []hooksjson.HookSpec{
 }
 
 var continueHooks = hooksjson.Manager{
-	Label:                 adapterID,
-	CommandPrefix:         continueHookCommandPrefix,
-	LegacyCommandPrefixes: []string{`if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks claude-code `, "ao hooks claude-code ", `"${AO_CLI:?AO_CLI is not set}" hooks claude-code `},
-	Timeout:               continueHookTimeout,
-	Path:                  continueClaudeSettingsPath,
-	Managed:               continueManagedHooks,
+	Label:                    adapterID,
+	CommandPrefix:            continueHookCommandPrefix,
+	LegacyCommandPrefixes:    []string{"ao hooks continue ", `if (-not $env:AO_CLI) { throw 'AO_CLI is not set' }; & "$env:AO_CLI" hooks claude-code `, "ao hooks claude-code ", `"${AO_CLI:?AO_CLI is not set}" hooks claude-code `},
+	UninstallCommandPrefixes: []string{"ao hooks continue "},
+	Timeout:                  continueHookTimeout,
+	Path:                     continueClaudeSettingsPath,
+	Managed:                  continueManagedHooks,
 }
 
 // Plugin is the Continue CLI agent adapter. It is safe for concurrent use; the
