@@ -5294,7 +5294,7 @@ func TestSpawnOrchestratorContinuityRetriesAfterStartupPending(t *testing.T) {
 	}
 }
 
-func TestSpawnOrchestratorContinuityFailureIsRetryable(t *testing.T) {
+func TestSpawnOrchestratorContinuityFailureIsTypedAndPreservesReplacement(t *testing.T) {
 	base := time.Date(2026, 8, 2, 12, 15, 0, 0, time.UTC)
 	st := newFakeStore()
 	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
@@ -5309,15 +5309,60 @@ func TestSpawnOrchestratorContinuityFailureIsRetryable(t *testing.T) {
 	}
 	svc := &Service{manager: fc, store: st, clock: func() time.Time { return base }}
 
-	_, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
+	got, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
 	if err == nil {
 		t.Fatal("SpawnOrchestrator returned nil after bounded continuity delivery failure")
 	}
+	if got.ID != "mer-new" || got.ProjectID != "mer" || got.Kind != domain.KindOrchestrator || got.IsTerminated {
+		t.Fatalf("failed continuity result = %+v, want the active replacement session", got)
+	}
 	var apiErr *apierr.Error
-	if !errors.As(err, &apiErr) || apiErr.Kind != apierr.KindUnavailable || apiErr.Code != "ORCHESTRATOR_CONTINUITY_RETRYABLE" {
-		t.Fatalf("continuity error = %v, want unavailable ORCHESTRATOR_CONTINUITY_RETRYABLE", err)
+	if !errors.As(err, &apiErr) || apiErr.Kind != apierr.KindConflict || apiErr.Code != "ORCHESTRATOR_CONTINUITY_DELIVERY_FAILED" {
+		t.Fatalf("continuity error = %v, want conflict ORCHESTRATOR_CONTINUITY_DELIVERY_FAILED", err)
+	}
+	if apiErr.Details["replacementSessionId"] != "mer-new" || apiErr.Details["continuityDelivered"] != false || apiErr.Details["retryable"] != false {
+		t.Fatalf("continuity error details = %#v, want replacement identity and non-retryable delivery failure", apiErr.Details)
 	}
 	if len(fc.ready) != 1 || fc.ready[0] != "mer-new" {
 		t.Fatalf("readiness waits = %v, want one bounded wait for mer-new", fc.ready)
+	}
+
+	// The replacement is already active even though delivery failed. A caller
+	// must not create a second replacement or pretend the notice was retried by
+	// repeating the idempotent ensure request.
+	st.sessions[got.ID] = got.SessionRecord
+	existing, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
+	if err != nil || existing.ID != got.ID {
+		t.Fatalf("existing replacement lookup = (%+v, %v), want %q without an error", existing, err, got.ID)
+	}
+	if len(fc.ready) != 1 {
+		t.Fatalf("existing replacement lookup retried readiness wait: %v", fc.ready)
+	}
+}
+
+func TestSpawnOrchestratorContinuitySendFailureIsTypedAndPreservesReplacement(t *testing.T) {
+	base := time.Date(2026, 8, 2, 12, 20, 0, 0, time.UTC)
+	st := newFakeStore()
+	st.projects["mer"] = domain.ProjectRecord{ID: "mer"}
+	st.sessions["mer-old"] = domain.SessionRecord{
+		ID: "mer-old", ProjectID: "mer", Kind: domain.KindOrchestrator,
+		IsTerminated: true, UpdatedAt: base.Add(-3 * time.Minute),
+	}
+	fc := &fakeCommander{
+		spawnRecord: domain.SessionRecord{ID: "mer-new", ProjectID: "mer", Kind: domain.KindOrchestrator},
+		sendErr:     errors.New("message transport closed"),
+	}
+	svc := &Service{manager: fc, store: st, clock: func() time.Time { return base }}
+
+	got, err := svc.SpawnOrchestrator(context.Background(), "mer", false, "")
+	if got.ID != "mer-new" {
+		t.Fatalf("failed direct send returned %q, want active replacement mer-new", got.ID)
+	}
+	var apiErr *apierr.Error
+	if err == nil || !errors.As(err, &apiErr) || apiErr.Code != "ORCHESTRATOR_CONTINUITY_DELIVERY_FAILED" {
+		t.Fatalf("direct continuity send error = %v, want typed delivery failure", err)
+	}
+	if len(fc.ready) != 0 {
+		t.Fatalf("non-startup send failure waited for readiness: %v", fc.ready)
 	}
 }

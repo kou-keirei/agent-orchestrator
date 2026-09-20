@@ -128,10 +128,34 @@ const (
 	RestoreModeViewFresh RestoreModeView = "fresh"
 )
 
-// ErrOrchestratorContinuityRetryable means a replacement was created but its
-// predecessor notice could not be delivered within the bounded readiness
-// window. The session remains available so the caller can retry delivery.
-var ErrOrchestratorContinuityRetryable = errors.New("session: orchestrator continuity notice delivery is retryable")
+// ErrOrchestratorContinuityDeliveryFailed means a replacement was created but
+// its predecessor notice could not be delivered within the bounded readiness
+// window. The replacement remains active; callers must use that existing
+// session rather than spawning another orchestrator.
+var ErrOrchestratorContinuityDeliveryFailed = errors.New("session: orchestrator continuity notice delivery failed")
+
+// OrchestratorContinuityFailure preserves the replacement identity when the
+// best-effort continuity notice fails after the new orchestrator is live.
+// SpawnOrchestrator returns the replacement session alongside this error, and
+// the HTTP mapping exposes the same identity in structured details.
+type OrchestratorContinuityFailure struct {
+	ReplacementSessionID domain.SessionID
+	Err                  error
+}
+
+func (e *OrchestratorContinuityFailure) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("orchestrator %s continuity delivery failed: %v", e.ReplacementSessionID, e.Err)
+}
+
+func (e *OrchestratorContinuityFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 // RestoreOutcome reports the restored read model and how AO relaunched it.
 type RestoreOutcome struct {
@@ -527,7 +551,10 @@ func (s *Service) SpawnOrchestrator(
 	}
 	if hasPredecessor {
 		if err := s.sendContinuityNotice(ctx, sess.ID, predecessor); err != nil {
-			return domain.Session{}, toAPIError(err)
+			return sess, toAPIError(&OrchestratorContinuityFailure{
+				ReplacementSessionID: sess.ID,
+				Err:                  err,
+			})
 		}
 	}
 	return sess, nil
@@ -571,19 +598,16 @@ func (s *Service) sendContinuityNotice(ctx context.Context, newSession domain.Se
 	if err := s.manager.Send(ctx, newSession, msg, nil); err == nil {
 		return nil
 	} else if !errors.Is(err, sessionmanager.ErrStartupPending) {
-		return fmt.Errorf("send continuity notice to %s: %w", newSession, err)
+		return fmt.Errorf("%w: send continuity notice to %s: %w", ErrOrchestratorContinuityDeliveryFailed, newSession, err)
 	}
 
 	readyCtx, cancel := context.WithTimeout(ctx, orchestratorContinuityReadyTimeout)
 	defer cancel()
 	if err := s.manager.WaitForMessageDeliveryReady(readyCtx, newSession); err != nil {
-		return fmt.Errorf("%w: wait for continuity delivery to %s: %w", ErrOrchestratorContinuityRetryable, newSession, err)
+		return fmt.Errorf("%w: wait for continuity delivery to %s: %w", ErrOrchestratorContinuityDeliveryFailed, newSession, err)
 	}
 	if err := s.manager.Send(readyCtx, newSession, msg, nil); err != nil {
-		if errors.Is(err, sessionmanager.ErrStartupPending) || errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("%w: send continuity notice to %s: %w", ErrOrchestratorContinuityRetryable, newSession, err)
-		}
-		return fmt.Errorf("send continuity notice to %s: %w", newSession, err)
+		return fmt.Errorf("%w: send continuity notice to %s after readiness: %w", ErrOrchestratorContinuityDeliveryFailed, newSession, err)
 	}
 	return nil
 }
@@ -1176,6 +1200,16 @@ func toAPIError(err error) error {
 }
 
 func mapSessionError(err error) error {
+	var continuityFailure *OrchestratorContinuityFailure
+	if errors.As(err, &continuityFailure) {
+		return apierr.New(apierr.KindConflict, "ORCHESTRATOR_CONTINUITY_DELIVERY_FAILED",
+			"The replacement orchestrator is active, but its predecessor context was not delivered; use the existing replacement session",
+			map[string]any{
+				"replacementSessionId": string(continuityFailure.ReplacementSessionID),
+				"continuityDelivered":  false,
+				"retryable":            false,
+			})
+	}
 	switch {
 	case err == nil:
 		return nil
@@ -1225,9 +1259,9 @@ func mapSessionError(err error) error {
 	case errors.Is(err, sessionmanager.ErrAwaitingDecision):
 		return apierr.Conflict("SESSION_AWAITING_DECISION",
 			"Session is paused on a permission decision; answer it in the session terminal first", nil)
-	case errors.Is(err, ErrOrchestratorContinuityRetryable):
-		return apierr.Unavailable("ORCHESTRATOR_CONTINUITY_RETRYABLE",
-			"The replacement orchestrator started, but its predecessor context was not delivered; retry")
+	case errors.Is(err, ErrOrchestratorContinuityDeliveryFailed):
+		return apierr.Conflict("ORCHESTRATOR_CONTINUITY_DELIVERY_FAILED",
+			"The replacement orchestrator is active, but its predecessor context was not delivered; use the existing replacement session", nil)
 	case errors.Is(err, sessionmanager.ErrStartupPending):
 		return apierr.Conflict("SESSION_STARTUP_PENDING",
 			"Session agent is still starting; retry after the agent prompt is ready", nil)
