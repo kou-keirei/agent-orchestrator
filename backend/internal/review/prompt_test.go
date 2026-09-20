@@ -27,10 +27,10 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		"* 1. https://github.com/o/r/pull/1 (head commit sha1, run run-1)",
 		"* 2. https://github.com/o/r/pull/2 (head commit sha2, run run-2)",
 		"After every PR has its own GitHub review from step 1",
-		"printf '%s'",
+		"jq -cn",
 		"do not use a heredoc",
 		`"$AO_CLI" review submit --session mer-1 --reviews -`,
-		`"reviews": [`,
+		"--arg body",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -51,29 +51,39 @@ func TestReviewTextsUsesShellAwareReviewerCommands(t *testing.T) {
 	}{
 		{
 			name:          "posix",
-			githubCommand: "printf '%s'",
+			githubCommand: "jq -cn",
 			submitCommand: `| "$AO_CLI" review submit --session mer-1 --reviews -`,
-			quoteRule:     "shell-escape any single quotes",
+			quoteRule:     "Use jq -cn for real JSON",
 			absent:        "& $env:AO_CLI",
 		},
 		{
 			name:          "windows powershell",
 			windows:       true,
-			githubCommand: "Write-Output",
+			githubCommand: "ConvertTo-Json -Compress",
 			submitCommand: `| & "$env:AO_CLI" review submit --session mer-1 --reviews -`,
-			quoteRule:     "double any single quotes",
+			quoteRule:     "Use ConvertTo-Json -Compress for real JSON",
 			absent:        `"$AO_CLI" review submit`,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			prompt, _ := reviewTextsForOS(spec, test.windows)
-			for _, want := range []string{test.githubCommand, test.submitCommand, test.quoteRule, "gh api --method POST", `"event": "COMMENT"`} {
+			for _, want := range []string{test.githubCommand, test.submitCommand, test.quoteRule, "gh api --method POST", "event", "COMMENT", "do not hand-escape"} {
 				if !strings.Contains(prompt, want) {
 					t.Fatalf("prompt missing %q:\n%s", want, prompt)
 				}
 			}
 			if strings.Contains(prompt, test.absent) {
 				t.Fatalf("prompt contains wrong-shell command %q:\n%s", test.absent, prompt)
+			}
+			for _, want := range []string{"Never resolve ao or ao.exe through PATH", "invoke any other AO subcommand"} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing authority rule %q:\n%s", want, prompt)
+				}
+			}
+			for _, forbidden := range []string{`printf '%s' '{`, `Write-Output '{`, `"body": "<your full review markdown>"`} {
+				if strings.Contains(prompt, forbidden) {
+					t.Fatalf("prompt contains unsafe literal %q:\n%s", forbidden, prompt)
+				}
 			}
 		})
 	}
