@@ -63,6 +63,7 @@ type process struct {
 	// second time.
 	reconnected   bool
 	nextRequestID int64
+	codexReadOnly []persistenthost.CodexReadOnlyProof
 	// stop releases the process. It must be safe to call more than once.
 	stop func() error
 	// terminate destroys a persistent host for explicit session shutdown.
@@ -412,6 +413,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		return nil, err
 	}
 	conv.setNativeEvidence(cfg.Permissions, resp.ApprovalPolicy, resp.Sandbox.Type)
+	bindNativeEvidenceCorrelation(conv, string(cfg.SessionID), resp.Thread.ID, "")
 
 	conv.configureDispatch(newDispatchConformanceInput(
 		cfg.SessionID,
@@ -453,8 +455,15 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		// loaded thread. Host replay bridges output and unresolved server requests
 		// across the daemon detach without waiting for the active turn to settle.
 		if cfg.Permissions == ports.PermissionModeReadOnly {
-			_ = conv.Close()
-			return nil, fmt.Errorf("%w: live provider reconnect has no effective permission-state read", ports.ErrChatPermissionModeUnsupported)
+			proof, ok := readOnlyProofForThread(
+				conv.proc.codexReadOnly, string(cfg.SessionID), cfg.ProviderConversationID,
+			)
+			if !ok {
+				_ = conv.Close()
+				return nil, fmt.Errorf("%w: surviving Codex host has no confirmed read-only posture", ports.ErrChatRecoveryInconclusive)
+			}
+			conv.setNativeEvidence(cfg.Permissions, proof.ApprovalPolicy, proof.Sandbox)
+			bindNativeEvidenceCorrelation(conv, string(cfg.SessionID), proof.ThreadID, proof.TurnID)
 		}
 		conv.configureDispatch(newDispatchConformanceInput(
 			cfg.SessionID,
@@ -522,6 +531,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return nil, err
 	}
 	conv.setNativeEvidence(cfg.Permissions, resp.ApprovalPolicy, resp.Sandbox.Type)
+	bindNativeEvidenceCorrelation(conv, string(cfg.SessionID), resp.Thread.ID, "")
 
 	dispatch := newDispatchConformanceInput(
 		cfg.SessionID,
@@ -619,6 +629,7 @@ func (d *Driver) connectSession(
 		stdout:        transport.Stdout,
 		reconnected:   transport.Reconnected,
 		nextRequestID: transport.NextRequestID,
+		codexReadOnly: append([]persistenthost.CodexReadOnlyProof(nil), transport.CodexReadOnly...),
 		stop:          transport.Stdin.Close,
 		terminate: func() error {
 			_ = transport.Stdin.Close()
@@ -685,6 +696,43 @@ func approvalReviewer(mode ports.PermissionMode) string {
 		return "auto_review"
 	}
 	return "user"
+}
+
+func readOnlyProofForThread(
+	proofs []persistenthost.CodexReadOnlyProof,
+	sessionID, threadID string,
+) (persistenthost.CodexReadOnlyProof, bool) {
+	if sessionID == "" || threadID == "" {
+		return persistenthost.CodexReadOnlyProof{}, false
+	}
+	var match persistenthost.CodexReadOnlyProof
+	matched := false
+	for _, proof := range proofs {
+		if proof.SessionID != sessionID || proof.ThreadID != threadID {
+			continue
+		}
+		if proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" ||
+			proof.RuntimeGeneration == "" || proof.ControllerGeneration == "" ||
+			proof.PermissionConfigGeneration == 0 {
+			return persistenthost.CodexReadOnlyProof{}, false
+		}
+		if matched {
+			// Multiple receipts for the same identity are ambiguous. Do not let a
+			// forged or stale duplicate select whichever one happens to be first.
+			return persistenthost.CodexReadOnlyProof{}, false
+		}
+		match = proof
+		matched = true
+	}
+	return match, matched
+}
+
+func bindNativeEvidenceCorrelation(conv *conversation, sessionID, threadID, turnID string) {
+	conv.mu.Lock()
+	defer conv.mu.Unlock()
+	conv.nativeEvidence.SessionID = domain.SessionID(sessionID)
+	conv.nativeEvidence.ProviderConversationID = threadID
+	conv.nativeEvidence.ProviderTurnID = turnID
 }
 
 // spawnAppServer is the real launcher.

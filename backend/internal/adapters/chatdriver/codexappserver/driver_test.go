@@ -386,12 +386,17 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	d.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
 		return &persistenthost.Transport{
 			Stdin: proc.stdin, Stdout: proc.stdout, Reconnected: true, NextRequestID: 41,
+			CodexReadOnly: []persistenthost.CodexReadOnlyProof{{
+				SessionID: "ao-reconnect", ThreadID: "thread-survived",
+				RuntimeGeneration: "runtime-1", ControllerGeneration: "2",
+				PermissionConfigGeneration: 3, ApprovalPolicy: "never", Sandbox: "readOnly",
+			}},
 		}, nil
 	}
 
 	conv, err := d.Resume(context.Background(), ports.ChatResumeConfig{
 		SessionID: "ao-reconnect", ProviderConversationID: "thread-survived",
-		DataDir: t.TempDir(), WorkspacePath: "/tmp/ws",
+		DataDir: t.TempDir(), WorkspacePath: "/tmp/ws", Permissions: ports.PermissionModeReadOnly,
 		PrepareEnv: func(context.Context) (map[string]string, error) {
 			prepareCalls++
 			return map[string]string{"AO_BROWSER_CAPABILITY": "rotated"}, nil
@@ -411,6 +416,12 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 		t.Fatalf("reconnect repeated handshake: initialize=%v resume=%v",
 			srv.sentMethod("initialize"), srv.sentMethod("thread/resume"))
 	}
+	evidence := conv.(ports.ChatNativeEvidenceReader).NativeEvidence()
+	if evidence.ProofStatus != "PROVEN" || evidence.SessionID != "ao-reconnect" ||
+		evidence.ProviderConversationID != "thread-survived" || evidence.EffectivePermission != "read-only" ||
+		evidence.ApprovalPolicy != "never" || evidence.ThreadSandbox != "readOnly" {
+		t.Fatalf("reconnect native evidence = %+v", evidence)
+	}
 
 	lister := conv.(ports.ChatModelLister)
 	if _, err := lister.ListModels(context.Background()); err != nil {
@@ -422,7 +433,7 @@ func TestResumeReconnectsInitializedHostWithoutNativeResume(t *testing.T) {
 	}
 }
 
-func TestReadOnlyReconnectRefusesWithoutLiveEffectivePosture(t *testing.T) {
+func TestReadOnlyReconnectRefusesWithoutHostReceipt(t *testing.T) {
 	d, srv := newTestDriver(t)
 	workspace := t.TempDir()
 	proc, err := d.spawn(context.Background(), "codex", workspace, nil)
@@ -438,8 +449,8 @@ func TestReadOnlyReconnectRefusesWithoutLiveEffectivePosture(t *testing.T) {
 		SessionID: "ao-reconnect", ProviderConversationID: "thread-survived",
 		DataDir: t.TempDir(), WorkspacePath: workspace, Permissions: ports.PermissionModeReadOnly,
 	})
-	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
-		t.Fatalf("Resume error = %v, want ErrChatPermissionModeUnsupported", err)
+	if !errors.Is(err, ports.ErrChatRecoveryInconclusive) {
+		t.Fatalf("Resume error = %v, want ErrChatRecoveryInconclusive", err)
 	}
 	if srv.sentMethod("thread/resume") {
 		t.Fatal("read-only reconnect attempted a native resume against the live provider")

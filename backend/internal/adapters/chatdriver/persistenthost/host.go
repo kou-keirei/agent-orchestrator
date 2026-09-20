@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,25 @@ type Transport struct {
 	Reconnected   bool
 	NextRequestID int64
 	ACPState      *ACPState
+	// CodexReadOnly contains typed, host-owned receipts. A thread id by itself
+	// is not permission evidence: callers must validate the correlated session,
+	// runtime, controller, and permission-configuration generations as well.
+	CodexReadOnly []CodexReadOnlyProof
+}
+
+// CodexReadOnlyProof is a host-driver receipt for one provider thread. The host
+// creates it only after observing a matching read-only request and successful
+// provider response. TurnID is empty until a successful turn/start response has
+// been observed; an empty value never authorizes a different thread.
+type CodexReadOnlyProof struct {
+	SessionID                  string `json:"sessionId"`
+	ThreadID                   string `json:"threadId"`
+	TurnID                     string `json:"turnId,omitempty"`
+	RuntimeGeneration          string `json:"runtimeGeneration"`
+	ControllerGeneration       string `json:"controllerGeneration"`
+	PermissionConfigGeneration uint64 `json:"permissionConfigGeneration"`
+	ApprovalPolicy             string `json:"approvalPolicy"`
+	Sandbox                    string `json:"sandbox"`
 }
 
 type hello struct {
@@ -136,10 +156,11 @@ type hello struct {
 }
 
 type helloResponse struct {
-	OK            bool      `json:"ok"`
-	Error         string    `json:"error,omitempty"`
-	NextRequestID int64     `json:"nextRequestId,omitempty"`
-	ACPState      *ACPState `json:"acpState,omitempty"`
+	OK            bool                 `json:"ok"`
+	Error         string               `json:"error,omitempty"`
+	NextRequestID int64                `json:"nextRequestId,omitempty"`
+	ACPState      *ACPState            `json:"acpState,omitempty"`
+	CodexReadOnly []CodexReadOnlyProof `json:"codexReadOnly,omitempty"`
 }
 
 func hostDir(dataDir, sessionID string) (string, error) {
@@ -467,6 +488,7 @@ func attach(ctx context.Context, d Descriptor, reconnected bool) (*Transport, er
 	return &Transport{
 		Stdin: conn, Stdout: reader, Reconnected: reconnected,
 		NextRequestID: response.NextRequestID, ACPState: response.ACPState,
+		CodexReadOnly: cloneCodexReadOnlyProofs(response.CodexReadOnly),
 	}, nil
 }
 
@@ -598,8 +620,12 @@ func Run(ctx context.Context, cfg Config) error {
 
 	h := &host{
 		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token,
+		sessionID: cfg.SessionID, runtimeGeneration: token,
 		detached: make([][]byte, 0, 64), pendingRequests: make(map[string]*pendingRequest),
-		shutdown: make(chan struct{}),
+		codexReadOnly:         make(map[string]codexReadOnlyReceipt),
+		codexPermissions:      make(map[string]codexPermissionRequest),
+		codexThreadGeneration: make(map[string]uint64),
+		shutdown:              make(chan struct{}),
 	}
 	if cfg.Protocol == ProtocolACP {
 		h.acp, err = newACPRelay(ctx, filepath.Join(filepath.Dir(path), "acp-prompt.journal"))
@@ -648,29 +674,53 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 type host struct {
-	ctx      context.Context
-	listener net.Listener
-	child    *exec.Cmd
-	stdin    io.WriteCloser
-	token    string
-	acp      *acpRelay
+	ctx               context.Context
+	listener          net.Listener
+	child             *exec.Cmd
+	stdin             io.WriteCloser
+	token             string
+	sessionID         string
+	runtimeGeneration string
+	acp               *acpRelay
 
-	mu               sync.Mutex
-	cond             *sync.Cond
-	client           net.Conn
-	clientGeneration uint64
-	detached         [][]byte
-	detachedBytes    int
-	pendingRequests  map[string]*pendingRequest
-	pendingOrder     []string
-	maxRequestID     int64
-	shutdown         chan struct{}
-	shutdownOnce     sync.Once
+	mu                        sync.Mutex
+	cond                      *sync.Cond
+	client                    net.Conn
+	clientGeneration          uint64
+	detached                  [][]byte
+	detachedBytes             int
+	pendingRequests           map[string]*pendingRequest
+	pendingOrder              []string
+	maxRequestID              int64
+	codexReadOnly             map[string]codexReadOnlyReceipt
+	codexPermissions          map[string]codexPermissionRequest
+	codexThreadGeneration     map[string]uint64
+	codexPermissionGeneration uint64
+	shutdown                  chan struct{}
+	shutdownOnce              sync.Once
 }
 
 type pendingRequest struct {
 	frame    []byte
 	buffered bool
+}
+
+type codexPermissionRequest struct {
+	method             string
+	threadID           string
+	threadIDRequired   bool
+	readOnly           bool
+	permissionProvided bool
+	generation         uint64
+}
+
+type codexReadOnlyReceipt struct {
+	threadID          string
+	turnID            string
+	generation        uint64
+	approvalPolicy    string
+	sandbox           string
+	runtimeGeneration string
 }
 
 func (h *host) accept() error {
@@ -722,7 +772,10 @@ func (h *host) handle(conn net.Conn) {
 	h.client = conn
 	h.clientGeneration++
 	generation := h.clientGeneration
-	response := helloResponse{OK: true, NextRequestID: h.maxRequestID}
+	response := helloResponse{
+		OK: true, NextRequestID: h.maxRequestID,
+		CodexReadOnly: h.codexReadOnlySnapshotLocked(),
+	}
 	if h.acp != nil {
 		response.ACPState = h.acp.snapshot()
 	}
@@ -757,6 +810,14 @@ func (h *host) handle(conn net.Conn) {
 			providerFrame := frame
 			var clientFrame []byte
 			h.mu.Lock()
+			if h.acp == nil {
+				if h.client != conn || generation != h.clientGeneration {
+					h.mu.Unlock()
+					_ = conn.Close()
+					return
+				}
+				h.observeCodexRequest(frame)
+			}
 			if h.acp != nil {
 				var relayErr error
 				var relayed acpClientFrames
@@ -836,6 +897,9 @@ func (h *host) forwardProvider(stdout io.Reader) error {
 		frame, err := reader.ReadBytes('\n')
 		if len(frame) > 0 {
 			h.mu.Lock()
+			if h.acp == nil {
+				h.observeCodexReadOnly(frame)
+			}
 			retainedByACP := false
 			if h.acp != nil {
 				var relayErr error
@@ -886,6 +950,371 @@ func (h *host) forwardProvider(stdout io.Reader) error {
 			return err
 		}
 	}
+}
+
+// observeCodexRequest records a permission-bearing Codex request while h.mu is
+// held. It never promotes a request to proof: only the matching provider
+// response can do that.
+func (h *host) observeCodexRequest(frame []byte) {
+	var value struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(frame, &value) != nil || !validRPCID(value.ID) {
+		return
+	}
+	if value.Method != "thread/start" && value.Method != "thread/resume" && value.Method != "turn/start" {
+		return
+	}
+	h.ensureCodexMapsLocked()
+	h.codexPermissionGeneration++
+	generation := h.codexPermissionGeneration
+
+	params, paramsValid := objectParams(value.Params)
+	posture := codexPermissionPosture{}
+	if paramsValid {
+		posture = requestedCodexPosture(params)
+	} else {
+		posture.valid = false
+	}
+	threadID, threadPresent, threadValid := jsonStringField(params, "threadId")
+	if !paramsValid {
+		threadID, threadPresent, threadValid = "", false, false
+	}
+	if threadPresent && (!threadValid || threadID == "") {
+		threadID = ""
+		threadValid = false
+	}
+
+	threadIDRequired := value.Method == "thread/resume" || value.Method == "turn/start"
+	if !paramsValid || !threadValid || (threadIDRequired && !threadPresent) ||
+		(value.Method == "thread/resume" && threadID == "") {
+		h.invalidateAllCodexReadOnlyLocked(generation)
+		threadID = ""
+	}
+	if value.Method == "thread/start" && !posture.valid {
+		h.invalidateAllCodexReadOnlyLocked(generation)
+	}
+
+	if value.Method == "turn/start" {
+		if threadID == "" {
+			h.invalidateAllCodexReadOnlyLocked(generation)
+		} else if posture.provided && (!posture.valid || !posture.readOnly) {
+			// A broader, malformed, or conflicting turn posture invalidates the
+			// thread receipt before the provider can answer.
+			h.invalidateCodexReadOnlyLocked(threadID, generation)
+		}
+	} else if threadID != "" {
+		// A new start/resume operation fences an older response for this thread.
+		h.invalidateCodexReadOnlyLocked(threadID, generation)
+	}
+
+	h.codexPermissions[string(value.ID)] = codexPermissionRequest{
+		method:             value.Method,
+		threadID:           threadID,
+		threadIDRequired:   threadIDRequired,
+		readOnly:           posture.readOnly,
+		permissionProvided: posture.provided,
+		generation:         generation,
+	}
+}
+
+// observeCodexReadOnly promotes only a successful, correlated provider
+// response. JSON-RPC responses carrying an error never become permission
+// evidence, even if they also contain a result-shaped payload.
+func (h *host) observeCodexReadOnly(frame []byte) {
+	var value struct {
+		ID     json.RawMessage `json:"id"`
+		Method json.RawMessage `json:"method"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(frame, &value) != nil || !validRPCID(value.ID) ||
+		(len(value.Method) > 0 && string(value.Method) != "null") {
+		return
+	}
+	h.ensureCodexMapsLocked()
+	requestID := string(value.ID)
+	request, ok := h.codexPermissions[requestID]
+	if !ok {
+		return
+	}
+	delete(h.codexPermissions, requestID)
+	if len(value.Error) > 0 {
+		// Presence itself is enough to fail closed; a malformed/null error is
+		// not a successful provider posture receipt either.
+		h.invalidateCodexRequestLocked(request)
+		return
+	}
+
+	if request.method == "turn/start" {
+		h.observeCodexTurnResponseLocked(request, value.Result)
+		return
+	}
+
+	threadID, approvalPolicy, sandbox, valid := codexThreadResponse(value.Result)
+	if !valid || (request.threadID != "" && request.threadID != threadID) ||
+		(request.threadIDRequired && request.threadID != threadID) ||
+		!request.readOnly {
+		target := threadID
+		if request.threadID != "" {
+			target = request.threadID
+		}
+		if target != "" {
+			h.invalidateCodexReadOnlyLocked(target, request.generation)
+		} else {
+			h.invalidateAllCodexReadOnlyLocked(request.generation)
+		}
+		return
+	}
+	if current := h.codexThreadGeneration[threadID]; current > request.generation {
+		// A newer operation already fenced this thread. This is a stale
+		// response and must not restore its old proof.
+		return
+	}
+	h.codexThreadGeneration[threadID] = request.generation
+	h.codexReadOnly[threadID] = codexReadOnlyReceipt{
+		threadID: threadID, generation: request.generation,
+		approvalPolicy: approvalPolicy, sandbox: sandbox,
+		runtimeGeneration: h.runtimeGeneration,
+	}
+}
+
+func (h *host) observeCodexTurnResponseLocked(request codexPermissionRequest, raw json.RawMessage) {
+	if request.threadID == "" {
+		return
+	}
+	result, valid := jsonObject(raw)
+	if !valid {
+		h.invalidateCodexReadOnlyLocked(request.threadID, request.generation)
+		return
+	}
+	turnRaw, present := result["turn"]
+	if !present {
+		h.invalidateCodexReadOnlyLocked(request.threadID, request.generation)
+		return
+	}
+	var turn struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(turnRaw, &turn) != nil || turn.ID == "" {
+		h.invalidateCodexReadOnlyLocked(request.threadID, request.generation)
+		return
+	}
+	if current := h.codexThreadGeneration[request.threadID]; current > request.generation {
+		return
+	}
+	receipt, exists := h.codexReadOnly[request.threadID]
+	if !exists || (request.permissionProvided && !request.readOnly) {
+		return
+	}
+	h.codexThreadGeneration[request.threadID] = request.generation
+	receipt.threadID = request.threadID
+	receipt.turnID = turn.ID
+	receipt.generation = request.generation
+	receipt.runtimeGeneration = h.runtimeGeneration
+	h.codexReadOnly[request.threadID] = receipt
+}
+
+func (h *host) invalidateCodexRequestLocked(request codexPermissionRequest) {
+	if request.threadID != "" {
+		h.invalidateCodexReadOnlyLocked(request.threadID, request.generation)
+		return
+	}
+	h.invalidateAllCodexReadOnlyLocked(request.generation)
+}
+
+func (h *host) invalidateCodexReadOnlyLocked(threadID string, generation uint64) {
+	if threadID == "" {
+		return
+	}
+	if current := h.codexThreadGeneration[threadID]; generation >= current {
+		h.codexThreadGeneration[threadID] = generation
+		delete(h.codexReadOnly, threadID)
+	}
+}
+
+func (h *host) invalidateAllCodexReadOnlyLocked(generation uint64) {
+	for threadID := range h.codexReadOnly {
+		h.invalidateCodexReadOnlyLocked(threadID, generation)
+	}
+	for threadID, current := range h.codexThreadGeneration {
+		if generation >= current {
+			h.codexThreadGeneration[threadID] = generation
+		}
+	}
+}
+
+func (h *host) ensureCodexMapsLocked() {
+	if h.codexReadOnly == nil {
+		h.codexReadOnly = make(map[string]codexReadOnlyReceipt)
+	}
+	if h.codexPermissions == nil {
+		h.codexPermissions = make(map[string]codexPermissionRequest)
+	}
+	if h.codexThreadGeneration == nil {
+		h.codexThreadGeneration = make(map[string]uint64)
+	}
+}
+
+func (h *host) codexReadOnlySnapshotLocked() []CodexReadOnlyProof {
+	h.ensureCodexMapsLocked()
+	threadIDs := make([]string, 0, len(h.codexReadOnly))
+	for threadID, receipt := range h.codexReadOnly {
+		if threadID == "" || receipt.generation == 0 ||
+			h.codexThreadGeneration[threadID] != receipt.generation ||
+			receipt.runtimeGeneration == "" || receipt.approvalPolicy != "never" ||
+			receipt.sandbox != "readOnly" {
+			continue
+		}
+		threadIDs = append(threadIDs, threadID)
+	}
+	sort.Strings(threadIDs)
+	proofs := make([]CodexReadOnlyProof, 0, len(threadIDs))
+	for _, threadID := range threadIDs {
+		receipt := h.codexReadOnly[threadID]
+		proofs = append(proofs, CodexReadOnlyProof{
+			SessionID:                  h.sessionID,
+			ThreadID:                   receipt.threadID,
+			TurnID:                     receipt.turnID,
+			RuntimeGeneration:          receipt.runtimeGeneration,
+			ControllerGeneration:       strconv.FormatUint(h.clientGeneration, 10),
+			PermissionConfigGeneration: receipt.generation,
+			ApprovalPolicy:             receipt.approvalPolicy,
+			Sandbox:                    receipt.sandbox,
+		})
+	}
+	return proofs
+}
+
+func cloneCodexReadOnlyProofs(proofs []CodexReadOnlyProof) []CodexReadOnlyProof {
+	if len(proofs) == 0 {
+		return nil
+	}
+	return append([]CodexReadOnlyProof(nil), proofs...)
+}
+
+type codexPermissionPosture struct {
+	readOnly bool
+	provided bool
+	valid    bool
+}
+
+func requestedCodexPosture(params map[string]json.RawMessage) codexPermissionPosture {
+	policy, policyPresent, policyValid := jsonStringField(params, "approvalPolicy")
+	reviewer, reviewerPresent, reviewerValid := jsonStringField(params, "approvalsReviewer")
+	sandbox, sandboxPresent, sandboxValid := requestedSandbox(params)
+	provided := policyPresent || reviewerPresent || sandboxPresent
+	valid := policyValid && reviewerValid && sandboxValid
+	readOnly := valid && policyPresent && policy == "never" && sandboxPresent && sandbox == "read-only" &&
+		(!reviewerPresent || reviewer == "user")
+	return codexPermissionPosture{readOnly: readOnly, provided: provided, valid: valid}
+}
+
+func codexThreadResponse(raw json.RawMessage) (threadID, approvalPolicy, sandbox string, valid bool) {
+	result, ok := jsonObject(raw)
+	if !ok {
+		return "", "", "", false
+	}
+	if _, hasError := result["error"]; hasError {
+		return "", "", "", false
+	}
+	threadRaw, threadPresent := result["thread"]
+	approvalRaw, approvalPresent := result["approvalPolicy"]
+	sandboxRaw, sandboxPresent := result["sandbox"]
+	if !threadPresent || !approvalPresent || !sandboxPresent {
+		return "", "", "", false
+	}
+	var thread struct {
+		ID string `json:"id"`
+	}
+	var sandboxObject struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(threadRaw, &thread) != nil || thread.ID == "" ||
+		json.Unmarshal(approvalRaw, &approvalPolicy) != nil || approvalPolicy == "" ||
+		json.Unmarshal(sandboxRaw, &sandboxObject) != nil || sandboxObject.Type == "" {
+		return "", "", "", false
+	}
+	return thread.ID, approvalPolicy, sandboxObject.Type, true
+}
+
+func objectParams(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return map[string]json.RawMessage{}, true
+	}
+	return jsonObject(raw)
+}
+
+func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, false
+	}
+	var value map[string]json.RawMessage
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return nil, false
+	}
+	return value, true
+}
+
+func jsonStringField(params map[string]json.RawMessage, name string) (string, bool, bool) {
+	raw, present := params[name]
+	if !present {
+		return "", false, true
+	}
+	if len(raw) == 0 {
+		return "", true, false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", true, false
+	}
+	return value, true, true
+}
+
+func requestedSandbox(params map[string]json.RawMessage) (string, bool, bool) {
+	direct, directPresent, directValid := jsonStringField(params, "sandbox")
+	policyRaw, policyPresent := params["sandboxPolicy"]
+	policy, policyValid := "", true
+	if policyPresent {
+		var object map[string]json.RawMessage
+		if object, policyValid = jsonObject(policyRaw); policyValid {
+			var typePresent bool
+			policy, typePresent, policyValid = jsonStringField(object, "type")
+			policyValid = policyValid && typePresent && policy != ""
+		}
+	}
+	if directPresent && !directValid || policyPresent && !policyValid {
+		return "", true, false
+	}
+	if directPresent && policyPresent && canonicalSandbox(direct) != canonicalSandbox(policy) {
+		return "", true, false
+	}
+	if directPresent {
+		return canonicalSandbox(direct), true, true
+	}
+	if policyPresent {
+		return canonicalSandbox(policy), true, true
+	}
+	return "", false, true
+}
+
+func canonicalSandbox(value string) string {
+	switch value {
+	case "readOnly", "read-only":
+		return "read-only"
+	case "workspaceWrite", "workspace-write":
+		return "workspace-write"
+	case "dangerFullAccess", "danger-full-access":
+		return "danger-full-access"
+	default:
+		return value
+	}
+}
+
+func validRPCID(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null" && json.Valid(raw)
 }
 
 func serverRequestID(frame []byte) (string, bool) {

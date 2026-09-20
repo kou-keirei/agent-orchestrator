@@ -60,6 +60,10 @@ func TestProviderHelper(t *testing.T) {
 		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
 			continue
 		}
+		if frame.Method == "thread/start" {
+			_, _ = fmt.Fprintf(os.Stdout, `{"id":%d,"result":{"thread":{"id":"readonly-thread"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`+"\n", frame.ID)
+			continue
+		}
 		if frame.Method == "emit-later" {
 			time.Sleep(50 * time.Millisecond)
 			_, _ = fmt.Fprintln(os.Stdout, `{"method":"turn/completed","params":{"turn":{"id":"survived"}}}`)
@@ -272,6 +276,128 @@ func readFrame(t *testing.T, reader *bufio.Reader) []byte {
 		t.Fatalf("read frame: %v", err)
 	}
 	return line
+}
+
+func newCodexEvidenceHost() *host {
+	return &host{
+		sessionID: "session-1", runtimeGeneration: "runtime-1", clientGeneration: 3,
+		codexReadOnly:         make(map[string]codexReadOnlyReceipt),
+		codexPermissions:      make(map[string]codexPermissionRequest),
+		codexThreadGeneration: make(map[string]uint64),
+	}
+}
+
+func seedCodexReadOnlyReceipt(t *testing.T, h *host, id, threadID string) {
+	t.Helper()
+	h.observeCodexRequest([]byte(fmt.Sprintf(
+		`{"id":%s,"method":"thread/resume","params":{"threadId":%q,"approvalPolicy":"never","sandbox":"read-only"}}`,
+		id, threadID,
+	)))
+	h.observeCodexReadOnly([]byte(fmt.Sprintf(
+		`{"id":%s,"result":{"thread":{"id":%q},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`,
+		id, threadID,
+	)))
+}
+
+func codexReadOnlyProofFor(h *host, threadID string) (CodexReadOnlyProof, bool) {
+	for _, proof := range h.codexReadOnlySnapshotLocked() {
+		if proof.ThreadID == threadID {
+			return proof, true
+		}
+	}
+	return CodexReadOnlyProof{}, false
+}
+
+func TestCodexReadOnlyProofCarriesHostDriverCorrelation(t *testing.T) {
+	h := newCodexEvidenceHost()
+	seedCodexReadOnlyReceipt(t, h, "1", "thread-1")
+	proof, ok := codexReadOnlyProofFor(h, "thread-1")
+	if !ok {
+		t.Fatal("matching read-only receipt was not promoted")
+	}
+	if proof.SessionID != "session-1" || proof.ThreadID != "thread-1" || proof.TurnID != "" ||
+		proof.RuntimeGeneration != "runtime-1" || proof.ControllerGeneration != "3" ||
+		proof.PermissionConfigGeneration == 0 || proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" {
+		t.Fatalf("typed host proof = %+v", proof)
+	}
+
+	h.observeCodexRequest([]byte(`{"id":2,"method":"turn/start","params":{"threadId":"thread-1","approvalPolicy":"never","sandboxPolicy":{"type":"readOnly"}}}`))
+	h.observeCodexReadOnly([]byte(`{"id":2,"result":{"turn":{"id":"turn-1"}}}`))
+	proof, ok = codexReadOnlyProofFor(h, "thread-1")
+	if !ok || proof.TurnID != "turn-1" || proof.PermissionConfigGeneration <= 1 {
+		t.Fatalf("turn-bound typed host proof = %+v (ok=%v)", proof, ok)
+	}
+}
+
+func TestCodexReadOnlyProofRejectsConflictingSandboxForms(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only","sandboxPolicy":{"type":"workspaceWrite"}}}`))
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`))
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("conflicting sandbox and sandboxPolicy forms became proof")
+	}
+}
+
+func TestCodexReadOnlyProofRejectsJSONRPCResultWithError(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only"}}`))
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}},"error":{"code":-32000,"message":"provider rejected"}}`))
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("JSON-RPC result plus error became permission proof")
+	}
+}
+
+func TestCodexReadOnlyProofRejectsStalePermissionResponse(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only"}}`))
+	h.observeCodexRequest([]byte(`{"id":2,"method":"turn/start","params":{"threadId":"thread-1","approvalPolicy":"on-request","sandboxPolicy":{"type":"workspaceWrite"}}}`))
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`))
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("stale read-only response restored proof after broader permission generation")
+	}
+}
+
+func TestHostRetainsTypedCodexReadOnlyProofAcrossAttachments(t *testing.T) {
+	cfg := Config{
+		SessionID: "typed-proof-host", DataDir: t.TempDir(), Workdir: t.TempDir(),
+		Env:  append(os.Environ(), "AO_CHAT_HOST_PROVIDER_HELPER=1"),
+		Argv: []string{os.Args[0], "-test.run=TestProviderHelper"},
+	}
+	done := make(chan error, 1)
+	go func() { done <- Run(context.Background(), cfg) }()
+	d := awaitDescriptor(t, cfg.DataDir, cfg.SessionID)
+	t.Cleanup(func() {
+		if err := Shutdown(context.Background(), cfg.DataDir, cfg.SessionID); err != nil {
+			t.Error(err)
+		}
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+
+	first := awaitAttach(t, d)
+	if len(first.CodexReadOnly) != 0 {
+		t.Fatal("new host invented read-only proof")
+	}
+	if _, err := fmt.Fprintln(first.Stdin, `{"id":1,"method":"thread/start","params":{"approvalPolicy":"never","sandbox":"read-only"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if response := readFrame(t, bufio.NewReader(first.Stdout)); !bytes.Contains(response, []byte(`"id":1`)) {
+		t.Fatalf("thread/start response = %s", response)
+	}
+	_ = first.Stdin.Close()
+
+	second := awaitAttach(t, d)
+	if len(second.CodexReadOnly) != 1 {
+		t.Fatalf("typed proofs after reconnect = %+v", second.CodexReadOnly)
+	}
+	proof := second.CodexReadOnly[0]
+	if proof.SessionID != cfg.SessionID || proof.ThreadID != "readonly-thread" ||
+		proof.RuntimeGeneration == "" || proof.ControllerGeneration != "2" ||
+		proof.PermissionConfigGeneration == 0 || proof.ApprovalPolicy != "never" || proof.Sandbox != "readOnly" {
+		t.Fatalf("reconnected typed proof = %+v", proof)
+	}
+	_ = second.Stdin.Close()
 }
 
 func TestShutdownReleasesHostBeforeFreshReplacement(t *testing.T) {
