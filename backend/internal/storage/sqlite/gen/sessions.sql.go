@@ -144,7 +144,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
 FROM sessions WHERE id = ?
 `
 
@@ -204,6 +204,7 @@ type GetSessionRow struct {
 	SessionPermissions               string
 	Effort                           string
 	EffortResolved                   bool
+	ExecutionBaseSha                 string
 }
 
 func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessionRow, error) {
@@ -265,6 +266,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.SessionPermissions,
 		&i.Effort,
 		&i.EffortResolved,
+		&i.ExecutionBaseSha,
 	)
 	return i, err
 }
@@ -281,9 +283,10 @@ INSERT INTO sessions (
     native_transcript_path,
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
     session_mode, provider_conversation_id, controller_generation, model, session_permissions,
-    created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci, effort, effort_resolved
+    created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
+    effort, effort_resolved, execution_base_sha
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -342,6 +345,7 @@ type InsertSessionParams struct {
 	AutoInjectCI                     bool
 	Effort                           string
 	EffortResolved                   bool
+	ExecutionBaseSha                 string
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
@@ -400,6 +404,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.AutoInjectCI,
 		arg.Effort,
 		arg.EffortResolved,
+		arg.ExecutionBaseSha,
 	)
 	return err
 }
@@ -416,7 +421,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
 FROM sessions ORDER BY project_id, num
 `
 
@@ -476,6 +481,7 @@ type ListAllSessionsRow struct {
 	SessionPermissions               string
 	Effort                           string
 	EffortResolved                   bool
+	ExecutionBaseSha                 string
 }
 
 func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, error) {
@@ -543,6 +549,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.SessionPermissions,
 			&i.Effort,
 			&i.EffortResolved,
+			&i.ExecutionBaseSha,
 		); err != nil {
 			return nil, err
 		}
@@ -569,7 +576,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -629,6 +636,7 @@ type ListSessionsByProjectRow struct {
 	SessionPermissions               string
 	Effort                           string
 	EffortResolved                   bool
+	ExecutionBaseSha                 string
 }
 
 func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.ProjectID) ([]ListSessionsByProjectRow, error) {
@@ -696,6 +704,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.SessionPermissions,
 			&i.Effort,
 			&i.EffortResolved,
+			&i.ExecutionBaseSha,
 		); err != nil {
 			return nil, err
 		}
@@ -1097,7 +1106,7 @@ UPDATE sessions SET
     preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
     cleanup_generation = ?, browser_capability_verifier = ?,
     provider_conversation_id = ?, controller_generation = ?, model = ?, updated_at = ?,
-    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?, effort = ?, effort_resolved = ?
+    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?, effort = ?, effort_resolved = ?, execution_base_sha = ?
 WHERE id = ?
 `
 
@@ -1150,6 +1159,7 @@ type UpdateSessionParams struct {
 	AutoInjectCI                     bool
 	Effort                           string
 	EffortResolved                   bool
+	ExecutionBaseSha                 string
 	ID                               domain.SessionID
 }
 
@@ -1203,6 +1213,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 		arg.AutoInjectCI,
 		arg.Effort,
 		arg.EffortResolved,
+		arg.ExecutionBaseSha,
 		arg.ID,
 	)
 	return err

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -99,6 +100,10 @@ type chatSpawn struct {
 // first so no app-server process is left behind holding the worktree.
 func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domain.SessionRecord, error) {
 	id := in.record.ID
+	if err := m.admitExecutionBase(ctx, in.workspace); err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false)
+		return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, err)
+	}
 	releaseCodexAdmission, err := m.acquireCodexControllerAdmission(ctx, in.cfg.Harness)
 	if err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false)
@@ -162,6 +167,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 				Branch:            in.workspace.Branch,
 				WorkspacePath:     in.workspace.Path,
 				WorkspaceRepoPath: in.workspace.RepoPath,
+				ExecutionBaseSHA:  firstNonEmptyString(in.workspace.ExecutionBaseSHA, strings.TrimSpace(in.cfg.ExecutionBaseSHA)),
 				Prompt:            in.prompt,
 				DiffBaseSHA:       diffBaseSHA,
 				DiffBaseRef:       diffBaseRef,

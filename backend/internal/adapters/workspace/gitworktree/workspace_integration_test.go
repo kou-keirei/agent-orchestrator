@@ -63,6 +63,123 @@ func TestWorkspaceIntegrationCreateRestoreDestroy(t *testing.T) {
 	}
 }
 
+func TestWorkspaceIntegrationExactExecutionBaseAdmission(t *testing.T) {
+	git := requireGit(t)
+	tmp := t.TempDir()
+	repo := setupOriginClone(t, git, tmp)
+	runGit(t, git, repo, "switch", "-c", "authorized-base")
+	if err := os.WriteFile(filepath.Join(repo, "authorized.txt"), []byte("authorized\n"), 0o644); err != nil {
+		t.Fatalf("write authorized commit: %v", err)
+	}
+	runGit(t, git, repo, "add", "authorized.txt")
+	runGit(t, git, repo, "commit", "-m", "authorized execution base")
+	target := gitOutput(t, git, repo, "rev-parse", "HEAD")
+	runGit(t, git, repo, "switch", "main")
+
+	ws, err := New(Options{Binary: git, ManagedRoot: filepath.Join(tmp, "managed"), RepoResolver: StaticRepoResolver{"proj": repo}})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	ctx := context.Background()
+
+	newExact := func(t *testing.T, session string) ports.WorkspaceInfo {
+		t.Helper()
+		info, err := ws.Create(ctx, ports.WorkspaceConfig{
+			ProjectID: "proj", SessionID: domain.SessionID(session), Branch: "ao/" + session,
+			ExecutionBaseSHA: target,
+		})
+		if err != nil {
+			t.Fatalf("create exact worktree: %v", err)
+		}
+		t.Cleanup(func() { _ = ws.ForceDestroy(ctx, info) })
+		return info
+	}
+
+	t.Run("noncanonical target materializes exact commit", func(t *testing.T) {
+		info := newExact(t, "exact-target")
+		if got := gitOutput(t, git, info.Path, "rev-parse", "HEAD"); got != target {
+			t.Fatalf("HEAD = %s, want authorized target %s", got, target)
+		}
+		if got := gitOutput(t, git, info.Path, "rev-parse", "HEAD^{tree}"); got != gitOutput(t, git, repo, "rev-parse", target+"^{tree}") {
+			t.Fatalf("HEAD tree = %s, want tree of %s", got, target)
+		}
+		for _, args := range [][]string{
+			{"diff", "--quiet", "--cached", target, "--"},
+			{"diff", "--quiet", target, "--"},
+		} {
+			if got := gitOutput(t, git, info.Path, args...); got != "" {
+				t.Fatalf("git %v output = %q, want empty", args, got)
+			}
+		}
+		if got := gitOutput(t, git, info.Path, "status", "--porcelain", "--untracked-files=all"); got != "" {
+			t.Fatalf("status = %q, want clean", got)
+		}
+	})
+
+	t.Run("HEAD mismatch rejects before execution", func(t *testing.T) {
+		info, err := ws.Create(ctx, ports.WorkspaceConfig{ProjectID: "proj", SessionID: "head-mismatch", Branch: "ao/head-mismatch"})
+		if err != nil {
+			t.Fatalf("create canonical worktree: %v", err)
+		}
+		t.Cleanup(func() { _ = ws.ForceDestroy(ctx, info) })
+		info.ExecutionBaseSHA = target
+		if err := ws.AttestExecutionBase(ctx, info); !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+			t.Fatalf("admission error = %v, want ErrWorkspaceExecutionBaseMismatch", err)
+		}
+		_, err = ws.Restore(ctx, ports.WorkspaceConfig{
+			ProjectID: "proj", SessionID: "head-mismatch", Branch: info.Branch,
+			Path: info.Path, ExecutionBaseSHA: target,
+		})
+		if !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+			t.Fatalf("restore mismatch error = %v, want ErrWorkspaceExecutionBaseMismatch", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, path string)
+	}{
+		{name: "index mismatch", mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("staged contamination\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, git, path, "add", "README.md")
+		}},
+		{name: "worktree mismatch", mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("unstaged contamination\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "untracked contamination", mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "untracked.txt"), []byte("untracked\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := newExact(t, "contaminated-"+strings.ReplaceAll(tc.name, " ", "-"))
+			tc.mutate(t, info.Path)
+			if err := ws.AttestExecutionBase(ctx, info); !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+				t.Fatalf("admission error = %v, want ErrWorkspaceExecutionBaseMismatch", err)
+			}
+		})
+	}
+
+	t.Run("matching restore re-admits exact target", func(t *testing.T) {
+		info := newExact(t, "matching-restore")
+		restored, err := ws.Restore(ctx, ports.WorkspaceConfig{
+			ProjectID: "proj", SessionID: "matching-restore", Branch: info.Branch,
+			Path: info.Path, ExecutionBaseSHA: target,
+		})
+		if err != nil {
+			t.Fatalf("restore matching target: %v", err)
+		}
+		if restored.ExecutionBaseSHA != target || gitOutput(t, git, restored.Path, "rev-parse", "HEAD") != target {
+			t.Fatalf("restored = %#v, want exact target %s", restored, target)
+		}
+	})
+}
+
 func TestWorkspaceIntegrationMixedWorkspaceContentReachesEverySessionKind(t *testing.T) {
 	git := requireGit(t)
 	tmp := t.TempDir()

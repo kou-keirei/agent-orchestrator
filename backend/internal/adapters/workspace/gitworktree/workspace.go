@@ -129,6 +129,7 @@ var _ ports.WorkspaceDefaultBranchRefresher = (*Workspace)(nil)
 var _ ports.WorkspaceProject = (*Workspace)(nil)
 var _ ports.WorkspaceObserver = (*Workspace)(nil)
 var _ ports.WorkspaceReclaimer = (*Workspace)(nil)
+var _ ports.WorkspaceExecutionBaseAttester = (*Workspace)(nil)
 
 // New builds a gitworktree Workspace, validating that ManagedRoot and
 // RepoResolver are set and resolving the root to an absolute, symlink-free path.
@@ -281,6 +282,12 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
+	if cfg.ExecutionBaseSHA != "" {
+		cfg.ExecutionBaseSHA, err = w.resolveExecutionBase(ctx, repo, cfg.ExecutionBaseSHA)
+		if err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
+	}
 	if err := w.validateBranch(ctx, repo, cfg.Branch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
@@ -296,13 +303,21 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 			return ports.WorkspaceInfo{}, err
 		}
 		info.BaseRef = refs.baseRef
+		info.ExecutionBaseSHA = cfg.ExecutionBaseSHA
+		if err := w.AttestExecutionBase(ctx, info); err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
 		return info, nil
 	}
-	baseRef, err := w.addWorktree(ctx, repo, path, cfg.Branch, cfg.BaseBranch, cfg.BaseRef, true)
+	baseRef, err := w.addWorktree(ctx, repo, path, cfg.Branch, cfg.BaseBranch, cfg.BaseRef, cfg.ExecutionBaseSHA, true)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}, nil
+	info := ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
+	if err := w.AttestExecutionBase(ctx, info); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	return info, nil
 }
 
 // CreateWorkspaceProject materialises a root-as-repo workspace session: the
@@ -1147,6 +1162,12 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
+	if cfg.ExecutionBaseSHA != "" {
+		cfg.ExecutionBaseSHA, err = w.resolveExecutionBase(ctx, repo, cfg.ExecutionBaseSHA)
+		if err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
+	}
 	path, err := w.restorePath(cfg)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -1171,7 +1192,11 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 			if branch == "" {
 				branch = cfg.Branch
 			}
-			return ports.WorkspaceInfo{Path: path, Branch: branch, BaseRef: cfg.BaseRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+			info := ports.WorkspaceInfo{Path: path, Branch: branch, BaseRef: cfg.BaseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}
+			if err := w.AttestExecutionBase(ctx, info); err != nil {
+				return ports.WorkspaceInfo{}, err
+			}
+			return info, nil
 		}
 		// The registration outlived its directory (issue #2775: a session's git
 		// worktree registration and DB row survived a deletion that removed only
@@ -1199,11 +1224,15 @@ func (w *Workspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) (por
 	if err := w.validateBranch(ctx, repo, recreateBranch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	baseRef, err := w.addWorktree(ctx, repo, path, recreateBranch, cfg.BaseBranch, cfg.BaseRef, false)
+	baseRef, err := w.addWorktree(ctx, repo, path, recreateBranch, cfg.BaseBranch, cfg.BaseRef, cfg.ExecutionBaseSHA, false)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: recreateBranch, BaseRef: baseRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}, nil
+	info := ports.WorkspaceInfo{Path: path, Branch: recreateBranch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: repo}
+	if err := w.AttestExecutionBase(ctx, info); err != nil {
+		return ports.WorkspaceInfo{}, err
+	}
+	return info, nil
 }
 
 func (w *Workspace) existingWorktree(ctx context.Context, repo, path string, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, bool, error) {
@@ -1292,13 +1321,40 @@ func registeredWorktreeDirMissing(rec worktreeRecord) (bool, error) {
 	return false, nil
 }
 
-func (w *Workspace) addWorktree(ctx context.Context, repo, path, branch, baseBranch, baseRef string, resolveExistingBase bool) (string, error) {
+func (w *Workspace) addWorktree(ctx context.Context, repo, path, branch, baseBranch, baseRef, executionBaseSHA string, resolveExistingBase bool) (string, error) {
 	// Refuse early if the branch is already checked out in another worktree:
 	// `git worktree add` will fail, but its stderr leaks through as an opaque
 	// 500. A typed sentinel lets the HTTP layer surface a 409.
 	records, err := w.listRecords(ctx, repo)
 	if err != nil {
 		return "", err
+	}
+	force, err := staleRegistrationForPath(records, path)
+	if err != nil {
+		return "", err
+	}
+	if executionBaseSHA != "" {
+		localBranch, err := w.refExists(ctx, repo, "refs/heads/"+branch)
+		if err != nil {
+			return "", err
+		}
+		if localBranch {
+			branchSHA, err := w.revParse(ctx, repo, "refs/heads/"+branch)
+			if err != nil {
+				return "", err
+			}
+			if branchSHA != executionBaseSHA {
+				return "", fmt.Errorf("%w: branch %q is at %s, requested %s", ports.ErrWorkspaceExecutionBaseMismatch, branch, branchSHA, executionBaseSHA)
+			}
+			if _, err := w.run(ctx, w.binary, worktreeAddBranchArgs(repo, path, branch, force)...); err != nil {
+				return "", fmt.Errorf("gitworktree: worktree add exact branch %q: %w", branch, err)
+			}
+			return baseRef, nil
+		}
+		if err := w.addNewBranchWorktree(ctx, repo, branch, path, executionBaseSHA, force); err != nil {
+			return "", fmt.Errorf("gitworktree: worktree add exact branch %q from %q: %w", branch, executionBaseSHA, err)
+		}
+		return baseRef, nil
 	}
 	if conflict, ok := findWorktreeByBranch(records, branch); ok && filepath.Clean(conflict.Path) != filepath.Clean(path) {
 		return "", fmt.Errorf("%w: %q is checked out at %q", ErrBranchCheckedOutElsewhere, branch, conflict.Path)
@@ -1308,11 +1364,6 @@ func (w *Workspace) addWorktree(ctx context.Context, repo, path, branch, baseBra
 	// override"), so re-register it in the same add instead of clearing it
 	// first. records is the freshly listed state, so this decision and the add
 	// it feeds are as close together as git allows.
-	force, err := staleRegistrationForPath(records, path)
-	if err != nil {
-		return "", err
-	}
-
 	localBranch, err := w.refExists(ctx, repo, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
@@ -1579,6 +1630,74 @@ func (w *Workspace) revParse(ctx context.Context, repo, ref string) (string, err
 		return "", fmt.Errorf("gitworktree: rev-parse %q: %w", ref, err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func (w *Workspace) resolveExecutionBase(ctx context.Context, repo, requested string) (string, error) {
+	target := strings.TrimSpace(requested)
+	if target == "" {
+		return "", nil
+	}
+	sha, err := w.revParse(ctx, repo, target+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("%w: target %q is not a resolvable commit: %v", ports.ErrWorkspaceExecutionBaseMismatch, target, err)
+	}
+	return sha, nil
+}
+
+// AttestExecutionBase proves the exact execution authority at the worktree
+// boundary. The checks are read-only: HEAD, index tree, worktree tree, and
+// tracked/untracked status must all agree with the authorized commit.
+func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.WorkspaceInfo) error {
+	target := strings.TrimSpace(info.ExecutionBaseSHA)
+	if target == "" {
+		return nil
+	}
+	repo := strings.TrimSpace(info.RepoPath)
+	if repo == "" {
+		var err error
+		repo, err = w.repoPath(info.ProjectID)
+		if err != nil {
+			return fmt.Errorf("%w: resolve repository: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+		}
+	}
+	canonical, err := w.resolveExecutionBase(ctx, repo, target)
+	if err != nil {
+		return err
+	}
+	head, err := w.revParse(ctx, info.Path, "HEAD")
+	if err != nil {
+		return fmt.Errorf("%w: read HEAD: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+	}
+	if head != canonical {
+		return fmt.Errorf("%w: HEAD=%s, want %s", ports.ErrWorkspaceExecutionBaseMismatch, head, canonical)
+	}
+	if err := w.requireDiffClean(ctx, info.Path, canonical, diffCachedQuietArgs, "index"); err != nil {
+		return err
+	}
+	if err := w.requireDiffClean(ctx, info.Path, canonical, diffWorktreeQuietArgs, "worktree"); err != nil {
+		return err
+	}
+	status, err := w.run(ctx, w.binary, statusUntrackedAllArgs(info.Path)...)
+	if err != nil {
+		return fmt.Errorf("%w: read status: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		return fmt.Errorf("%w: worktree has tracked or untracked changes", ports.ErrWorkspaceExecutionBaseMismatch)
+	}
+	return nil
+}
+
+type diffQuietArgs func(string, string) []string
+
+func (w *Workspace) requireDiffClean(ctx context.Context, worktree, target string, argsFn diffQuietArgs, label string) error {
+	if _, err := w.run(ctx, w.binary, argsFn(worktree, target)...); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return fmt.Errorf("%w: %s differs from %s", ports.ErrWorkspaceExecutionBaseMismatch, label, target)
+		}
+		return fmt.Errorf("%w: inspect %s: %v", ports.ErrWorkspaceExecutionBaseMismatch, label, err)
+	}
+	return nil
 }
 
 func (w *Workspace) validateBranch(ctx context.Context, repo, branch string) error {

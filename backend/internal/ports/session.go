@@ -34,7 +34,11 @@ type SpawnConfig struct {
 	Kind         domain.SessionKind
 	Harness      domain.AgentHarness
 	Branch       string
-	Prompt       string
+	// ExecutionBaseSHA is an optional exact commit authority for the session's
+	// execution workspace. When present, the workspace adapter must materialize
+	// and admit the worktree at this commit before the agent launches.
+	ExecutionBaseSHA string
+	Prompt           string
 	// AgentConfig overrides the resolved project/role agent config for this
 	// single spawn. Empty fields keep the project defaults.
 	AgentConfig AgentConfig

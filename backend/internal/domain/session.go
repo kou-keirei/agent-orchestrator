@@ -76,11 +76,14 @@ type SessionMetadata struct {
 	Branch            string `json:"branch,omitempty"`
 	WorkspacePath     string `json:"workspacePath,omitempty"`
 	WorkspaceRepoPath string `json:"workspaceRepoPath,omitempty"`
-	DiffBaseSHA       string `json:"diffBaseSha,omitempty"`
-	DiffBaseRef       string `json:"diffBaseRef,omitempty"`
-	RuntimeHandleID   string `json:"runtimeHandleId,omitempty"`
-	RuntimeLaunchID   string `json:"runtimeLaunchId,omitempty"`
-	AgentSessionID    string `json:"agentSessionId,omitempty"`
+	// ExecutionBaseSHA is the exact commit AO authorized for execution. It is
+	// distinct from DiffBaseSHA, which remains comparison-only metadata.
+	ExecutionBaseSHA string `json:"executionBaseSha,omitempty"`
+	DiffBaseSHA      string `json:"diffBaseSha,omitempty"`
+	DiffBaseRef      string `json:"diffBaseRef,omitempty"`
+	RuntimeHandleID  string `json:"runtimeHandleId,omitempty"`
+	RuntimeLaunchID  string `json:"runtimeLaunchId,omitempty"`
+	AgentSessionID   string `json:"agentSessionId,omitempty"`
 	// AgentSessionIDLaunchID identifies the terminal runtime generation proven to
 	// own AgentSessionID. Usually that proof comes from a provider hook. A
 	// coordinated Chat-to-TUI handoff may also establish it by launching the

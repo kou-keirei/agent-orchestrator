@@ -41,6 +41,7 @@ var _ ports.WorkspaceDefaultBranchRefresher = (*Workspace)(nil)
 var _ ports.WorkspaceProject = (*Workspace)(nil)
 var _ ports.WorkspaceObserver = (*Workspace)(nil)
 var _ ports.WorkspaceReclaimer = (*Workspace)(nil)
+var _ ports.WorkspaceExecutionBaseAttester = (*Workspace)(nil)
 
 // New returns a router over git and scratch workspace implementations.
 func New(deps Deps) *Workspace {
@@ -144,6 +145,21 @@ func (w *Workspace) AddExclude(ctx context.Context, info ports.WorkspaceInfo, pa
 		return err
 	}
 	return adapter.AddExclude(ctx, info, patterns...)
+}
+
+// AttestExecutionBase delegates the exact execution-base admission to the
+// selected project adapter. Scratch workspaces have no commit authority and
+// are rejected by the session manager before reaching this method.
+func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.WorkspaceInfo) error {
+	adapter, err := w.adapterForProject(ctx, info.ProjectID)
+	if err != nil {
+		return err
+	}
+	attester, ok := adapter.(ports.WorkspaceExecutionBaseAttester)
+	if !ok {
+		return fmt.Errorf("%w: selected workspace adapter cannot attest", ports.ErrWorkspaceExecutionBaseUnsupported)
+	}
+	return attester.AttestExecutionBase(ctx, info)
 }
 
 // ObserveWorkspace delegates the read-only handoff snapshot to the selected

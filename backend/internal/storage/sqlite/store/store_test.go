@@ -93,6 +93,7 @@ func TestSessionPersistsDiffBaseMetadata(t *testing.T) {
 	ctx := context.Background()
 	seedProject(t, s, "mer")
 	rec := sampleRecord("mer")
+	rec.Metadata.ExecutionBaseSHA = "execution-base-1"
 	rec.Metadata.DiffBaseSHA = "base-sha-1"
 	rec.Metadata.DiffBaseRef = "main"
 
@@ -104,10 +105,11 @@ func TestSessionPersistsDiffBaseMetadata(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("get session: ok=%v err=%v", ok, err)
 	}
-	if got.Metadata.DiffBaseSHA != "base-sha-1" || got.Metadata.DiffBaseRef != "main" {
-		t.Fatalf("created diff base = sha:%q ref:%q", got.Metadata.DiffBaseSHA, got.Metadata.DiffBaseRef)
+	if got.Metadata.ExecutionBaseSHA != "execution-base-1" || got.Metadata.DiffBaseSHA != "base-sha-1" || got.Metadata.DiffBaseRef != "main" {
+		t.Fatalf("created base metadata = execution:%q diff-sha:%q diff-ref:%q", got.Metadata.ExecutionBaseSHA, got.Metadata.DiffBaseSHA, got.Metadata.DiffBaseRef)
 	}
 
+	got.Metadata.ExecutionBaseSHA = "execution-base-2"
 	got.Metadata.DiffBaseSHA = "base-sha-2"
 	got.Metadata.DiffBaseRef = "develop"
 	if err := s.UpdateSession(ctx, got); err != nil {
@@ -117,8 +119,8 @@ func TestSessionPersistsDiffBaseMetadata(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("get updated session: ok=%v err=%v", ok, err)
 	}
-	if updated.Metadata.DiffBaseSHA != "base-sha-2" || updated.Metadata.DiffBaseRef != "develop" {
-		t.Fatalf("updated diff base = sha:%q ref:%q", updated.Metadata.DiffBaseSHA, updated.Metadata.DiffBaseRef)
+	if updated.Metadata.ExecutionBaseSHA != "execution-base-2" || updated.Metadata.DiffBaseSHA != "base-sha-2" || updated.Metadata.DiffBaseRef != "develop" {
+		t.Fatalf("updated base metadata = execution:%q diff-sha:%q diff-ref:%q", updated.Metadata.ExecutionBaseSHA, updated.Metadata.DiffBaseSHA, updated.Metadata.DiffBaseRef)
 	}
 }
 

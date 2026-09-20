@@ -951,7 +951,9 @@ type fakeWorkspace struct {
 	calls []string
 	// sharedLog, when non-nil, receives entries alongside calls so ordering
 	// tests can compare workspace calls against store calls in one sequence.
-	sharedLog *[]string
+	sharedLog                 *[]string
+	executionBaseErr          error
+	executionBaseAttestations []ports.WorkspaceInfo
 }
 
 type fetchDefaultBranchCall struct {
@@ -1009,7 +1011,7 @@ func (w *fakeWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (po
 	if baseRef == "" {
 		baseRef = cfg.BaseBranch
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: w.createRepoPath}, nil
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: w.createRepoPath}, nil
 }
 func (w *fakeWorkspace) CreateWorkspaceProject(_ context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
 	if w.projectErr != nil {
@@ -1099,9 +1101,13 @@ func (w *fakeWorkspace) Restore(ctx context.Context, cfg ports.WorkspaceConfig) 
 			RepoPath:  cfg.RepoPath,
 		})
 		w.calls = append(w.calls, entry)
-		return ports.WorkspaceInfo{Path: cfg.Path, Branch: cfg.Branch, BaseRef: cfg.BaseRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: cfg.RepoPath}, nil
+		return ports.WorkspaceInfo{Path: cfg.Path, Branch: cfg.Branch, BaseRef: cfg.BaseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: cfg.RepoPath}, nil
 	}
 	return w.Create(ctx, cfg)
+}
+func (w *fakeWorkspace) AttestExecutionBase(_ context.Context, info ports.WorkspaceInfo) error {
+	w.executionBaseAttestations = append(w.executionBaseAttestations, info)
+	return w.executionBaseErr
 }
 func (w *fakeWorkspace) ForceDestroy(_ context.Context, info ports.WorkspaceInfo) error {
 	entry := "ForceDestroy:" + string(info.SessionID)
@@ -7602,10 +7608,11 @@ func TestRestoreAllCarriesConfiguredAndRecordedBaseToWorkspaceRestore(t *testing
 		Harness:      domain.HarnessClaudeCode,
 		IsTerminated: true,
 		Metadata: domain.SessionMetadata{
-			WorkspacePath:  "/ws/mer-1",
-			Branch:         "ao/mer-1/root",
-			DiffBaseRef:    "refs/remotes/origin/trunk",
-			AgentSessionID: "agent-w",
+			WorkspacePath:    "/ws/mer-1",
+			Branch:           "ao/mer-1/root",
+			ExecutionBaseSHA: "authorized-execution-base",
+			DiffBaseRef:      "refs/remotes/origin/trunk",
+			AgentSessionID:   "agent-w",
 		},
 		Activity: domain.Activity{State: domain.ActivityExited},
 	}
@@ -7626,6 +7633,41 @@ func TestRestoreAllCarriesConfiguredAndRecordedBaseToWorkspaceRestore(t *testing
 	}
 	if got := ws.restoreConfigs[0].BaseRef; got != "refs/remotes/origin/trunk" {
 		t.Fatalf("restore BaseRef = %q, want refs/remotes/origin/trunk", got)
+	}
+	if got := ws.restoreConfigs[0].ExecutionBaseSHA; got != "authorized-execution-base" {
+		t.Fatalf("restore ExecutionBaseSHA = %q, want authorized-execution-base", got)
+	}
+}
+
+func TestRestoreAllRejectsExecutionBaseMismatchBeforeRuntimeLaunch(t *testing.T) {
+	m, st, rt, ws := newLifecycleManager()
+	ws.executionBaseErr = ports.ErrWorkspaceExecutionBaseMismatch
+	st.sessions["mer-1"] = domain.SessionRecord{
+		ID:           "mer-1",
+		ProjectID:    "mer",
+		Kind:         domain.KindWorker,
+		Harness:      domain.HarnessClaudeCode,
+		IsTerminated: true,
+		Metadata: domain.SessionMetadata{
+			WorkspacePath:    "/ws/mer-1",
+			Branch:           "ao/mer-1/root",
+			ExecutionBaseSHA: "authorized-execution-base",
+			AgentSessionID:   "agent-w",
+		},
+		Activity: domain.Activity{State: domain.ActivityExited},
+	}
+	st.worktrees["mer-1"] = []domain.SessionWorktreeRecord{{
+		SessionID: "mer-1", RepoName: domain.RootWorkspaceRepoName, State: "removed",
+	}}
+
+	if err := m.RestoreAll(ctx); err != nil {
+		t.Fatalf("RestoreAll err = %v", err)
+	}
+	if rt.created != 0 {
+		t.Fatalf("runtime creates = %d, want 0 after exact-base rejection", rt.created)
+	}
+	if len(ws.executionBaseAttestations) != 1 || ws.executionBaseAttestations[0].ExecutionBaseSHA != "authorized-execution-base" {
+		t.Fatalf("execution-base attestations = %#v, want one persisted authority", ws.executionBaseAttestations)
 	}
 }
 

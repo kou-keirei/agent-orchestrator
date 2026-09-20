@@ -120,6 +120,18 @@ func revParseHeadArgs(worktree string) []string {
 	return []string{"-C", worktree, "rev-parse", "--verify", "HEAD"}
 }
 
+func diffCachedQuietArgs(worktree, target string) []string {
+	return []string{"-C", worktree, "diff", "--quiet", "--cached", target, "--"}
+}
+
+func diffWorktreeQuietArgs(worktree, target string) []string {
+	return []string{"-C", worktree, "diff", "--quiet", target, "--"}
+}
+
+func statusUntrackedAllArgs(worktree string) []string {
+	return []string{"-C", worktree, "status", "--porcelain", "--untracked-files=all"}
+}
+
 // cherryPickNoCommitArgs applies a single commit's diff onto the current
 // working tree via a true three-way merge without committing or moving HEAD.
 // git cherry-pick --no-commit computes the diff between <sha> and its parent

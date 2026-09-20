@@ -369,6 +369,13 @@ type WorkspaceObserver interface {
 	ObserveWorkspace(ctx context.Context, info WorkspaceInfo) (WorkspaceObservation, error)
 }
 
+// WorkspaceExecutionBaseAttester is an optional capability for adapters that
+// can prove an exact execution base. The session manager uses it as the final
+// pre-launch gate after adapter-owned creation or restore.
+type WorkspaceExecutionBaseAttester interface {
+	AttestExecutionBase(ctx context.Context, info WorkspaceInfo) error
+}
+
 // WorkspaceObservation is a bounded, provider-neutral snapshot of one
 // materialized workspace. Git-backed adapters populate repository facts;
 // scratch adapters return the path with Git fields empty.
@@ -459,6 +466,12 @@ var (
 	// conflict markers for manual resolution. Adapters wrap this sentinel via
 	// fmt.Errorf so callers can match it with errors.Is.
 	ErrPreservedConflict = errors.New("workspace: preserved apply produced conflicts")
+	// ErrWorkspaceExecutionBaseMismatch means an exact execution-base authority
+	// could not be proven for the materialized worktree.
+	ErrWorkspaceExecutionBaseMismatch = errors.New("workspace: exact execution base admission failed")
+	// ErrWorkspaceExecutionBaseUnsupported means the selected workspace shape or
+	// adapter cannot honor an exact execution-base authority.
+	ErrWorkspaceExecutionBaseUnsupported = errors.New("workspace: exact execution base is unsupported")
 	// ErrRuntimePrerequisite reports a missing host prerequisite for the selected
 	// runtime before a session can be created.
 	ErrRuntimePrerequisite = errors.New("runtime: prerequisite missing")
@@ -505,6 +518,9 @@ type WorkspaceConfig struct {
 	RepoPath string
 	// Path optionally supplies an existing managed worktree path for restore.
 	Path string
+	// ExecutionBaseSHA is an optional exact commit authority. It is never used
+	// as comparison metadata and must be proven by the adapter before launch.
+	ExecutionBaseSHA string
 }
 
 // WorkspaceInfo describes a created workspace — where it lives and its branch.
@@ -513,9 +529,12 @@ type WorkspaceInfo struct {
 	Branch string
 	// BaseRef is the repository-default ref selected for session comparisons.
 	// It can differ from the remote session ref used to seed the worktree.
-	BaseRef   string
-	SessionID domain.SessionID
-	ProjectID domain.ProjectID
+	BaseRef string
+	// ExecutionBaseSHA is the exact commit authority admitted for this
+	// worktree, when requested.
+	ExecutionBaseSHA string
+	SessionID        domain.SessionID
+	ProjectID        domain.ProjectID
 	// RepoPath optionally overrides ProjectID-based repo resolution. It is used
 	// when the normal workspace lifecycle primitives operate on one child repo
 	// inside a workspace project.

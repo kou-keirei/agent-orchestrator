@@ -1009,6 +1009,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 		prompt = appendAttachmentReferences(prompt, refs)
 	}
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
+	}
 
 	// Everything above is shared: project, harness, prompts, seed row, worktree,
 	// provisioning, attachments. From here the two modes launch different
@@ -1044,6 +1048,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	m.augmentAgentRuntimeEnv(agent, env)
 	pinRuntimePermissionEnv(env, adapterConfig.Permissions)
 	if err := m.prepareWorkspace(ctx, agent, id, ws.Path, systemPrompt, systemPromptFile, adapterConfig, env); err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnPrepare, err)
+	}
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnPrepare, err)
 	}
@@ -1113,6 +1121,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
+		ExecutionBaseSHA:          firstNonEmptyString(ws.ExecutionBaseSHA, strings.TrimSpace(cfg.ExecutionBaseSHA)),
 		RuntimeHandleID:           handle.ID,
 		RuntimeLaunchID:           launchID,
 		Prompt:                    prompt,
@@ -1361,20 +1370,30 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 	if cfg.ProjectID == "" {
 		projectKind = domain.ProjectKindScratch
 	}
+	if strings.TrimSpace(cfg.ExecutionBaseSHA) != "" && projectKind != domain.ProjectKindSingleRepo {
+		return ports.WorkspaceInfo{}, nil, fmt.Errorf("%w: exact execution base requires a single-repository Git workspace", ports.ErrWorkspaceExecutionBaseUnsupported)
+	}
 	if projectKind != domain.ProjectKindWorkspace {
 		baseBranch := project.Config.WorktreeBaseBranch()
 		if projectKind == domain.ProjectKindScratch {
 			baseBranch = ""
 		}
 		ws, err := m.workspace.Create(ctx, ports.WorkspaceConfig{
-			ProjectID:     cfg.ProjectID,
-			SessionID:     id,
-			Kind:          cfg.Kind,
-			SessionPrefix: sessionPrefix(project),
-			Branch:        branch,
-			BaseBranch:    baseBranch,
-			BaseRef:       baseRefs[filepath.Clean(project.Path)],
+			ProjectID:        cfg.ProjectID,
+			SessionID:        id,
+			Kind:             cfg.Kind,
+			SessionPrefix:    sessionPrefix(project),
+			Branch:           branch,
+			BaseBranch:       baseBranch,
+			BaseRef:          baseRefs[filepath.Clean(project.Path)],
+			ExecutionBaseSHA: strings.TrimSpace(cfg.ExecutionBaseSHA),
 		})
+		if err == nil && strings.TrimSpace(cfg.ExecutionBaseSHA) != "" {
+			ws.ExecutionBaseSHA = firstNonEmptyString(ws.ExecutionBaseSHA, strings.TrimSpace(cfg.ExecutionBaseSHA))
+			if err := m.admitExecutionBase(ctx, ws); err != nil {
+				return ports.WorkspaceInfo{}, nil, err
+			}
+		}
 		return ws, nil, err
 	}
 	workspaceProject, ok := m.workspace.(ports.WorkspaceProject)
@@ -2397,10 +2416,13 @@ func (m *Manager) resumeAgentRecordWithReservedGeneration(
 		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, ErrIncompleteHandle)
 	}
 	ws := ports.WorkspaceInfo{
-		Path:      meta.WorkspacePath,
-		Branch:    meta.Branch,
-		SessionID: rec.ID,
-		ProjectID: rec.ProjectID,
+		Path:             meta.WorkspacePath,
+		Branch:           meta.Branch,
+		BaseRef:          meta.DiffBaseRef,
+		ExecutionBaseSHA: meta.ExecutionBaseSHA,
+		SessionID:        rec.ID,
+		ProjectID:        rec.ProjectID,
+		RepoPath:         meta.WorkspaceRepoPath,
 	}
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
 		return m.relaunchSessionWithPolicyAndGeneration(ctx, operation, rec, project, ws, nil, forceFresh, requireNativeHistory, reservedGeneration, domain.SessionInterfaceTransitionHistoryStrict)
@@ -2494,6 +2516,10 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	if err := m.prepareWorkspace(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, err)
 	}
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
+		m.cleanupSystemPromptDir(rec.ID)
+		return RestoreResult{}, fmt.Errorf("%s %s: execution base: %w", operation, rec.ID, err)
+	}
 	var argv []string
 	var delivery ports.PromptDeliveryStrategy
 	var mode RestoreMode
@@ -2559,6 +2585,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 		Branch:                    ws.Branch,
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
+		ExecutionBaseSHA:          rec.Metadata.ExecutionBaseSHA,
 		RuntimeHandleID:           handle.ID,
 		RuntimeLaunchID:           launchID,
 		AgentSessionID:            rec.Metadata.AgentSessionID,
@@ -3180,14 +3207,15 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 		} else {
 			var restoreErr error
 			ws, restoreErr = m.workspace.Restore(ctx, ports.WorkspaceConfig{
-				ProjectID:     rec.ProjectID,
-				SessionID:     rec.ID,
-				Kind:          rec.Kind,
-				SessionPrefix: sessionPrefix(project),
-				Branch:        rec.Metadata.Branch,
-				BaseBranch:    project.Config.WorktreeBaseBranch(),
-				BaseRef:       rec.Metadata.DiffBaseRef,
-				Path:          rec.Metadata.WorkspacePath,
+				ProjectID:        rec.ProjectID,
+				SessionID:        rec.ID,
+				Kind:             rec.Kind,
+				SessionPrefix:    sessionPrefix(project),
+				Branch:           rec.Metadata.Branch,
+				BaseBranch:       project.Config.WorktreeBaseBranch(),
+				BaseRef:          rec.Metadata.DiffBaseRef,
+				Path:             rec.Metadata.WorkspacePath,
+				ExecutionBaseSHA: rec.Metadata.ExecutionBaseSHA,
 			})
 			if restoreErr != nil {
 				m.logger.Error("restore-all: workspace restore failed", "sessionID", rec.ID, "error", restoreErr)
@@ -3292,14 +3320,15 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
 	if projectKindForSession(project, rec.ProjectID) != domain.ProjectKindWorkspace {
 		ws, err := m.workspace.Restore(ctx, ports.WorkspaceConfig{
-			ProjectID:     rec.ProjectID,
-			SessionID:     rec.ID,
-			Kind:          rec.Kind,
-			SessionPrefix: sessionPrefix(project),
-			Branch:        rec.Metadata.Branch,
-			BaseBranch:    project.Config.WorktreeBaseBranch(),
-			BaseRef:       rec.Metadata.DiffBaseRef,
-			Path:          rec.Metadata.WorkspacePath,
+			ProjectID:        rec.ProjectID,
+			SessionID:        rec.ID,
+			Kind:             rec.Kind,
+			SessionPrefix:    sessionPrefix(project),
+			Branch:           rec.Metadata.Branch,
+			BaseBranch:       project.Config.WorktreeBaseBranch(),
+			BaseRef:          rec.Metadata.DiffBaseRef,
+			Path:             rec.Metadata.WorkspacePath,
+			ExecutionBaseSHA: rec.Metadata.ExecutionBaseSHA,
 		})
 		if err != nil {
 			return ports.WorkspaceInfo{}, err
@@ -4057,9 +4086,10 @@ func seedRecord(cfg ports.SpawnConfig, projectConfig domain.ProjectConfig, now t
 		// statement that can change it afterwards.
 		Mode: domain.NormalizeSessionMode(cfg.RequestedMode),
 		Metadata: domain.SessionMetadata{
-			Permissions:    agentConfig.Permissions,
-			Effort:         agentConfig.Effort,
-			EffortResolved: true,
+			Permissions:      agentConfig.Permissions,
+			Effort:           agentConfig.Effort,
+			EffortResolved:   true,
+			ExecutionBaseSHA: strings.TrimSpace(cfg.ExecutionBaseSHA),
 		},
 		AutoReviewEnabled: projectConfig.AutoReview,
 		AutoInjectReview:  true,
@@ -5212,13 +5242,25 @@ func runtimeHandle(meta domain.SessionMetadata) ports.RuntimeHandle {
 
 func workspaceInfo(rec domain.SessionRecord) ports.WorkspaceInfo {
 	return ports.WorkspaceInfo{
-		Path:      rec.Metadata.WorkspacePath,
-		Branch:    rec.Metadata.Branch,
-		BaseRef:   rec.Metadata.DiffBaseRef,
-		SessionID: rec.ID,
-		ProjectID: rec.ProjectID,
-		RepoPath:  rec.Metadata.WorkspaceRepoPath,
+		Path:             rec.Metadata.WorkspacePath,
+		Branch:           rec.Metadata.Branch,
+		BaseRef:          rec.Metadata.DiffBaseRef,
+		ExecutionBaseSHA: rec.Metadata.ExecutionBaseSHA,
+		SessionID:        rec.ID,
+		ProjectID:        rec.ProjectID,
+		RepoPath:         rec.Metadata.WorkspaceRepoPath,
 	}
+}
+
+func (m *Manager) admitExecutionBase(ctx context.Context, info ports.WorkspaceInfo) error {
+	if strings.TrimSpace(info.ExecutionBaseSHA) == "" {
+		return nil
+	}
+	attester, ok := m.workspace.(ports.WorkspaceExecutionBaseAttester)
+	if !ok {
+		return fmt.Errorf("%w: selected workspace adapter cannot attest %q", ports.ErrWorkspaceExecutionBaseUnsupported, info.ExecutionBaseSHA)
+	}
+	return attester.AttestExecutionBase(ctx, info)
 }
 
 func workspaceInfoFromRepoInfo(info ports.WorkspaceRepoInfo) ports.WorkspaceInfo {
