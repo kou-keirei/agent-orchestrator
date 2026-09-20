@@ -1578,7 +1578,7 @@ func effectiveAgentConfig(harness domain.AgentHarness, kind domain.SessionKind, 
 	if harnessMatches && override.Model != "" {
 		merged.Model = override.Model
 	}
-	if override.Effort != "" {
+	if harnessMatches && override.Effort != "" {
 		merged.Effort = override.Effort
 	}
 	if harnessMatches && override.Mode != "" {

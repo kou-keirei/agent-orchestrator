@@ -28,6 +28,23 @@ import (
 
 var ctx = context.Background()
 
+func TestEffectiveAgentConfigGuardsRoleEffortByHarness(t *testing.T) {
+	cfg := domain.ProjectConfig{
+		AgentConfig: domain.AgentConfig{Effort: "medium"},
+		Worker: domain.RoleOverride{
+			Harness:     domain.HarnessCodex,
+			AgentConfig: domain.AgentConfig{Effort: "high"},
+		},
+	}
+
+	if got := effectiveAgentConfig(domain.HarnessCodex, domain.KindWorker, cfg).Effort; got != "high" {
+		t.Fatalf("matching-harness effort = %q, want high", got)
+	}
+	if got := effectiveAgentConfig(domain.HarnessAider, domain.KindWorker, cfg).Effort; got != "medium" {
+		t.Fatalf("mismatched-harness effort = %q, want base effort medium", got)
+	}
+}
+
 type fakeStore struct {
 	sessions         map[domain.SessionID]domain.SessionRecord
 	pr               map[domain.SessionID]domain.PRFacts
