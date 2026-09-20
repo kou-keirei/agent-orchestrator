@@ -316,6 +316,9 @@ func (m *Manager) resumeChatController(
 	controllerGeneration string,
 	historyPolicy domain.SessionInterfaceTransitionHistoryPolicy,
 ) (RestoreResult, error) {
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
+		return RestoreResult{}, fmt.Errorf("%s %s: execution base: %w", operation, rec.ID, err)
+	}
 	if m.chat == nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: %w: chat mode is not available in this build",
 			operation, rec.ID, ports.ErrChatUnsupported)

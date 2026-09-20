@@ -4663,6 +4663,7 @@ func TestReconcileChatAgentSwitchTargetReadyRestoresFinalizedContinuationBeforeR
 	rec.Metadata.AgentSessionID = targetNative.NativeSessionID
 	rec.Metadata.ProviderConversationID = targetNative.NativeSessionID
 	rec.Metadata.ControllerGeneration = string(sw.TargetGenerationID)
+	rec.Metadata.ExecutionBaseSHA = "authorized-execution-base"
 	store.sessions[rec.ID] = rec
 
 	if err := manager.ReconcileAgentSwitches(context.Background()); err != nil {
@@ -4691,6 +4692,38 @@ func TestReconcileChatAgentSwitchTargetReadyRestoresFinalizedContinuationBeforeR
 	}
 	if manager.SessionMutationInProgress(rec.ID) {
 		t.Fatal("recovered target-ready Chat switch left the mutation gate closed")
+	}
+}
+
+func TestRollbackStoppedChatAgentSwitchRejectsExecutionBaseBeforeProviderResume(t *testing.T) {
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	workspace := manager.workspace.(switchTestWorkspace)
+	workspace.executionBaseErr = ports.ErrWorkspaceExecutionBaseMismatch
+	source := manager.agents.(switchTestAgents)[domain.HarnessClaudeCode].(*switchTestAgent)
+	launcher := &switchAgentChatLauncher{recordingLauncher: &recordingLauncher{}, store: store}
+	manager.chat = launcher
+
+	rec := store.sessions["proj-1"]
+	rec.Mode = domain.SessionModeChat
+	rec.Metadata.RuntimeHandleID = ""
+	rec.Metadata.RuntimeLaunchID = ""
+	rec.Metadata.ProviderConversationID = "source-chat-native"
+	rec.Metadata.ControllerGeneration = "source-chat-generation"
+	rec.Metadata.ExecutionBaseSHA = "authorized-B"
+	store.sessions[rec.ID] = rec
+
+	err := manager.rollbackStoppedChatAgentSwitchSource(context.Background(), rec, store.projects[string(rec.ProjectID)])
+	if !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("rollback error = %v, want exact-base mismatch", err)
+	}
+	if len(launcher.started) != 0 {
+		t.Fatalf("provider starts = %d, want 0 after exact-base rejection", len(launcher.started))
+	}
+	if source.hookCalls != 0 {
+		t.Fatalf("source workspace hook calls = %d, want 0 before admission", source.hookCalls)
+	}
+	if len(workspace.executionBaseAttestations) != 1 || workspace.executionBaseAttestations[0].ExecutionBaseSHA != "authorized-B" {
+		t.Fatalf("execution-base attestations = %#v, want persisted authority", workspace.executionBaseAttestations)
 	}
 }
 

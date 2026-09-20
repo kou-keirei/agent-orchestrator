@@ -273,7 +273,7 @@ func TestReconcileLive_ChatRelaunchesInExistingWorktree(t *testing.T) {
 		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
 		Metadata: domain.SessionMetadata{
 			Branch: "ao/mer-1/root", WorkspacePath: "/ws/mer-1",
-			ProviderConversationID: "thread-existing",
+			ProviderConversationID: "thread-existing", ExecutionBaseSHA: "authorized-execution-base",
 		},
 	}
 	st.sessions[rec.ID] = rec
@@ -295,6 +295,36 @@ func TestReconcileLive_ChatRelaunchesInExistingWorktree(t *testing.T) {
 	}
 	if len(ws.restoreConfigs) != 1 || ws.restoreConfigs[0].Path != rec.Metadata.WorkspacePath {
 		t.Fatalf("Restore configs = %+v, want existing Chat worktree", ws.restoreConfigs)
+	}
+	if len(ws.executionBaseAttestations) != 1 || ws.executionBaseAttestations[0].ExecutionBaseSHA != "authorized-execution-base" {
+		t.Fatalf("execution-base attestations = %#v, want matching Chat recovery admission", ws.executionBaseAttestations)
+	}
+}
+
+func TestReconcileLive_ChatExecutionBaseMismatchStopsBeforeProviderResume(t *testing.T) {
+	launcher := &recordingLauncher{}
+	m, st, _ := newChatManager(launcher)
+	ws := m.workspace.(*fakeWorkspace)
+	ws.executionBaseErr = ports.ErrWorkspaceExecutionBaseMismatch
+	rec := domain.SessionRecord{
+		ID: "mer-1", ProjectID: chatTestProject, Kind: domain.KindWorker,
+		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+		Metadata: domain.SessionMetadata{
+			Branch: "ao/mer-1/root", WorkspacePath: "/ws/mer-1",
+			ProviderConversationID: "thread-existing", ExecutionBaseSHA: "authorized-B",
+		},
+	}
+	st.sessions[rec.ID] = rec
+
+	err := m.reconcileLive(context.Background(), rec)
+	if !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("reconcileLive error = %v, want exact-base mismatch", err)
+	}
+	if len(launcher.started) != 0 {
+		t.Fatalf("provider starts = %d, want 0 after exact-base rejection", len(launcher.started))
+	}
+	if len(ws.executionBaseAttestations) != 1 || ws.executionBaseAttestations[0].ExecutionBaseSHA != "authorized-B" {
+		t.Fatalf("execution-base attestations = %#v, want persisted authority", ws.executionBaseAttestations)
 	}
 }
 

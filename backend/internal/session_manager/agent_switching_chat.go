@@ -653,6 +653,11 @@ func (m *Manager) rollbackStoppedChatAgentSwitchSource(
 	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
 	m.augmentAgentRuntimeEnv(sourceAgent, env)
 	pinRuntimePermissionEnv(env, agentConfig.Permissions)
+	ws := workspaceInfo(current)
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
+		m.cleanupSystemPromptDir(rec.ID)
+		return err
+	}
 	if err := m.prepareWorkspace(
 		ctx, sourceAgent, rec.ID, rec.Metadata.WorkspacePath,
 		systemPrompt, systemPromptFile, agentConfig, env,
@@ -661,7 +666,7 @@ func (m *Manager) rollbackStoppedChatAgentSwitchSource(
 	}
 	_, err = m.resumeChatController(
 		ctx, "restore failed agent switch", current, project,
-		workspaceInfo(current), false, "", domain.SessionInterfaceTransitionHistoryStrict,
+		ws, false, "", domain.SessionInterfaceTransitionHistoryStrict,
 	)
 	return err
 }
