@@ -357,6 +357,47 @@ func TestCodexReadOnlyProofRejectsStalePermissionResponse(t *testing.T) {
 	}
 }
 
+func TestCodexReadOnlyProofRejectsResponseAfterReattach(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only"}}`))
+
+	// The provider response arrives after AO has attached a replacement
+	// controller. The old request must not be relabeled with the new fence.
+	h.clientGeneration++
+	h.runtimeGeneration = "runtime-2"
+	h.controllerGeneration = "controller-2"
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`))
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("late response from the previous attachment restored read-only proof")
+	}
+}
+
+func TestCodexReadOnlyProofKeepsRequestGenerations(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only"}}`))
+	h.runtimeGeneration = "runtime-2"
+	h.controllerGeneration = "controller-2"
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`))
+
+	receipt, ok := h.codexReadOnly["thread-1"]
+	if !ok || receipt.runtimeGeneration != "runtime-1" || receipt.controllerGeneration != "controller-1" {
+		t.Fatalf("receipt generations = %+v (ok=%v), want request-time generations", receipt, ok)
+	}
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("receipt from an old AO generation was relabeled as current proof")
+	}
+}
+
+func TestCodexReadOnlyProofMissingRuntimeGenerationFailsClosed(t *testing.T) {
+	h := newCodexEvidenceHost()
+	h.runtimeGeneration = ""
+	h.observeCodexRequest([]byte(`{"id":1,"method":"thread/resume","params":{"threadId":"thread-1","approvalPolicy":"never","sandbox":"read-only"}}`))
+	h.observeCodexReadOnly([]byte(`{"id":1,"result":{"thread":{"id":"thread-1"},"approvalPolicy":"never","sandbox":{"type":"readOnly"}}}`))
+	if _, ok := codexReadOnlyProofFor(h, "thread-1"); ok {
+		t.Fatal("read-only proof with no AO runtime generation passed the evidence floor")
+	}
+}
+
 func TestHostRetainsTypedCodexReadOnlyProofAcrossAttachments(t *testing.T) {
 	cfg := Config{
 		SessionID: "typed-proof-host", RuntimeGeneration: "runtime-1", ControllerGeneration: "controller-1", DataDir: t.TempDir(), Workdir: t.TempDir(),

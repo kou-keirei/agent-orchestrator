@@ -639,8 +639,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 	h := &host{
 		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token,
-		sessionID: cfg.SessionID, runtimeGeneration: token,
-		detached: make([][]byte, 0, 64), pendingRequests: make(map[string]*pendingRequest),
+		sessionID: cfg.SessionID, runtimeGeneration: cfg.RuntimeGeneration,
+		controllerGeneration: cfg.ControllerGeneration,
+		detached:             make([][]byte, 0, 64), pendingRequests: make(map[string]*pendingRequest),
 		codexReadOnly:         make(map[string]codexReadOnlyReceipt),
 		codexPermissions:      make(map[string]codexPermissionRequest),
 		codexThreadGeneration: make(map[string]uint64),
@@ -726,12 +727,15 @@ type pendingRequest struct {
 }
 
 type codexPermissionRequest struct {
-	method             string
-	threadID           string
-	threadIDRequired   bool
-	readOnly           bool
-	permissionProvided bool
-	generation         uint64
+	method               string
+	threadID             string
+	threadIDRequired     bool
+	readOnly             bool
+	permissionProvided   bool
+	generation           uint64
+	clientGeneration     uint64
+	runtimeGeneration    string
+	controllerGeneration string
 }
 
 type codexReadOnlyReceipt struct {
@@ -1036,12 +1040,15 @@ func (h *host) observeCodexRequest(frame []byte) {
 	}
 
 	h.codexPermissions[string(value.ID)] = codexPermissionRequest{
-		method:             value.Method,
-		threadID:           threadID,
-		threadIDRequired:   threadIDRequired,
-		readOnly:           posture.readOnly,
-		permissionProvided: posture.provided,
-		generation:         generation,
+		method:               value.Method,
+		threadID:             threadID,
+		threadIDRequired:     threadIDRequired,
+		readOnly:             posture.readOnly,
+		permissionProvided:   posture.provided,
+		generation:           generation,
+		clientGeneration:     h.clientGeneration,
+		runtimeGeneration:    h.runtimeGeneration,
+		controllerGeneration: h.controllerGeneration,
 	}
 }
 
@@ -1066,6 +1073,12 @@ func (h *host) observeCodexReadOnly(frame []byte) {
 		return
 	}
 	delete(h.codexPermissions, requestID)
+	if request.clientGeneration != h.clientGeneration {
+		// A response belonging to an attachment that has already been replaced
+		// must not affect the current attachment, even when the provider reuses
+		// the same request id or the AO generations happen to be unchanged.
+		return
+	}
 	if len(value.Error) > 0 {
 		// Presence itself is enough to fail closed; a malformed/null error is
 		// not a successful provider posture receipt either.
@@ -1102,7 +1115,7 @@ func (h *host) observeCodexReadOnly(frame []byte) {
 	h.codexReadOnly[threadID] = codexReadOnlyReceipt{
 		threadID: threadID, generation: request.generation,
 		approvalPolicy: approvalPolicy, sandbox: sandbox,
-		runtimeGeneration: h.runtimeGeneration, controllerGeneration: h.controllerGeneration,
+		runtimeGeneration: request.runtimeGeneration, controllerGeneration: request.controllerGeneration,
 	}
 }
 
@@ -1138,8 +1151,8 @@ func (h *host) observeCodexTurnResponseLocked(request codexPermissionRequest, ra
 	receipt.threadID = request.threadID
 	receipt.turnID = turn.ID
 	receipt.generation = request.generation
-	receipt.runtimeGeneration = h.runtimeGeneration
-	receipt.controllerGeneration = h.controllerGeneration
+	receipt.runtimeGeneration = request.runtimeGeneration
+	receipt.controllerGeneration = request.controllerGeneration
 	h.codexReadOnly[request.threadID] = receipt
 }
 
@@ -1209,7 +1222,7 @@ func (h *host) codexReadOnlySnapshotLocked() []CodexReadOnlyProof {
 			ThreadID:                   receipt.threadID,
 			TurnID:                     receipt.turnID,
 			RuntimeGeneration:          receipt.runtimeGeneration,
-			ControllerGeneration:       h.controllerGeneration,
+			ControllerGeneration:       receipt.controllerGeneration,
 			PermissionConfigGeneration: receipt.generation,
 			ApprovalPolicy:             receipt.approvalPolicy,
 			Sandbox:                    receipt.sandbox,
