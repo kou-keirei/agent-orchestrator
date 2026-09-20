@@ -356,6 +356,9 @@ func (m *Manager) executeChatAgentSwitch(
 		return result, fmt.Errorf("switch Chat agent %s: target system prompt file: %w", id, err)
 	}
 	recorder.boundary(domain.AgentSwitchFailureTargetWorkspacePrepare)
+	if err := m.admitExecutionBase(ctx, workspaceInfo(stoppedSession)); err != nil {
+		return result, fmt.Errorf("switch Chat agent %s: execution base: %w", id, err)
+	}
 	if err := m.prepareWorkspace(
 		ctx, targetAgent, rec.ID, rec.Metadata.WorkspacePath,
 		finalSystemPrompt, systemPromptFile, agentConfig, targetSetupEnv,

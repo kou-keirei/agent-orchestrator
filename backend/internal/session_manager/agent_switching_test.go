@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -882,6 +884,15 @@ type switchTestWorkspace struct {
 	onObserve func()
 }
 
+type switchExecutionBaseWorkspace struct {
+	switchTestWorkspace
+	attester ports.WorkspaceExecutionBaseAttester
+}
+
+func (w switchExecutionBaseWorkspace) AttestExecutionBase(ctx context.Context, info ports.WorkspaceInfo) error {
+	return w.attester.AttestExecutionBase(ctx, info)
+}
+
 func (w switchTestWorkspace) ObserveWorkspace(_ context.Context, info ports.WorkspaceInfo) (ports.WorkspaceObservation, error) {
 	if w.onObserve != nil {
 		w.onObserve()
@@ -1075,6 +1086,153 @@ func TestSwitchAgentAdmitsChatSessionWithoutRuntimeHandle(t *testing.T) {
 	}
 	if sw.SourceGenerationID != domain.AgentGenerationID(rec.Metadata.ControllerGeneration) {
 		t.Fatalf("source generation = %q, want controller generation %q", sw.SourceGenerationID, rec.Metadata.ControllerGeneration)
+	}
+}
+
+func runSwitchGit(t *testing.T, git, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.CommandContext(context.Background(), git, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func newSwitchExecutionBaseFixture(t *testing.T, head string) (ports.WorkspaceExecutionBaseAttester, string, string, string, string) {
+	t.Helper()
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runSwitchGit(t, git, repo, "init", "-b", "main")
+	runSwitchGit(t, git, repo, "config", "user.email", "ao@example.com")
+	runSwitchGit(t, git, repo, "config", "user.name", "AO Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("A\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runSwitchGit(t, git, repo, "add", "README.md")
+	runSwitchGit(t, git, repo, "commit", "-m", "A")
+	a := runSwitchGit(t, git, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("B\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runSwitchGit(t, git, repo, "add", "README.md")
+	runSwitchGit(t, git, repo, "commit", "-m", "B")
+	b := runSwitchGit(t, git, repo, "rev-parse", "HEAD")
+	if head == "" {
+		head = a
+	}
+	workspacePath := filepath.Join(root, "workspace")
+	runSwitchGit(t, git, repo, "worktree", "add", "--detach", workspacePath, head)
+	workspace, err := gitworktree.New(gitworktree.Options{
+		Binary: git, ManagedRoot: filepath.Join(root, "managed"),
+		RepoResolver: gitworktree.StaticRepoResolver{"proj": repo},
+	})
+	if err != nil {
+		t.Fatalf("new git workspace: %v", err)
+	}
+	return workspace, repo, workspacePath, a, b
+}
+
+func configureNormalChatSwitch(t *testing.T, manager *Manager, store *switchTestStore, workspace, repo, executionBase string, attester ports.WorkspaceExecutionBaseAttester) (*switchTestAgent, *switchAgentChatLauncher) {
+	t.Helper()
+	rec := store.sessions["proj-1"]
+	rec.Mode = domain.SessionModeChat
+	rec.Activity = domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Now().UTC()}
+	rec.Metadata.RuntimeHandleID = ""
+	rec.Metadata.RuntimeLaunchID = ""
+	rec.Metadata.AgentSessionID = ""
+	rec.Metadata.ProviderConversationID = "source-chat-native"
+	rec.Metadata.ControllerGeneration = "source-chat-generation"
+	rec.Metadata.WorkspacePath = workspace
+	rec.Metadata.WorkspaceRepoPath = repo
+	rec.Metadata.ExecutionBaseSHA = executionBase
+	store.sessions[rec.ID] = rec
+	target := manager.agents.(switchTestAgents)[domain.HarnessCodex].(*switchTestAgent)
+	launcher := &switchAgentChatLauncher{
+		recordingLauncher: &recordingLauncher{}, store: store, live: true,
+	}
+	manager.chat = launcher
+	if attester != nil {
+		baseWorkspace := manager.workspace.(switchTestWorkspace)
+		manager.workspace = switchExecutionBaseWorkspace{
+			switchTestWorkspace: baseWorkspace,
+			attester:            attester,
+		}
+	}
+	return target, launcher
+}
+
+func TestSwitchAgentChatTargetSwitchRejectsExecutionBaseMismatchBeforePrepare(t *testing.T) {
+	attester, repo, workspace, effectiveA, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	target, launcher := configureNormalChatSwitch(t, manager, store, workspace, repo, authorizedB, attester)
+	// The fixture worktree is deliberately at A while the session authorizes B.
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	if got := runSwitchGit(t, git, workspace, "rev-parse", "HEAD"); got != effectiveA {
+		t.Fatalf("fixture HEAD = %s, want effective A %s", got, effectiveA)
+	}
+
+	_, err = switchAgentSynchronously(context.Background(), manager, "proj-1", SwitchAgentConfig{
+		TargetHarness: domain.HarnessCodex, IdempotencyKey: "chat-execution-base-mismatch",
+	})
+	if !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("SwitchAgent error = %v, want exact-base mismatch", err)
+	}
+	if target.hookCalls != 0 {
+		t.Fatalf("target prepareWorkspace hook calls = %d, want 0", target.hookCalls)
+	}
+	if len(launcher.started) != 0 {
+		t.Fatalf("target Chat starts = %d, want 0", len(launcher.started))
+	}
+}
+
+func TestSwitchAgentChatTargetSwitchAdmitsMatchingExecutionBase(t *testing.T) {
+	attester, repo, workspace, _, authorizedB := newSwitchExecutionBaseFixture(t, "")
+	// Recreate the worktree at B for the legitimate matching case.
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git is unavailable: %v", err)
+	}
+	runSwitchGit(t, git, repo, "worktree", "remove", "--force", workspace)
+	runSwitchGit(t, git, repo, "worktree", "add", "--detach", workspace, authorizedB)
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	target, launcher := configureNormalChatSwitch(t, manager, store, workspace, repo, authorizedB, attester)
+
+	if _, err := switchAgentSynchronously(context.Background(), manager, "proj-1", SwitchAgentConfig{
+		TargetHarness: domain.HarnessCodex, IdempotencyKey: "chat-execution-base-match",
+	}); err != nil {
+		t.Fatalf("SwitchAgent: %v", err)
+	}
+	if target.hookCalls != 1 {
+		t.Fatalf("target prepareWorkspace hook calls = %d, want 1", target.hookCalls)
+	}
+	if len(launcher.started) != 1 {
+		t.Fatalf("target Chat starts = %d, want 1", len(launcher.started))
+	}
+}
+
+func TestSwitchAgentChatTargetSwitchWithoutExecutionBasePreservesLegacyBehavior(t *testing.T) {
+	manager, store, _ := newSwitchTestManager(t, &fakeRestartRuntime{fakeRuntime: &fakeRuntime{}})
+	target, launcher := configureNormalChatSwitch(t, manager, store, "/legacy/workspace", "", "", nil)
+
+	if _, err := switchAgentSynchronously(context.Background(), manager, "proj-1", SwitchAgentConfig{
+		TargetHarness: domain.HarnessCodex, IdempotencyKey: "chat-execution-base-legacy",
+	}); err != nil {
+		t.Fatalf("SwitchAgent: %v", err)
+	}
+	if target.hookCalls != 1 || len(launcher.started) != 1 {
+		t.Fatalf("legacy target activation = hooks %d starts %d, want 1/1", target.hookCalls, len(launcher.started))
 	}
 }
 
