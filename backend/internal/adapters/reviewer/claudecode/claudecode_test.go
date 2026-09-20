@@ -97,7 +97,7 @@ func TestReviewCommandLaunchesReadOnlyOffBypass(t *testing.T) {
 	if agent.got.SessionID != "review-w1" {
 		t.Fatalf("AO session id = %q, want review-w1", agent.got.SessionID)
 	}
-	if !contains(agent.got.AllowedTools, "Read") || !contains(agent.got.AllowedTools, "Bash(ao review submit:*)") {
+	if !contains(agent.got.AllowedTools, "Read") || !contains(agent.got.AllowedTools, `Bash("$AO_CLI" review submit:*)`) {
 		t.Fatalf("allowlist missing read-only review tools: %#v", agent.got.AllowedTools)
 	}
 	for _, denied := range []string{"Edit", "Write", "Bash(git push:*)", "Bash(git commit:*)"} {
@@ -171,13 +171,13 @@ func TestAllowlistCoversPromptRequiredPipedCommands(t *testing.T) {
 		t.Fatalf("ReviewCommand: %v", err)
 	}
 
-	if !contains(agent.got.AllowedTools, "Bash(printf:*)") {
-		t.Fatalf("allowlist missing printf for piped review commands: %#v", agent.got.AllowedTools)
+	if !contains(agent.got.AllowedTools, "Bash(jq:*)") {
+		t.Fatalf("allowlist missing jq for serialized review commands: %#v", agent.got.AllowedTools)
 	}
 
 	for _, cmd := range []string{
-		"printf '%s' '{ \"event\": \"COMMENT\", \"body\": \"x\" }' | gh api --method POST repos/o/r/pulls/1/reviews --input - --jq '.id'",
-		"printf '%s' '{ \"reviews\": [] }' | ao review submit --session sess-1 --reviews -",
+		`jq -cn --arg summary "$summary" --argjson comments "$comments_json" '{event:"COMMENT",body:$summary}' | gh api --method POST repos/o/r/pulls/1/reviews --input - --jq '.id'`,
+		`"$AO_CLI" review submit --session sess-1 --reviews -`,
 	} {
 		if !compoundCommandCovered(agent.got.AllowedTools, cmd) {
 			t.Fatalf("allowlist does not cover prompt-required command %q with tools %#v", cmd, agent.got.AllowedTools)

@@ -31,10 +31,65 @@ func TestReviewTextsIncludesMultiPRQueue(t *testing.T) {
 		"do not use a heredoc",
 		`"$AO_CLI" review submit --session mer-1 --reviews -`,
 		"--arg body",
+		"exactly one object per queued PR/run",
+		"one object to \"comments\" per inline finding",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestReviewTextsQueueAndCommentCardinality(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		queue  []ports.ReviewTask
+		want   []string
+		absent []string
+	}{
+		{name: "zero", want: []string{"Review task queue is empty", "zero review objects"}, absent: []string{"* 1."}},
+		{name: "one", queue: []ports.ReviewTask{{RunID: "run-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1"}}, want: []string{"* 1. https://github.com/o/r/pull/1", "exactly one object per queued PR/run"}},
+		{name: "many", queue: []ports.ReviewTask{{RunID: "run-1"}, {RunID: "run-2"}}, want: []string{"AO created 2 review tasks", "one for every item in a larger queue"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := launchSpec()
+			spec.ReviewQueue = tc.queue
+			if tc.name == "zero" {
+				spec.RunID = ""
+				spec.PRURL = ""
+				spec.TargetSHA = ""
+			}
+			prompt, _ := reviewTextsForOS(spec, false)
+			for _, want := range tc.want {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt missing %q:\n%s", want, prompt)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(prompt, absent) {
+					t.Fatalf("prompt contains %q:\n%s", absent, prompt)
+				}
+			}
+		})
+	}
+}
+
+func TestReviewTextsRequiresSerializerSafePayloadValues(t *testing.T) {
+	prompt, _ := reviewTextsForOS(launchSpec(), false)
+	promptWindows, _ := reviewTextsForOS(launchSpec(), true)
+	for _, want := range []string{
+		"multiline text, quotes, backslashes, dollar signs, backticks, Unicode, braces, and control characters",
+		"--arg path \"$path\"",
+		"--arg finding \"$finding\"",
+		"--arg body \"$body\"",
+		"do not hand-escape",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing serializer-safety requirement %q:\n%s", want, prompt)
+		}
+	}
+	if !strings.Contains(promptWindows, "ConvertTo-Json -Compress") {
+		t.Fatalf("PowerShell prompt missing real serializer:\n%s", promptWindows)
 	}
 }
 
@@ -67,7 +122,7 @@ func TestReviewTextsUsesShellAwareReviewerCommands(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			prompt, _ := reviewTextsForOS(spec, test.windows)
-			for _, want := range []string{test.githubCommand, test.submitCommand, test.quoteRule, "gh api --method POST", "event", "COMMENT", "do not hand-escape"} {
+			for _, want := range []string{test.githubCommand, test.submitCommand, test.quoteRule, "gh api --method POST", "event", "COMMENT", "do not hand-escape", "Never resolve ao or ao.exe through PATH", "invoke any other AO subcommand"} {
 				if !strings.Contains(prompt, want) {
 					t.Fatalf("prompt missing %q:\n%s", want, prompt)
 				}
@@ -75,14 +130,10 @@ func TestReviewTextsUsesShellAwareReviewerCommands(t *testing.T) {
 			if strings.Contains(prompt, test.absent) {
 				t.Fatalf("prompt contains wrong-shell command %q:\n%s", test.absent, prompt)
 			}
-			for _, want := range []string{"Never resolve ao or ao.exe through PATH", "invoke any other AO subcommand"} {
-				if !strings.Contains(prompt, want) {
-					t.Fatalf("prompt missing authority rule %q:\n%s", want, prompt)
-				}
-			}
-			for _, forbidden := range []string{`printf '%s' '{`, `Write-Output '{`, `"body": "<your full review markdown>"`} {
-				if strings.Contains(prompt, forbidden) {
-					t.Fatalf("prompt contains unsafe literal %q:\n%s", forbidden, prompt)
+			forbidden := []string{`printf '%s' '{`, `Write-Output '{`, `"body": "<your full review markdown>"`, `ao review submit`, `"$OTHER_CLI" review submit`}
+			for _, value := range forbidden {
+				if strings.Contains(prompt, value) {
+					t.Fatalf("prompt contains unsafe literal %q:\n%s", value, prompt)
 				}
 			}
 		})

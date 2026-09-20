@@ -95,8 +95,8 @@ func TestReviewCommandPreservesAgentAndAppliesReadOnlyPolicy(t *testing.T) {
 	}
 	if config.Permission.Bash["*"] != "deny" ||
 		config.Permission.Bash["gh api *"] != "allow" ||
-		config.Permission.Bash["ao review submit *"] != "allow" ||
-		config.Permission.Bash["printf *"] != "allow" {
+		config.Permission.Bash[`"$AO_CLI" review submit *`] != "allow" ||
+		config.Permission.Bash["jq -cn *"] != "allow" {
 		t.Fatalf("bash policy = %#v", config.Permission.Bash)
 	}
 	wantPromptPattern := filepath.ToSlash(filepath.Join("ao", "prompts", "reviewer", "**"))
@@ -158,15 +158,15 @@ func TestBashPolicyAllowsEveryParsedReportingPipelineStage(t *testing.T) {
 		{
 			name: "GitHub review",
 			stages: []string{
-				`printf '%s' '{ "event": "COMMENT", "body": "ready" }'`,
+				`jq -cn --arg summary "$summary" --argjson comments "$comments_json" '{event:"COMMENT",body:$summary}'`,
 				`gh api --method POST repos/o/r/pulls/1/reviews --input - --jq '.id'`,
 			},
 		},
 		{
 			name: "AO bookkeeping",
 			stages: []string{
-				`printf '%s' '{ "reviews": [] }'`,
-				`ao review submit --session sess-1 --reviews -`,
+				`jq -cn --argjson reviews "$reviews_json" '{reviews:$reviews}'`,
+				`"$AO_CLI" review submit --session sess-1 --reviews -`,
 			},
 		},
 	}

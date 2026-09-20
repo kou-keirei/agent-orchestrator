@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	workeragent "github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/kilocode"
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reviewer/commandpolicy"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -109,10 +110,14 @@ func withReviewerConfig(argv []string, taskPromptRoot, systemPromptFile string) 
 			"git log*":                      "allow",
 			"git show*":                     "allow",
 			"git status*":                   "allow",
-			"ao review submit *":            "allow",
-			"printf *":                      "allow",
-			"printf * | gh api *":           "allow",
-			"printf * | ao review submit *": "allow",
+			"jq -cn *":                      "allow",
+			"ConvertTo-Json *":              "allow",
+			commandpolicy.SubmitGlobs()[0]:  "allow",
+			commandpolicy.SubmitGlobs()[1]:  "allow",
+			"jq -cn * | gh api *":           "allow",
+			"ConvertTo-Json * | & gh api *": "allow",
+			"jq -cn * | " + commandpolicy.SubmitGlobs()[0]:         "allow",
+			"ConvertTo-Json * | " + commandpolicy.SubmitGlobs()[1]: "allow",
 		},
 	}
 	if taskPromptRoot != "" {

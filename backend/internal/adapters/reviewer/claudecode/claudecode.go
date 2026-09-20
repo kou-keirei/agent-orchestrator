@@ -42,20 +42,22 @@ var _ ports.ReviewerRestorer = (*Reviewer)(nil)
 // system entirely and ignores allow/deny rules — it launches in the default
 // mode where these rules are honored: allow rules auto-approve without
 // prompting, so the reviewer can read the checkout and run the few commands it
-// needs (git diff/log/show to inspect the PR, printf to pipe review JSON into
+// needs (git diff/log/show to inspect the PR, jq to serialize review JSON into
 // the downstream commands without writing a worktree file, gh to post the
-// review, and `ao review submit` to record the verdict) without stalling.
+// review, and the AO_CLI-pinned `review submit` to record the verdict) without
+// stalling.
 var reviewerAllowedTools = []string{
 	"Read",
 	"Grep",
 	"Glob",
-	"Bash(printf:*)",
+	"Bash(jq:*)",
 	"Bash(gh:*)",
 	"Bash(git diff:*)",
 	"Bash(git log:*)",
 	"Bash(git show:*)",
 	"Bash(git status:*)",
-	"Bash(ao review submit:*)",
+	`Bash("$AO_CLI" review submit:*)`,
+	`Bash(& "$env:AO_CLI" review submit:*)`,
 }
 
 // reviewerDisallowedTools hard-denies the write paths as defense in depth, so a
