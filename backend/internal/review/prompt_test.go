@@ -47,9 +47,9 @@ func TestReviewTextsQueueAndCommentCardinality(t *testing.T) {
 		want   []string
 		absent []string
 	}{
-		{name: "zero", want: []string{"Review task queue is empty", "zero review objects"}, absent: []string{"* 1."}},
+		{name: "zero", want: []string{"Review task queue is empty", "zero review objects"}, absent: []string{"* 1.", "gh api", "review submit", "AO_CLI"}},
 		{name: "one", queue: []ports.ReviewTask{{RunID: "run-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1"}}, want: []string{"* 1. https://github.com/o/r/pull/1", "exactly one object per queued PR/run"}},
-		{name: "many", queue: []ports.ReviewTask{{RunID: "run-1"}, {RunID: "run-2"}}, want: []string{"AO created 2 review tasks", "one for every item in a larger queue"}},
+		{name: "many", queue: []ports.ReviewTask{{RunID: "run-1"}, {RunID: "run-2"}, {RunID: "run-3"}}, want: []string{"AO created 3 review tasks", "one for every item in a larger queue"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := launchSpec()
@@ -74,6 +74,23 @@ func TestReviewTextsQueueAndCommentCardinality(t *testing.T) {
 	}
 }
 
+func TestReviewTextsUsesAllQueuedValuesForSingleTask(t *testing.T) {
+	spec := launchSpec()
+	spec.RunID = "legacy-run"
+	spec.PRURL = "https://github.com/o/r/pull/legacy"
+	spec.TargetSHA = "legacy-sha"
+	spec.ReviewQueue = []ports.ReviewTask{{RunID: "queue-run", PRURL: "https://github.com/o/r/pull/queue", TargetSHA: "queue-sha"}}
+	prompt, _ := reviewTextsForOS(spec, false)
+	if strings.Contains(prompt, "legacy-run") || strings.Contains(prompt, "legacy-sha") {
+		t.Fatalf("prompt used legacy task values despite explicit queue:\n%s", prompt)
+	}
+	for _, want := range []string{"queue-run", "https://github.com/o/r/pull/queue", "queue-sha"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing queued task value %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestReviewTextsRequiresSerializerSafePayloadValues(t *testing.T) {
 	prompt, _ := reviewTextsForOS(launchSpec(), false)
 	promptWindows, _ := reviewTextsForOS(launchSpec(), true)
@@ -82,6 +99,11 @@ func TestReviewTextsRequiresSerializerSafePayloadValues(t *testing.T) {
 		"--arg path \"$path\"",
 		"--arg finding \"$finding\"",
 		"--arg body \"$body\"",
+		"comments_json=$(jq -cn '[]')",
+		"reviews_json=$(jq -cn '[]')",
+		"$comments + [$comment]",
+		"$reviews + [$review]",
+		"once per finding or queued run",
 		"do not hand-escape",
 	} {
 		if !strings.Contains(prompt, want) {

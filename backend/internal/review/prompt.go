@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 // reviewTexts returns the user-facing prompt and the system prompt to deliver to
@@ -24,6 +26,13 @@ func reviewTextsForOS(spec LaunchSpec, windows bool) (prompt, systemPrompt strin
 	systemPrompt = reviewSystemPrompt()
 
 	queueText := reviewQueueText(spec)
+	if len(reviewTasks(spec)) == 0 {
+		prompt = fmt.Sprintf(`Review the requested pull request(s) for worker session %s.
+%s
+
+The review task queue is empty. Wait for AO to send a non-empty review task before taking any review or reporting action.`, spec.WorkerID, queueText)
+		return prompt, systemPrompt
+	}
 	githubReviewCommand, aoSubmitCommand, quoteInstruction := reviewShellCommands(windows, string(spec.WorkerID))
 	prompt = fmt.Sprintf(`Review the requested pull request(s) for worker session %s.
 %s
@@ -61,11 +70,15 @@ func reviewShellCommands(windows bool, sessionID string) (githubReviewCommand, a
     $payload | & "$env:AO_CLI" review submit --session %s --reviews -`, sessionID),
 			"Use ConvertTo-Json -Compress for real JSON and pass every review value as an object property; do not hand-escape or interpolate review text into a quoted JSON string"
 	}
-	return `    comments_json=$(jq -cn --arg path "$path" --argjson line "$line" --arg finding "$finding" '[{path:$path,line:$line,body:$finding}]')
+	return `    comments_json=$(jq -cn '[]')
+    comment_json=$(jq -cn --arg path "$path" --argjson line "$line" --arg finding "$finding" '{path:$path,line:$line,body:$finding}')
+    comments_json=$(jq -cn --argjson comments "$comments_json" --argjson comment "$comment_json" '$comments + [$comment]')
     jq -cn --arg summary "$summary" --argjson comments "$comments_json" '{event:"COMMENT",body:$summary} + (if ($comments|length)>0 then {comments:$comments} else {} end)' | gh api --method POST repos/{owner}/{repo}/pulls/{number}/reviews --input - --jq '.id'`,
-		fmt.Sprintf(`    reviews_json=$(jq -cn --arg runId "$runId" --arg verdict "$verdict" --arg githubReviewId "$githubReviewId" --arg body "$body" '[{runId:$runId,verdict:$verdict,githubReviewId:$githubReviewId,body:$body}]')
+		fmt.Sprintf(`    reviews_json=$(jq -cn '[]')
+    review_json=$(jq -cn --arg runId "$runId" --arg verdict "$verdict" --arg githubReviewId "$githubReviewId" --arg body "$body" '{runId:$runId,verdict:$verdict,githubReviewId:$githubReviewId,body:$body}')
+    reviews_json=$(jq -cn --argjson reviews "$reviews_json" --argjson review "$review_json" '$reviews + [$review]')
     jq -cn --argjson reviews "$reviews_json" '{reviews:$reviews}' | "$AO_CLI" review submit --session %s --reviews -`, sessionID),
-		"Use jq -cn for real JSON and pass every review value through --arg or --argjson; do not hand-escape or interpolate review text into a quoted JSON string"
+		"Use jq -cn for real JSON and pass every review value through --arg or --argjson; initialize arrays with jq -cn '[]' and repeat the serializer/append pair once per finding or queued run; do not hand-escape or interpolate review text into a quoted JSON string"
 }
 
 func reviewSystemPrompt() string {
@@ -79,16 +92,27 @@ Post your review as a comment on the pull request, stating clearly whether it ne
 }
 
 func reviewQueueText(spec LaunchSpec) string {
-	if len(spec.ReviewQueue) == 0 && strings.TrimSpace(spec.RunID) == "" && strings.TrimSpace(spec.PRURL) == "" && strings.TrimSpace(spec.TargetSHA) == "" {
-		return "\nReview task queue is empty; submit zero review objects.\n"
+	tasks := reviewTasks(spec)
+	if len(tasks) == 0 {
+		return "\nReview task queue is empty; zero review objects are expected.\n"
 	}
-	if len(spec.ReviewQueue) <= 1 {
-		return fmt.Sprintf("\nReview task queue:\n* 1. %s (head commit %s, run %s)\n", spec.PRURL, spec.TargetSHA, spec.RunID)
+	if len(tasks) == 1 {
+		return fmt.Sprintf("\nReview task queue:\n* 1. %s (head commit %s, run %s)\n", tasks[0].PRURL, tasks[0].TargetSHA, tasks[0].RunID)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "\nAO created %d review tasks for this worker session. Review every queued PR, then submit all results together.\n\nReview task queue:\n", len(spec.ReviewQueue))
-	for i, task := range spec.ReviewQueue {
+	fmt.Fprintf(&b, "\nAO created %d review tasks for this worker session. Review every queued PR, then submit all results together.\n\nReview task queue:\n", len(tasks))
+	for i, task := range tasks {
 		fmt.Fprintf(&b, "* %d. %s (head commit %s, run %s)\n", i+1, task.PRURL, task.TargetSHA, task.RunID)
 	}
 	return b.String()
+}
+
+func reviewTasks(spec LaunchSpec) []ports.ReviewTask {
+	if len(spec.ReviewQueue) > 0 {
+		return spec.ReviewQueue
+	}
+	if strings.TrimSpace(spec.RunID) == "" && strings.TrimSpace(spec.PRURL) == "" && strings.TrimSpace(spec.TargetSHA) == "" {
+		return nil
+	}
+	return []ports.ReviewTask{{RunID: spec.RunID, PRURL: spec.PRURL, TargetSHA: spec.TargetSHA}}
 }

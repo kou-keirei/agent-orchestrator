@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -73,7 +74,7 @@ func TestReviewCommandBuildsReadOnlyInteractiveTUI(t *testing.T) {
 	if !slices.Equal(cfg.Tools, []string{"read", "glob", "grep", "shell"}) || slices.Contains(cfg.AllowedTools, "shell") {
 		t.Fatalf("tool policy = tools %#v allowed %#v", cfg.Tools, cfg.AllowedTools)
 	}
-	if !cfg.ToolsSettings.Shell.DenyByDefault || len(cfg.ToolsSettings.Shell.AllowedCommands) != 8 || len(cfg.ToolsSettings.Shell.DeniedCommands) == 0 {
+	if !cfg.ToolsSettings.Shell.DenyByDefault || len(cfg.ToolsSettings.Shell.AllowedCommands) != 20 || len(cfg.ToolsSettings.Shell.DeniedCommands) == 0 {
 		t.Fatalf("shell policy = %+v", cfg.ToolsSettings.Shell)
 	}
 	for _, command := range cfg.ToolsSettings.Shell.AllowedCommands {
@@ -91,6 +92,51 @@ func TestReviewCommandBuildsReadOnlyInteractiveTUI(t *testing.T) {
 	for _, phrase := range []string{"supported git shell shapes are exactly", "whitespace-free", "intentionally unsupported"} {
 		if !strings.Contains(string(systemPrompt), phrase) {
 			t.Fatalf("Kiro shell policy does not document %q:\n%s", phrase, systemPrompt)
+		}
+	}
+}
+
+func TestShellAllowedCommandsPreservePayloadCardinalityAndPinnedAuthority(t *testing.T) {
+	patterns := shellAllowedCommands(ports.ReviewInvocation{WorkerSessionID: "sess-1", WorkspacePath: "/worktrees/worker-1"})
+	allowed := []string{
+		`comments_json=$(jq -cn '[]')`,
+		`comment_json=$(jq -cn --arg path "$path" --argjson line "$line" --arg finding "$finding" '{path:$path,line:$line,body:$finding}')`,
+		`comments_json=$(jq -cn --argjson comments "$comments_json" --argjson comment "$comment_json" '$comments + [$comment]')`,
+		`jq -cn --arg summary "$summary" --argjson comments "$comments_json" '{event:"COMMENT",body:$summary} + (if ($comments|length)>0 then {comments:$comments} else {} end)' | gh api --method POST repos/o/r/pulls/1/reviews --input - --jq '.id'`,
+		`reviews_json=$(jq -cn '[]')`,
+		`review_json=$(jq -cn --arg runId "$runId" --arg verdict "$verdict" --arg githubReviewId "$githubReviewId" --arg body "$body" '{runId:$runId,verdict:$verdict,githubReviewId:$githubReviewId,body:$body}')`,
+		`reviews_json=$(jq -cn --argjson reviews "$reviews_json" --argjson review "$review_json" '$reviews + [$review]')`,
+		`jq -cn --argjson reviews "$reviews_json" '{reviews:$reviews}' | "$AO_CLI" review submit --session sess-1 --reviews -`,
+		`$payload = [ordered]@{ event = 'COMMENT'; body = $summary }`,
+		`if ($findings.Count -gt 0) { $payload.comments = @($findings | ForEach-Object { [ordered]@{ path = $_.path; line = [int]$_.line; body = $_.body } }) }`,
+		`$payload = $payload | ConvertTo-Json -Compress -Depth 10`,
+		`$OutputEncoding = [Text.UTF8Encoding]::new($false)`,
+		`$payload | & gh api --method POST repos/o/r/pulls/1/reviews --input - --jq '.id'`,
+		`$reviewObjects = @($queuedRuns | ForEach-Object { [ordered]@{ runId = $_.runId; verdict = $_.verdict; githubReviewId = $_.githubReviewId; body = $_.body } })`,
+		`$payload = [ordered]@{ reviews = $reviewObjects } | ConvertTo-Json -Compress -Depth 10`,
+		`$payload | & "$env:AO_CLI" review submit --session sess-1 --reviews -`,
+	}
+	for _, command := range allowed {
+		matched := false
+		for _, pattern := range patterns {
+			if regexp.MustCompile(pattern).MatchString(command) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("allowlist rejected required command %q", command)
+		}
+	}
+	for _, command := range []string{
+		`ao review submit --session sess-1 --reviews -`,
+		`"$OTHER_CLI" review submit --session sess-1 --reviews -`,
+		`jq -cn --argjson reviews "$reviews_json" '{reviews:$reviews}' | "$AO_CLI" review submit --session sess-2 --reviews -`,
+	} {
+		for _, pattern := range patterns {
+			if regexp.MustCompile(pattern).MatchString(command) {
+				t.Fatalf("allowlist admitted unauthorized command %q via %q", command, pattern)
+			}
 		}
 	}
 }

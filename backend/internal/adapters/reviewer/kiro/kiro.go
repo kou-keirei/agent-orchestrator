@@ -101,7 +101,7 @@ Kiro security and reporting rules:
 - Your process runs outside the checkout. Use the read, glob, and grep tools on the absolute worker checkout path from the task.
 - Shell is deny-by-default. Only the narrow git inspection and review-reporting command shapes configured by AO can run.
 - The supported git shell shapes are exactly: status with optional --short; diff with --no-ext-diff --no-textconv; log; and show. Additional arguments must be single whitespace-free refs, options, or paths. Filenames with spaces, extra shell quoting, compound commands, redirections, and complex ref expressions are intentionally unsupported; use read, glob, or grep instead.
-- For each JSON reporting body, use the task's jq command with serializer values for every review field. The AO reporting command must use the exact pinned AO_CLI reference and the review-submit command.
+- For each JSON reporting body, use the task's shell serializer and array append commands with serializer values for every review field. The AO reporting command must use the exact pinned AO_CLI reference and the review-submit command.
 - Never request or attempt any write, unrestricted shell, commit, push, extension, MCP server, skill, steering, or project agent resource.
 `
 	if err := hookutil.AtomicWriteFile(kiroSystemPath, append(system, extra...), 0o600); err != nil {
@@ -144,8 +144,20 @@ func shellAllowedCommands(inv ports.ReviewInvocation) []string {
 	safeArg := `[A-Za-z0-9_./:=,@{}^~+\-]+`
 	jqReview := `jq -cn --arg summary "\$summary" --argjson comments "\$comments_json" '\{event:"COMMENT",body:\$summary\} \+ \(if \(\$comments\|length\)>0 then \{comments:\$comments\} else \{\} end\)' \| gh api --method POST repos/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pulls/[0-9]+/reviews --input - --jq '\.id'`
 	jqSubmit := `jq -cn --argjson reviews "\$reviews_json" '\{reviews:\$reviews\}' \| ` + commandpolicy.SubmitRegex(session) + `$`
-	commentValues := `^comments_json=\$\(jq -cn --arg path "\$path" --argjson line "\$line" --arg finding "\$finding" '\[\{path:\$path,line:\$line,body:\$finding\}\]'\)$`
-	reviewValues := `^reviews_json=\$\(jq -cn --arg runId "\$runId" --arg verdict "\$verdict" --arg githubReviewId "\$githubReviewId" --arg body "\$body" '\[\{runId:\$runId,verdict:\$verdict,githubReviewId:\$githubReviewId,body:\$body\}\]'\)$`
+	commentInit := `^comments_json=\$\(jq -cn '\[\]'\)$`
+	commentValue := `^comment_json=\$\(jq -cn --arg path "\$path" --argjson line "\$line" --arg finding "\$finding" '\{path:\$path,line:\$line,body:\$finding\}'\)$`
+	commentAppend := `^comments_json=\$\(jq -cn --argjson comments "\$comments_json" --argjson comment "\$comment_json" '\$comments \+ \[\$comment\]'\)$`
+	reviewInit := `^reviews_json=\$\(jq -cn '\[\]'\)$`
+	reviewValue := `^review_json=\$\(jq -cn --arg runId "\$runId" --arg verdict "\$verdict" --arg githubReviewId "\$githubReviewId" --arg body "\$body" '\{runId:\$runId,verdict:\$verdict,githubReviewId:\$githubReviewId,body:\$body\}'\)$`
+	reviewAppend := `^reviews_json=\$\(jq -cn --argjson reviews "\$reviews_json" --argjson review "\$review_json" '\$reviews \+ \[\$review\]'\)$`
+	powershellReviewPayload := `^` + regexp.QuoteMeta(`$payload = [ordered]@{ event = 'COMMENT'; body = $summary }`) + `$`
+	powershellReviewFindings := `^` + regexp.QuoteMeta(`if ($findings.Count -gt 0) { $payload.comments = @($findings | ForEach-Object { [ordered]@{ path = $_.path; line = [int]$_.line; body = $_.body } }) }`) + `$`
+	powershellReviewJSON := `^` + regexp.QuoteMeta(`$payload = $payload | ConvertTo-Json -Compress -Depth 10`) + `$`
+	powershellEncoding := `^` + regexp.QuoteMeta(`$OutputEncoding = [Text.UTF8Encoding]::new($false)`) + `$`
+	powershellReviewPost := `^` + regexp.QuoteMeta(`$payload | & gh api --method POST repos/`) + `[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/pulls/[0-9]+/reviews` + regexp.QuoteMeta(` --input - --jq '.id'`) + `$`
+	powershellReviewObjects := `^` + regexp.QuoteMeta(`$reviewObjects = @($queuedRuns | ForEach-Object { [ordered]@{ runId = $_.runId; verdict = $_.verdict; githubReviewId = $_.githubReviewId; body = $_.body } })`) + `$`
+	powershellSubmitPayload := `^` + regexp.QuoteMeta(`$payload = [ordered]@{ reviews = $reviewObjects } | ConvertTo-Json -Compress -Depth 10`) + `$`
+	powershellSubmit := `^` + regexp.QuoteMeta(`$payload | & `) + `"\$env:AO_CLI" review submit --session ` + regexp.QuoteMeta(session) + ` --reviews -$`
 	// Kiro accepts regex policies rather than structured argv. Anchor every
 	// pattern to the complete command and intentionally support only the exact
 	// whitespace-free argument shapes described in the reviewer prompt above.
@@ -154,9 +166,21 @@ func shellAllowedCommands(inv ports.ReviewInvocation) []string {
 		`^` + gitPrefix + `diff --no-ext-diff --no-textconv(?: ` + safeArg + `)*(?: --(?: ` + safeArg + `)*)?$`,
 		`^` + gitPrefix + `log(?: ` + safeArg + `)*$`,
 		`^` + gitPrefix + `show(?: ` + safeArg + `)*(?: --(?: ` + safeArg + `)*)?$`,
-		commentValues,
-		reviewValues,
+		commentInit,
+		commentValue,
+		commentAppend,
+		reviewInit,
+		reviewValue,
+		reviewAppend,
 		`^` + jqReview + `$`,
 		`^` + jqSubmit,
+		powershellReviewPayload,
+		powershellReviewFindings,
+		powershellReviewJSON,
+		powershellEncoding,
+		powershellReviewPost,
+		powershellReviewObjects,
+		powershellSubmitPayload,
+		powershellSubmit,
 	}
 }
