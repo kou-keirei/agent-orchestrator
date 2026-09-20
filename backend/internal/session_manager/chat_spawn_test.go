@@ -963,7 +963,7 @@ func TestDefaultChatSpawnFallbackPreservesEffortPresence(t *testing.T) {
 		effortOverride bool
 		wantEffort     string
 	}{
-		{name: "omitted inherits project effort", wantEffort: "high"},
+		{name: "omitted retains base effort for mismatched role harness", wantEffort: ""},
 		{name: "explicit empty selects provider default", effortOverride: true},
 		{name: "explicit value forwards exact effort", effort: "low", effortOverride: true, wantEffort: "low"},
 	}
@@ -1008,7 +1008,7 @@ func TestChatSpawnPreservesEffortPresence(t *testing.T) {
 		effortOverride bool
 		wantEffort     string
 	}{
-		{name: "omitted inherits project effort", wantEffort: "high"},
+		{name: "omitted retains base effort for mismatched role harness", wantEffort: ""},
 		{name: "explicit empty selects provider default", effortOverride: true},
 		{name: "explicit value forwards exact effort", effort: "low", effortOverride: true, wantEffort: "low"},
 	}
