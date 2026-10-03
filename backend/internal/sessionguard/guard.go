@@ -211,6 +211,11 @@ func (g *Guard) DeliverWithPostWrite(ctx context.Context, id domain.SessionID, m
 // active or decision state.
 func (g *Guard) Automation(ctx context.Context, id domain.SessionID, msg string, acknowledges func(domain.AgentHarness) bool) (Outcome, error) {
 	return g.send(ctx, id, msg, func(rec domain.SessionRecord) (Outcome, bool) {
+		// Manual delivery may use the compatibility fallback; unattended pane
+		// input requires the exact raw TUI mode at this leased fresh read.
+		if rec.Mode != domain.SessionModeTUI {
+			return SuppressedUnknown, true
+		}
 		if g.tuiAwaitingStartupInput(rec) {
 			return SuppressedStartupPending, true
 		}

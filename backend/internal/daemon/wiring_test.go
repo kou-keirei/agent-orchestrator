@@ -900,6 +900,10 @@ func (f *fakeSessionLifecycle) SendAutomation(context.Context, domain.SessionID,
 	return nil
 }
 
+func (f *fakeSessionLifecycle) SendAutomationWithAcknowledgement(context.Context, domain.SessionID, string, string) (bool, error) {
+	return false, nil
+}
+
 func (f *fakeSessionLifecycle) Kill(_ context.Context, _ domain.SessionID) (bool, error) {
 	return false, nil
 }

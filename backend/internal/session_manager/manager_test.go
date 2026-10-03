@@ -9678,6 +9678,91 @@ func TestHarnessNudgeSafe(t *testing.T) {
 	}
 }
 
+func TestSendAutomationAcknowledgementRequiresChatAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     domain.SessionMode
+		relayErr error
+		wantAck  bool
+		wantSend bool
+	}{
+		{"Chat admitted", domain.SessionModeChat, nil, true, false},
+		{"Chat rejected", domain.SessionModeChat, errors.New("admission failed"), false, false},
+		{"TUI submitted", domain.SessionModeTUI, nil, false, true},
+		{"unknown rejected", "voice", nil, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["s1"] = pastStartupGate(domain.SessionRecord{ID: "s1", Mode: tc.mode, Harness: domain.HarnessPi, Activity: domain.Activity{State: domain.ActivityIdle}})
+			messenger := &fakeMessenger{}
+			m := newSendTestManager(t, submitOnlyAgent{}, messenger, st)
+			chat := &recordingLauncher{turnErr: tc.relayErr}
+			m.chat = chat
+			ack, err := m.SendAutomationWithAcknowledgement(context.Background(), "s1", "wake", "stable-batch")
+			if ack != tc.wantAck || (len(messenger.msgs) == 1) != tc.wantSend {
+				t.Fatalf("ack=%v sends=%v err=%v", ack, messenger.msgs, err)
+			}
+			if tc.mode == domain.SessionModeChat && (len(chat.relayIDs) != 1 || chat.relayIDs[0] != "stable-batch") {
+				t.Fatalf("relay IDs=%v", chat.relayIDs)
+			}
+			if tc.relayErr != nil && !errors.Is(err, tc.relayErr) {
+				t.Fatalf("err=%v", err)
+			}
+			if !tc.mode.Valid() && !errors.Is(err, ErrAutomationUnsupported) {
+				t.Fatalf("err=%v", err)
+			}
+			if tc.mode.Valid() && tc.relayErr == nil && err != nil {
+				t.Fatal(err)
+			}
+			if m.inputLeases["s1"] != 0 {
+				t.Fatal("send left input lease held")
+			}
+		})
+	}
+}
+
+type automationFreshModeStore struct {
+	*fakeStore
+	reads    int
+	changeAt int
+	mode     domain.SessionMode
+}
+
+func (s *automationFreshModeStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	s.reads++
+	if s.reads == s.changeAt {
+		rec := s.sessions[id]
+		rec.Mode = s.mode
+		s.sessions[id] = rec
+	}
+	return s.fakeStore.GetSession(ctx, id)
+}
+
+func TestSendAutomationRechecksModeAtControllerAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		initial, fresh domain.SessionMode
+		changeAt       int
+	}{
+		{"Chat cannot fall through to TUI", domain.SessionModeChat, domain.SessionModeTUI, 2},
+		{"TUI cannot fall through to Chat", domain.SessionModeTUI, domain.SessionModeChat, 3},
+		{"TUI cannot borrow manual fallback", domain.SessionModeTUI, "voice", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["s1"] = pastStartupGate(domain.SessionRecord{ID: "s1", Mode: tc.initial, Harness: domain.HarnessPi, Activity: domain.Activity{State: domain.ActivityIdle}})
+			store := &automationFreshModeStore{fakeStore: st, changeAt: tc.changeAt, mode: tc.fresh}
+			messenger := &fakeMessenger{}
+			chat := &recordingLauncher{}
+			m := New(Deps{Store: store, Messenger: messenger, Agents: singleAgent{submitOnlyAgent{}}, Chat: chat})
+			ack, err := m.SendAutomationWithAcknowledgement(context.Background(), "s1", "wake", "stable-batch")
+			if err == nil || ack || len(messenger.msgs) != 0 || len(chat.relayIDs) != 0 || store.reads < tc.changeAt {
+				t.Fatalf("ack=%v sends=%v relays=%v reads=%d err=%v", ack, messenger.msgs, chat.relayIDs, store.reads, err)
+			}
+		})
+	}
+}
+
 func TestSendAutomationTUIRechecksStateAndAcknowledgementCapability(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

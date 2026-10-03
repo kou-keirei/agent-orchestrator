@@ -3677,66 +3677,79 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string,
 // Chat controllers persist that key; TUI delivery is acknowledged separately
 // by the exact prompt-submit lifecycle hook.
 func (m *Manager) SendAutomation(ctx context.Context, id domain.SessionID, message, clientMessageID string) error {
+	_, err := m.SendAutomationWithAcknowledgement(ctx, id, message, clientMessageID)
+	return err
+}
+
+// SendAutomationWithAcknowledgement reports Chat's durable admission, never a
+// dispatcher-time mode observation. Controller selection and admission share
+// the existing input lease; a successful TUI write still waits for its hook.
+func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id domain.SessionID, message, clientMessageID string) (bool, error) {
 	if strings.TrimSpace(clientMessageID) == "" {
-		return errors.New("automation send requires a client message id")
+		return false, errors.New("automation send requires a client message id")
 	}
+	release, admitted := m.AcquireSessionInput(id)
+	if !admitted {
+		return false, ErrSwitchInProgress
+	}
+	defer release()
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
-		return ErrNotFound
+		return false, ErrNotFound
 	}
-	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
-		release, admitted := m.AcquireSessionInput(id)
-		if !admitted {
-			return ErrSwitchInProgress
-		}
-		defer release()
-		rec, ok, err = m.store.GetSession(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return ErrNotFound
-		}
+	if !rec.Mode.Valid() {
+		return false, ErrAutomationUnsupported
+	}
+	if rec.Mode == domain.SessionModeChat {
 		switch {
 		case rec.IsTerminated:
-			return ErrTerminated
+			return false, ErrTerminated
 		case rec.Activity.State == domain.ActivityExited:
-			return ErrAgentExited
+			return false, ErrAgentExited
 		case rec.Activity.State.NeedsInput():
-			return ErrAwaitingDecision
+			return false, ErrAwaitingDecision
 		case rec.FirstSignalAt.IsZero():
-			return ErrStartupPending
+			return false, ErrStartupPending
 		}
-		return m.send(ctx, id, message, clientMessageID)
+		// Do not fall through to manual pane delivery or transition queuing:
+		// only this controller's durable client-message-id admission can ack.
+		handled, err := m.sendChat(ctx, id, message, clientMessageID)
+		if err != nil {
+			return false, err
+		}
+		if !handled {
+			return false, ErrSwitchInProgress
+		}
+		return true, nil
 	}
 	message, err = m.prepareOutboundMessage(ctx, id, message)
 	if err != nil {
-		return err
+		return false, err
 	}
 	outcome, err := m.messenger.Automation(ctx, id, message, m.harnessAutomationAcknowledges)
 	if err != nil {
-		return err
+		return false, err
 	}
 	switch outcome {
 	case sessionguard.Sent:
-		return nil
+		return false, nil
 	case sessionguard.SuppressedNotFound:
-		return ErrNotFound
+		return false, ErrNotFound
 	case sessionguard.SuppressedTerminated:
-		return ErrTerminated
+		return false, ErrTerminated
 	case sessionguard.SuppressedExited:
-		return ErrAgentExited
+		return false, ErrAgentExited
 	case sessionguard.SuppressedAwaitingUser:
-		return ErrAwaitingDecision
+		return false, ErrAwaitingDecision
 	case sessionguard.SuppressedStartupPending:
-		return ErrStartupPending
+		return false, ErrStartupPending
 	case sessionguard.SuppressedInputGated, sessionguard.SuppressedBusy:
-		return ErrSwitchInProgress
+		return false, ErrSwitchInProgress
 	default:
-		return ErrAutomationUnsupported
+		return false, ErrAutomationUnsupported
 	}
 }
 

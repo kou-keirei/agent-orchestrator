@@ -131,6 +131,7 @@ func TestGuard_AutomationFailsClosedAtJITBoundary(t *testing.T) {
 		{"unsupported harness", record(domain.ActivityIdle, false), SuppressedUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.rec.Mode = domain.SessionModeTUI
 			tc.rec.Harness = domain.HarnessPi
 			if tc.name == "unsupported harness" {
 				tc.rec.Harness = domain.HarnessCursor
@@ -140,6 +141,40 @@ func TestGuard_AutomationFailsClosedAtJITBoundary(t *testing.T) {
 			got, err := guard.Automation(context.Background(), tc.rec.ID, "wake", ack)
 			if err != nil || got != tc.want || (len(messenger.sent) == 1) != (tc.want == Sent) {
 				t.Fatalf("outcome=%v sends=%v err=%v", got, messenger.sent, err)
+			}
+		})
+	}
+}
+
+type automationModeChangingLease struct {
+	store *fakeStore
+	mode  domain.SessionMode
+	held  bool
+}
+
+func (l *automationModeChangingLease) AcquireSessionInput(domain.SessionID) (func(), bool) {
+	l.store.rec.Mode = l.mode
+	l.held = true
+	return func() { l.held = false }, true
+}
+
+func TestGuardAutomationChecksRawModeAfterInputLease(t *testing.T) {
+	for _, mode := range []domain.SessionMode{"", "voice", " \t\n", "TUI", " tui ", "{broken}", domain.SessionModeChat, domain.SessionModeTUI} {
+		t.Run(string(mode), func(t *testing.T) {
+			rec := record(domain.ActivityIdle, false)
+			rec.Mode, rec.Harness = domain.SessionModeTUI, domain.HarnessPi
+			store := &fakeStore{rec: rec, ok: true}
+			messenger := &fakeMessenger{}
+			guard := New(store, messenger, nil)
+			lease := &automationModeChangingLease{store: store, mode: mode}
+			guard.SetInputLease(lease)
+			got, err := guard.Automation(context.Background(), rec.ID, "wake", func(domain.AgentHarness) bool { return true })
+			want := SuppressedUnknown
+			if mode == domain.SessionModeTUI {
+				want = Sent
+			}
+			if err != nil || got != want || (len(messenger.sent) == 1) != (want == Sent) || lease.held {
+				t.Fatalf("mode=%q outcome=%v sends=%v held=%v err=%v", mode, got, messenger.sent, lease.held, err)
 			}
 		})
 	}
