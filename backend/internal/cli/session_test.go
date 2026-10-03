@@ -93,6 +93,10 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1","session":`+sessionJSON("demo-1", "demo", "worker", "exited", false)+`}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/resume-agent":
 			_, _ = io.WriteString(w, `{"ok":true,"sessionId":"demo-1","resumeMode":"native","session":`+sessionJSON("demo-1", "demo", "worker", "idle", false)+`}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/demo-1/hide":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-1", "demo", "worker", "working", false)+`}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/sessions/demo-1/hide":
+			_, _ = io.WriteString(w, `{"session":`+sessionJSON("demo-1", "demo", "worker", "working", false)+`}`)
 		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/sessions/demo-1":
 			var req sessionRenameRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -110,10 +114,30 @@ func sessionCommandServer(t *testing.T) (*httptest.Server, *sessionRequestLog) {
 
 func sessionJSON(id, project, kind, status string, terminated bool) string {
 	b, _ := json.Marshal(map[string]any{
-		"id":           id,
-		"projectId":    project,
-		"kind":         kind,
-		"harness":      "codex",
+		"id":        id,
+		"projectId": project,
+		"kind":      kind,
+		"harness":   "codex",
+		"mode":      "tui",
+		"continuationReadback": map[string]any{
+			"sessionId": id,
+			"projectId": project,
+			"harness":   "codex",
+			"mode":      "tui",
+			"available": true,
+			"reason":    "available",
+			"chat": map[string]any{
+				"available": false,
+				"reason":    "mode_not_applicable",
+			},
+			"tui": map[string]any{
+				"available":              true,
+				"reason":                 "available",
+				"agentSessionId":         "agent-session-1",
+				"runtimeLaunchId":        "runtime-launch-1",
+				"agentSessionIdLaunchId": "runtime-launch-1",
+			},
+		},
 		"displayName":  "Current Name",
 		"activity":     map[string]any{"state": "idle", "lastActivityAt": "2026-06-02T12:00:00Z"},
 		"isTerminated": terminated,
@@ -154,7 +178,7 @@ func TestSessionList_ProjectFilterAndDefaultFiltering(t *testing.T) {
 	}
 	want := []string{
 		"GET /api/v1/sessions?active=true&project=demo",
-		"GET /api/v1/sessions?active=false&project=demo",
+		"GET /api/v1/sessions?active=false&includeHidden=true&project=demo",
 	}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
@@ -378,6 +402,55 @@ func TestSessionList_AllIncludesOrchestratorsWithoutHiddenHint(t *testing.T) {
 	}
 }
 
+func TestSessionList_HiddenTerminatedCountUsesHistoryFilter(t *testing.T) {
+	cfg := setConfigEnv(t)
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		appendPrimaryRequest(&requests, r)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("active") == "false" && r.URL.Query().Get("includeHidden") == "true" {
+			_, _ = io.WriteString(w, `{"sessions":[`+sessionJSON("hidden-old", "demo", "worker", "terminated", true)+`]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"sessions":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "ls", "--project", "demo", "--json")
+	if err != nil {
+		t.Fatalf("session ls --json failed: %v\nstderr=%s", err, errOut)
+	}
+	var got sessionListOutput
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("session ls output is not decodable: %v\noutput=%s", err, out)
+	}
+	if got.Meta.HiddenTerminatedCount != 1 {
+		t.Fatalf("hiddenTerminatedCount = %d, want 1 for hidden terminated history", got.Meta.HiddenTerminatedCount)
+	}
+	if len(requests) != 2 || !strings.Contains(requests[1], "includeHidden=true") {
+		t.Fatalf("requests = %#v, want active and hidden terminated history requests", requests)
+	}
+}
+
+func TestSessionList_IncludeHiddenPassesExplicitFilter(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, log := sessionCommandServer(t)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "ls", "--project", "demo", "--include-hidden", "--json")
+	if err != nil {
+		t.Fatalf("session ls --include-hidden failed: %v\nstderr=%s", err, errOut)
+	}
+	want := []string{
+		"GET /api/v1/sessions?active=true&includeHidden=true&project=demo",
+		"GET /api/v1/sessions?active=false&includeHidden=true&project=demo",
+	}
+	if got := log.all(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests = %#v, want %#v", got, want)
+	}
+}
+
 func TestSessionGet_SuccessWithProjectScope(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv, log := sessionCommandServer(t)
@@ -413,7 +486,13 @@ func TestSessionGet_JSONOutputDecodes(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("session get --json output is not decodable: %v\noutput=%s", err, out)
 	}
-	if got.Session.ID != "demo-1" || got.Session.ProjectID != "demo" || got.Session.Status != "working" {
+	if got.Session.ID != "demo-1" || got.Session.ProjectID != "demo" || got.Session.Status != "working" ||
+		got.Session.ContinuationReadback == nil ||
+		got.Session.ContinuationReadback.SessionID != "demo-1" ||
+		got.Session.ContinuationReadback.ProjectID != "demo" ||
+		got.Session.ContinuationReadback.Mode != "tui" ||
+		!got.Session.ContinuationReadback.Available ||
+		got.Session.ContinuationReadback.TUI.AgentSessionID != "agent-session-1" {
 		t.Fatalf("unexpected session JSON: %#v", got.Session)
 	}
 }
@@ -538,7 +617,7 @@ func TestSessionCleanup_YesSkipsPrompt(t *testing.T) {
 		}
 	}
 	want := []string{
-		"GET /api/v1/sessions?active=false&project=demo",
+		"GET /api/v1/sessions?active=false&includeHidden=true&project=demo",
 		"POST /api/v1/sessions/cleanup?project=demo",
 	}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
@@ -617,7 +696,47 @@ func TestSessionCleanup_DryRunListsWithoutPromptingOrDeleting(t *testing.T) {
 		t.Fatalf("--dry-run must not report removals:\n%s", out)
 	}
 	// Only the candidate listing GET is allowed; no cleanup POST may be sent.
-	want := []string{"GET /api/v1/sessions?active=false&project=demo"}
+	want := []string{"GET /api/v1/sessions?active=false&includeHidden=true&project=demo"}
+	if got := log.all(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests = %#v, want %#v", got, want)
+	}
+}
+
+func TestSessionCleanupPreviewIncludesHiddenTerminatedSession(t *testing.T) {
+	cfg := setConfigEnv(t)
+	log := &sessionRequestLog{}
+	hidden := strings.TrimSuffix(sessionJSON("demo-hidden", "demo", "worker", "terminated", true), "}") + `,"hiddenAt":"2026-09-22T12:00:00Z"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.append(r)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/sessions":
+			if r.URL.Query().Get("active") != "false" || r.URL.Query().Get("includeHidden") != "true" {
+				t.Fatalf("cleanup preview query = %s, want active=false&includeHidden=true", r.URL.RawQuery)
+			}
+			_, _ = io.WriteString(w, `{"sessions":[`+hidden+`]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/sessions/cleanup":
+			_, _ = io.WriteString(w, `{"ok":true,"cleaned":["demo-hidden"],"skipped":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "cleanup", "--project", "demo", "--yes")
+	if err != nil {
+		t.Fatalf("session cleanup failed: %v\nstderr=%s", err, errOut)
+	}
+	for _, want := range []string{"Would clean demo-hidden", "Cleaned: demo-hidden", "Cleanup complete. 1 session cleaned."} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cleanup output missing %q:\n%s", want, out)
+		}
+	}
+	want := []string{
+		"GET /api/v1/sessions?active=false&includeHidden=true&project=demo",
+		"POST /api/v1/sessions/cleanup?project=demo",
+	}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
 	}
@@ -680,7 +799,7 @@ func TestSessionCleanup_PromptFailsWithoutInput(t *testing.T) {
 	if !strings.Contains(out, "Type yes to confirm") {
 		t.Fatalf("output missing confirmation prompt:\n%s", out)
 	}
-	want := []string{"GET /api/v1/sessions?active=false&project=demo"}
+	want := []string{"GET /api/v1/sessions?active=false&includeHidden=true&project=demo"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
 	}
@@ -708,7 +827,7 @@ func TestSessionRename_SuccessWithProjectScope(t *testing.T) {
 
 func TestSessionCommands_MissingIDIsUsageError(t *testing.T) {
 	setConfigEnv(t)
-	for _, sub := range []string{"get", "kill", "restore", "exit-agent", "resume-agent"} {
+	for _, sub := range []string{"get", "kill", "restore", "exit-agent", "resume-agent", "hide", "unhide"} {
 		t.Run(sub, func(t *testing.T) {
 			_, _, err := executeCLI(t, Deps{}, "session", sub)
 			if err == nil {
@@ -718,6 +837,34 @@ func TestSessionCommands_MissingIDIsUsageError(t *testing.T) {
 				t.Fatalf("exit code = %d, want 2 (err=%v)", got, err)
 			}
 		})
+	}
+}
+
+func TestSessionHideUnhideUsePresentationOnlyEndpoints(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, log := sessionCommandServer(t)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "hide", "demo-1")
+	if err != nil {
+		t.Fatalf("session hide failed: %v\nstderr=%s", err, errOut)
+	}
+	if out != "session demo-1 hidden\n" {
+		t.Fatalf("hide output = %q", out)
+	}
+	out, errOut, err = executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }}, "session", "unhide", "demo-1")
+	if err != nil {
+		t.Fatalf("session unhide failed: %v\nstderr=%s", err, errOut)
+	}
+	if out != "session demo-1 unhidden\n" {
+		t.Fatalf("unhide output = %q", out)
+	}
+	want := []string{
+		"POST /api/v1/sessions/demo-1/hide",
+		"DELETE /api/v1/sessions/demo-1/hide",
+	}
+	if got := log.all(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("requests = %#v, want %#v", got, want)
 	}
 }
 

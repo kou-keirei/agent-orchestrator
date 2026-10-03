@@ -432,6 +432,7 @@ type fakeRuntime struct {
 	destroyedIDs            []string
 	fencedResult            ports.FencedProbeResult
 	fencedRefs              []ports.FencedRuntimeRef
+	sharedLog               *[]string
 }
 
 func (r *fakeRuntime) Interrupt(_ context.Context, handle ports.RuntimeHandle) error {
@@ -576,6 +577,9 @@ func (r *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) err
 	return nil
 }
 func (r *fakeRuntime) IsAlive(_ context.Context, handle ports.RuntimeHandle) (bool, error) {
+	if r.sharedLog != nil {
+		*r.sharedLog = append(*r.sharedLog, "IsAlive:"+handle.ID)
+	}
 	if r.aliveErr != nil {
 		return false, r.aliveErr
 	}
@@ -3086,14 +3090,15 @@ func (f *fakeShellTerminalCloser) BeginSessionTeardown(_ context.Context, id dom
 }
 
 type fakeReviewerTerminator struct {
-	calls         []domain.SessionID
-	bodies        []string
-	teardownCalls []domain.SessionID
-	restoreCalls  []domain.SessionID
-	err           error
-	teardownErr   error
-	restoreErr    error
-	sharedLog     *[]string
+	calls          []domain.SessionID
+	bodies         []string
+	teardownCalls  []domain.SessionID
+	restoreCalls   []domain.SessionID
+	reconcileCalls []domain.SessionID
+	err            error
+	teardownErr    error
+	restoreErr     error
+	sharedLog      *[]string
 }
 
 func (f *fakeReviewerTerminator) TerminateReviewer(_ context.Context, id domain.SessionID, body string) error {
@@ -3119,6 +3124,14 @@ func (f *fakeReviewerTerminator) RestoreReviewer(_ context.Context, id domain.Se
 		*f.sharedLog = append(*f.sharedLog, "RestoreReviewer:"+string(id))
 	}
 	return f.restoreErr
+}
+
+func (f *fakeReviewerTerminator) ReconcileReviewerCleanup(_ context.Context, id domain.SessionID) error {
+	f.reconcileCalls = append(f.reconcileCalls, id)
+	if f.sharedLog != nil {
+		*f.sharedLog = append(*f.sharedLog, "ReconcileReviewerCleanup:"+string(id))
+	}
+	return nil
 }
 
 // TestKill_ClosesScopedShellTerminalsBeforeWorkspaceTeardown is the regression
@@ -8420,6 +8433,33 @@ func TestReconcileLive_AliveSessionAdoptedNoop(t *testing.T) {
 	}
 }
 
+func TestReconcileBackground_AdoptedLiveSessionStillReconcilesReviewerCleanup(t *testing.T) {
+	st := newFakeStore()
+	st.projects["p1"] = domain.ProjectRecord{ID: "p1", Config: testRoleAgents()}
+	st.sessions["s2"] = domain.SessionRecord{
+		ID: "s2", ProjectID: "p1", IsTerminated: false,
+		Metadata: domain.SessionMetadata{Branch: "ao/s2/root", WorkspacePath: "/wt/s2", RuntimeHandleID: "s2"},
+	}
+	var events []string
+	rt := &fakeRuntime{aliveByHandle: map[string]bool{"s2": true}, sharedLog: &events}
+	reviewer := &fakeReviewerTerminator{sharedLog: &events}
+	m := New(Deps{Runtime: rt, Agents: fakeAgents{}, Workspace: &fakeWorkspace{}, Store: st, Messenger: &fakeMessenger{}, Lifecycle: &fakeLCM{store: st}, LookPath: func(string) (string, error) { return "/bin/true", nil }})
+	m.SetReviewerTerminator(reviewer)
+
+	if err := m.ReconcileBackground(context.Background()); err != nil {
+		t.Fatalf("ReconcileBackground: %v", err)
+	}
+	if len(reviewer.reconcileCalls) != 1 || reviewer.reconcileCalls[0] != "s2" {
+		t.Fatalf("reviewer cleanup calls = %v, want adopted session s2", reviewer.reconcileCalls)
+	}
+	if len(reviewer.restoreCalls) != 0 {
+		t.Fatalf("adopted live session unexpectedly restored reviewer: %v", reviewer.restoreCalls)
+	}
+	if got, want := strings.Join(events, ","), "IsAlive:s2,ReconcileReviewerCleanup:s2"; got != want {
+		t.Fatalf("startup authority order = %q, want %q", got, want)
+	}
+}
+
 func TestReconcile_LivePassUsesConfiguredConcurrency(t *testing.T) {
 	st := newFakeStore()
 	st.projects["p1"] = domain.ProjectRecord{ID: "p1", Config: testRoleAgents()}
@@ -9117,11 +9157,29 @@ func (s *activityProjectionBarrierStore) UpdateSessionFromActivitySignal(
 	rec domain.SessionRecord,
 	expectedRevision int64,
 ) (bool, error) {
+	if err := s.waitForActivityProjection(ctx); err != nil {
+		return false, err
+	}
+	return s.Store.UpdateSessionFromActivitySignal(ctx, rec, expectedRevision)
+}
+
+func (s *activityProjectionBarrierStore) CommitActivityAndOrchestrationEvent(
+	ctx context.Context,
+	rec domain.SessionRecord,
+	event domain.OrchestrationEvent,
+) (bool, error) {
+	if err := s.waitForActivityProjection(ctx); err != nil {
+		return false, err
+	}
+	return s.Store.CommitActivityAndOrchestrationEvent(ctx, rec, event)
+}
+
+func (s *activityProjectionBarrierStore) waitForActivityProjection(ctx context.Context) error {
 	s.barrierMu.Lock()
 	if s.skipUpdates > 0 {
 		s.skipUpdates--
 		s.barrierMu.Unlock()
-		return s.Store.UpdateSessionFromActivitySignal(ctx, rec, expectedRevision)
+		return nil
 	}
 	blocked := false
 	s.blockOnce.Do(func() {
@@ -9133,10 +9191,10 @@ func (s *activityProjectionBarrierStore) UpdateSessionFromActivitySignal(
 		select {
 		case <-s.releaseUpdate:
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return ctx.Err()
 		}
 	}
-	return s.Store.UpdateSessionFromActivitySignal(ctx, rec, expectedRevision)
+	return nil
 }
 
 func TestActivitySignal_CASRetryPreservesCorrelatedPermissionPost(t *testing.T) {
@@ -9620,6 +9678,33 @@ func TestHarnessNudgeSafe(t *testing.T) {
 	}
 }
 
+func TestSendAutomationTUIRechecksStateAndAcknowledgementCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		harness  domain.AgentHarness
+		state    domain.ActivityState
+		wantErr  error
+		wantSend bool
+	}{
+		{"Pi idle", domain.HarnessPi, domain.ActivityIdle, nil, true},
+		{"Pi active", domain.HarnessPi, domain.ActivityActive, ErrSwitchInProgress, false},
+		{"Pi waiting", domain.HarnessPi, domain.ActivityWaitingInput, ErrAwaitingDecision, false},
+		{"Pi blocked", domain.HarnessPi, domain.ActivityBlocked, ErrAwaitingDecision, false},
+		{"unsupported TUI", domain.HarnessCursor, domain.ActivityIdle, ErrAutomationUnsupported, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["s1"] = pastStartupGate(domain.SessionRecord{ID: "s1", Mode: domain.SessionModeTUI, Harness: tc.harness, Activity: domain.Activity{State: tc.state}})
+			messenger := &fakeMessenger{}
+			m := newSendTestManager(t, submitOnlyAgent{}, messenger, st)
+			err := m.SendAutomation(context.Background(), "s1", "[AO AUTOMATION batch_id=b] wake", "b")
+			if !errors.Is(err, tc.wantErr) || (len(messenger.msgs) == 1) != tc.wantSend {
+				t.Fatalf("err=%v sends=%v", err, messenger.msgs)
+			}
+		})
+	}
+}
+
 func TestSwitchTargetsOnlyRetryEnterWhenActivitySignalsMakeItSafe(t *testing.T) {
 	agents := switchTestAgents{
 		domain.HarnessClaudeCode: claudecode.New(),
@@ -9673,6 +9758,16 @@ type flipOnNudgeMessenger struct {
 	sessionID domain.SessionID
 	store     *fakeStore
 	flipped   bool
+}
+
+func TestCopilotOrchestratorMessagePreservesAutomationMarkerAtStart(t *testing.T) {
+	message := copilotOrchestratorMessage("p", "[AO AUTOMATION batch_id=batch-1] machine wake\nworker_terminated worker=w")
+	if !strings.HasPrefix(message, "[AO AUTOMATION batch_id=batch-1]") {
+		t.Fatalf("automation acknowledgement marker moved: %q", message)
+	}
+	if !strings.Contains(message, "AO ORCHESTRATOR DIRECTIVE") {
+		t.Fatalf("orchestrator safety directive missing: %q", message)
+	}
 }
 
 func (m *flipOnNudgeMessenger) Send(_ context.Context, _ domain.SessionID, msg string) error {

@@ -1791,6 +1791,47 @@ paths:
   /api/v1/orchestrators:
     get:
       operationId: listOrchestrators
+      parameters:
+      - description: Project id filter.
+        in: query
+        name: project
+        schema:
+          description: Project id filter.
+          type: string
+      - description: When true, return non-terminated sessions; when false, return
+          terminated sessions.
+        in: query
+        name: active
+        schema:
+          description: When true, return non-terminated sessions; when false, return
+            terminated sessions.
+          type:
+          - "null"
+          - boolean
+      - description: When true, return only orchestrator sessions.
+        in: query
+        name: orchestratorOnly
+        schema:
+          description: When true, return only orchestrator sessions.
+          type:
+          - "null"
+          - boolean
+      - description: When true, return only fresh non-terminated sessions.
+        in: query
+        name: fresh
+        schema:
+          description: When true, return only fresh non-terminated sessions.
+          type:
+          - "null"
+          - boolean
+      - description: When true, include presentation-hidden sessions.
+        in: query
+        name: includeHidden
+        schema:
+          description: When true, include presentation-hidden sessions.
+          type:
+          - "null"
+          - boolean
       responses:
         "200":
           content:
@@ -1798,6 +1839,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListSessionsResponse'
           description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
         "500":
           content:
             application/json:
@@ -2158,6 +2205,95 @@ paths:
       summary: Replace a project's per-project config
       tags:
       - projects
+  /api/v1/projects/{id}/orchestration-events:
+    get:
+      operationId: listOrchestrationEvents
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      - in: query
+        name: limit
+        schema:
+          maximum: 100
+          minimum: 1
+          type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListOrchestrationEventsResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: List daemon orchestration delivery state
+      tags:
+      - notifications
+  /api/v1/projects/{id}/orchestration-events/{eventId}/retry:
+    post:
+      operationId: retryOrchestrationEvent
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      - in: path
+        name: eventId
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryOrchestrationEventResponse'
+          description: OK
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Explicitly retry a dead-letter orchestration event
+      tags:
+      - notifications
   /api/v1/projects/{id}/permissions:
     patch:
       operationId: setProjectPermissions
@@ -2622,6 +2758,14 @@ paths:
         name: fresh
         schema:
           description: When true, return only fresh non-terminated sessions.
+          type:
+          - "null"
+          - boolean
+      - description: When true, include presentation-hidden sessions.
+        in: query
+        name: includeHidden
+        schema:
+          description: When true, include presentation-hidden sessions.
           type:
           - "null"
           - boolean
@@ -4471,6 +4615,83 @@ paths:
                 $ref: '#/components/schemas/APIError'
           description: Not Implemented
       summary: Exit the agent while preserving its AO session
+      tags:
+      - sessions
+  /api/v1/sessions/{sessionId}/hide:
+    delete:
+      operationId: unhideSession
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Restore a session to default presentation lists
+      tags:
+      - sessions
+    post:
+      operationId: hideSession
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Hide a session from default presentation lists
       tags:
       - sessions
   /api/v1/sessions/{sessionId}/interface-transition:
@@ -8413,6 +8634,8 @@ components:
           type: string
         chatProviderPreserved:
           type: boolean
+        continuationReadback:
+          $ref: '#/components/schemas/SessionContinuationReadback'
         createdAt:
           format: date-time
           type: string
@@ -8444,6 +8667,11 @@ components:
           type: string
         harness:
           type: string
+        hiddenAt:
+          format: date-time
+          type:
+          - "null"
+          - string
         id:
           type: string
         isPinned:
@@ -8585,6 +8813,7 @@ components:
       - status
       - kanbanColumn
       - displayStatus
+      - continuationReadback
       - prs
       type: object
     ControllersSetSecurePairingRequest:
@@ -10002,6 +10231,15 @@ components:
       - unreadCount
       - unresolvedCount
       type: object
+    ListOrchestrationEventsResponse:
+      properties:
+        events:
+          items:
+            $ref: '#/components/schemas/OrchestrationEventResponse'
+          type: array
+      required:
+      - events
+      type: object
     ListProjectsResponse:
       properties:
         projects:
@@ -10397,6 +10635,7 @@ components:
           - ready_to_merge
           - pr_merged
           - pr_closed_unmerged
+          - orchestration_attention
           type: string
       required:
       - id
@@ -10449,6 +10688,63 @@ components:
           description: 'Windows shell selector: auto, git-bash, pwsh, powershell,
             cmd, or a custom executable path. Ignored on macOS and Linux.'
           type: string
+      type: object
+    OrchestrationEventResponse:
+      properties:
+        acknowledgedAt:
+          format: date-time
+          type:
+          - "null"
+          - string
+        attemptCount:
+          type: integer
+        attentionRequiredAt:
+          format: date-time
+          type:
+          - "null"
+          - string
+        destinationSessionId:
+          type: string
+        enqueuedAt:
+          format: date-time
+          type: string
+        id:
+          type: string
+        kind:
+          type: string
+        lastError:
+          type: string
+        leaseExpiresAt:
+          format: date-time
+          type:
+          - "null"
+          - string
+        nextAttemptAt:
+          format: date-time
+          type: string
+        projectId:
+          type: string
+        sourceRevision:
+          type: string
+        state:
+          type: string
+        submittedAt:
+          format: date-time
+          type:
+          - "null"
+          - string
+        workerId:
+          type: string
+      required:
+      - id
+      - projectId
+      - workerId
+      - kind
+      - sourceRevision
+      - state
+      - attemptCount
+      - enqueuedAt
+      - nextAttemptAt
       type: object
     OrchestratorResponse:
       properties:
@@ -10918,6 +11214,13 @@ components:
       - resumeMode
       - session
       type: object
+    RetryOrchestrationEventResponse:
+      properties:
+        retried:
+          type: boolean
+      required:
+      - retried
+      type: object
     RetryTurnResponse:
       properties:
         providerTurnId:
@@ -10956,14 +11259,20 @@ components:
           type: string
         id:
           type: string
+        launchId:
+          type: string
         prUrl:
           type: string
+        provenance:
+          $ref: '#/components/schemas/ReviewerProvenance'
         reviewId:
           type: string
         sessionId:
           type: string
         status:
           type: string
+        targetBinding:
+          $ref: '#/components/schemas/ReviewTargetBinding'
         targetSha:
           type: string
         triggerSource:
@@ -10982,6 +11291,9 @@ components:
       - triggerSource
       - prUrl
       - targetSha
+      - targetBinding
+      - provenance
+      - launchId
       - status
       - verdict
       - body
@@ -11003,6 +11315,95 @@ components:
       - review
       - reviews
       - reviewerHandleId
+      type: object
+    ReviewTargetBinding:
+      properties:
+        diffBaseRef:
+          type: string
+        diffBaseSha:
+          type: string
+        executionBaseSha:
+          type: string
+        indexStaged:
+          type: boolean
+        indexStagedKnown:
+          type: boolean
+        observationPhase:
+          type: string
+        observedAt:
+          format: date-time
+          type: string
+        observedBranch:
+          type: string
+        observedHeadSha:
+          type: string
+        targetSha:
+          type: string
+        workspaceDirty:
+          type: boolean
+        workspaceDirtyKnown:
+          type: boolean
+        workspacePath:
+          type: string
+      required:
+      - targetSha
+      - executionBaseSha
+      - workspacePath
+      - observedHeadSha
+      - workspaceDirty
+      - workspaceDirtyKnown
+      - indexStaged
+      - indexStagedKnown
+      - observationPhase
+      - observedAt
+      type: object
+    ReviewerNativeEvidence:
+      properties:
+        completionId:
+          type: string
+        firstTurnId:
+          type: string
+        observedAt:
+          format: date-time
+          type: string
+        sessionId:
+          type: string
+      type: object
+    ReviewerProvenance:
+      properties:
+        aoResolved:
+          $ref: '#/components/schemas/ReviewerSettings'
+        configured:
+          $ref: '#/components/schemas/ReviewerSettings'
+        providerEffective:
+          $ref: '#/components/schemas/ReviewerSettings'
+        providerNative:
+          $ref: '#/components/schemas/ReviewerNativeEvidence'
+        requested:
+          $ref: '#/components/schemas/ReviewerSettings'
+      required:
+      - requested
+      - configured
+      - aoResolved
+      - providerEffective
+      - providerNative
+      type: object
+    ReviewerSettings:
+      properties:
+        effort:
+          type: string
+        harness:
+          type: string
+        mode:
+          type: string
+        model:
+          type: string
+        observed:
+          type: boolean
+        permission:
+          type: string
+      required:
+      - observed
       type: object
     RoleOverride:
       properties:
@@ -11092,6 +11493,69 @@ components:
       - ok
       - sessionId
       - message
+      type: object
+    SessionContinuationChat:
+      properties:
+        available:
+          type: boolean
+        controllerGeneration:
+          type: string
+        providerConversationId:
+          type: string
+        reason:
+          type: string
+      required:
+      - available
+      - reason
+      - providerConversationId
+      - controllerGeneration
+      type: object
+    SessionContinuationReadback:
+      properties:
+        available:
+          type: boolean
+        chat:
+          $ref: '#/components/schemas/SessionContinuationChat'
+        harness:
+          type: string
+        mode:
+          type: string
+        projectId:
+          type: string
+        reason:
+          type: string
+        sessionId:
+          type: string
+        tui:
+          $ref: '#/components/schemas/SessionContinuationTUI'
+      required:
+      - sessionId
+      - projectId
+      - harness
+      - mode
+      - available
+      - reason
+      - chat
+      - tui
+      type: object
+    SessionContinuationTUI:
+      properties:
+        agentSessionId:
+          type: string
+        agentSessionIdLaunchId:
+          type: string
+        available:
+          type: boolean
+        reason:
+          type: string
+        runtimeLaunchId:
+          type: string
+      required:
+      - available
+      - reason
+      - agentSessionId
+      - runtimeLaunchId
+      - agentSessionIdLaunchId
       type: object
     SessionInterfaceTransition:
       properties:
@@ -11665,11 +12129,20 @@ components:
         agentSessionId:
           description: Native reviewer session identifier used to resume its transcript.
           type: string
+        completionId:
+          description: Provider-native completion identifier observed by AO.
+          type: string
         event:
           description: AO hook sub-command that produced this signal.
           type: string
+        firstTurnId:
+          description: Provider-native first-turn identifier observed by AO.
+          type: string
         launchId:
           description: AO process generation that produced the signal.
+          type: string
+        runId:
+          description: Exact review pass that produced the native evidence.
           type: string
         state:
           description: Reviewer activity state reported by a hook. Used for reviewer-pane

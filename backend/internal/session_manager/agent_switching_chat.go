@@ -491,6 +491,7 @@ func (m *Manager) executeChatAgentSwitch(
 				TargetGenerationID:     targetGeneration,
 				ProviderConversationID: started.ProviderConversationID,
 				ControllerGeneration:   started.ControllerGeneration,
+				PresentationHiddenAt:   rec.HiddenAt,
 				ActivatedAt:            activatedAt,
 			}
 			recorder.boundary(domain.AgentSwitchFailureChatTargetActivationCommit)

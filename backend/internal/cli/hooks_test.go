@@ -128,6 +128,20 @@ func TestHookConversationFactsNativeTurnIdentity(t *testing.T) {
 	}
 }
 
+func TestHookReviewRunIDUsesImmutableTaskReference(t *testing.T) {
+	first := []byte(`{"prompt":"Read and follow the AO review task in ` + "`" + `/tmp/ao/prompts/worker/reviewer/requests/batch-1/run-1/task.md` + "`" + `."}`)
+	second := []byte(`{"prompt":"Read and follow the AO review task in ` + "`" + `/tmp/ao/prompts/worker/reviewer/requests/batch-2/run-2/task.md` + "`" + `."}`)
+	if got := hookReviewRunID(first); got != "run-1" {
+		t.Fatalf("first task run id = %q, want run-1", got)
+	}
+	if got := hookReviewRunID(second); got != "run-2" {
+		t.Fatalf("second task run id = %q, want run-2", got)
+	}
+	if got := hookReviewRunID([]byte(`{"prompt":"continue the review"}`)); got != "" {
+		t.Fatalf("unbound prompt run id = %q, want empty", got)
+	}
+}
+
 // activityServer accepts POST /api/v1/sessions/{id}/activity and records what
 // the CLI sent. It mirrors sendServer in send_test.go.
 func activityServer(t *testing.T, status int, respBody string) (*httptest.Server, *activityCapture) {
@@ -603,6 +617,26 @@ func TestHooks_CodexStopDoesNotReportClaudeAssistantCheckpoint(t *testing.T) {
 	}
 	if req.LatestAssistantUpdate != "" {
 		t.Fatalf("Codex Stop promoted Claude-only checkpoint = %q", req.LatestAssistantUpdate)
+	}
+}
+
+func TestHooks_PiPromptSubmitCarriesExactAutomationBatch(t *testing.T) {
+	t.Setenv("AO_SESSION_ID", "ao-7")
+	cfg := setConfigEnv(t)
+	srv, capture := activityServer(t, http.StatusOK, `{"ok":true}`)
+	writeRunFileFor(t, cfg, srv)
+	prompt := "[AO AUTOMATION batch_id=batch-7] machine wake\nworker_turn_settled worker=w"
+	payload := `{"session_id":"pi-native","prompt":` + mustJSONString(t, prompt) + `}`
+	_, _, err := executeCLI(t, Deps{In: strings.NewReader(payload), ProcessAlive: func(int) bool { return true }}, "hooks", "pi", "user-prompt-submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req setActivityAPIRequest
+	if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.LatestUserPrompt != prompt || req.Event != "user-prompt-submit" || req.State != "active" {
+		t.Fatalf("Pi prompt acknowledgement payload = %#v", req)
 	}
 }
 

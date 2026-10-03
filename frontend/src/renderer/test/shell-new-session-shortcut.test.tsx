@@ -150,6 +150,7 @@ vi.mock("../lib/bridge", () => ({
 
 vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspaceQuery: () => shellMocks.state.workspaceQuery,
+	useHiddenWorkspaceQuery: () => ({ data: [] }),
 	useWorkspaceTraySessions: () => ({ data: [] }),
 	workspaceQueryKey: ["workspaces"],
 	workspaceQueryOptions: {},

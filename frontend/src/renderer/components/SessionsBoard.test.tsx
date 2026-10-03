@@ -37,6 +37,7 @@ vi.mock("@tanstack/react-router", () => ({
 
 vi.mock("../hooks/useWorkspaceQuery", () => ({
 	workspaceQueryKey: ["workspaces"],
+	hiddenWorkspaceQueryKey: ["workspaces", "include-hidden"],
 	cloudSessionsQueryKey: ["cloud-sessions"],
 	useWorkspaceQuery: workspaceQueryMock,
 	useWorkspaceScope: (projectId?: string) => {
@@ -115,6 +116,32 @@ beforeEach(() => {
 });
 
 describe("SessionsBoard", () => {
+	it.each([undefined, "p1"])("keeps hidden archived workers reachable in an existing visible project (%s)", async (projectId) => {
+		const active = boardSession({ id: "visible-worker", title: "visible worker", status: "working" });
+		const hiddenAt = "2026-01-01T01:00:00Z";
+		const hiddenArchived = terminatedSession({ title: "hidden archived worker", hiddenAt });
+		const hiddenActive = boardSession({ id: "hidden-active", title: "hidden active worker", status: "working", hiddenAt });
+		workspaceQueryMock.mockImplementation((options?: { includeHidden?: boolean }) => ({
+			data: [workspaceWithSessions(options?.includeHidden
+				? [{ ...active, title: "stale visible worker" }, hiddenArchived, hiddenActive]
+				: [active])],
+			isError: false,
+			isSuccess: true,
+		}));
+
+		renderBoard(projectId);
+
+		expect(screen.getAllByText("visible worker")).toHaveLength(1);
+		expect(screen.queryByText("stale visible worker")).not.toBeInTheDocument();
+		expect(screen.queryByText("hidden active worker")).not.toBeInTheDocument();
+		const archive = await expandArchive();
+		expect(within(archive).getAllByText("hidden archived worker")).toHaveLength(1);
+		await userEvent.click(within(archive).getByRole("button", { name: "Restore hidden archived worker" }));
+		await waitFor(() => expect(postMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/restore", {
+			params: { path: { sessionId: hiddenArchived.id } },
+		}));
+	});
+
 	it("uses the last human message time rather than generic session updatedAt", () => {
 		const presentation = toBoardSessionPresentation(
 			boardSession({

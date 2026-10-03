@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { useEffect, useRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { shellTerminalsQueryKey, type ShellTerminal } from "../hooks/useShellTerminals";
-import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { hiddenWorkspaceQueryKey, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import type { AttachableTerminal } from "../hooks/useTerminalSession";
 import type { TerminalTarget } from "../types/terminal";
 import type { WorkspaceSession } from "../types/workspace";
@@ -293,18 +293,21 @@ function workspaceWithSessions(sessions: WorkspaceSession[]) {
 function renderCachedPane({
 	session,
 	sessions,
+	visibleSessions = sessions,
 	shellTerminals = [],
 	terminalTarget,
 	focusRequested = false,
 }: {
 	session?: WorkspaceSession;
 	sessions: WorkspaceSession[];
+	visibleSessions?: WorkspaceSession[];
 	shellTerminals?: ShellTerminal[];
 	terminalTarget?: TerminalTarget;
 	focusRequested?: boolean;
 }) {
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions(sessions));
+	queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions(visibleSessions));
+	queryClient.setQueryData(hiddenWorkspaceQueryKey, workspaceWithSessions(sessions));
 	queryClient.setQueryData(shellTerminalsQueryKey, shellTerminals);
 	const previousAO = window.ao;
 	window.ao = {} as typeof window.ao;
@@ -663,6 +666,23 @@ describe("TerminalCacheProvider", () => {
 		}
 	});
 
+	it("retains a hidden active terminal when the visible query excludes it", async () => {
+		const hidden = { ...sessionA, id: "sess-hidden", title: "hidden session", hiddenAt: "2026-09-22T12:00:00Z" };
+		const visible = { ...sessionB, title: "visible session" };
+		const view = renderCachedPane({ session: hidden, sessions: [hidden, visible], visibleSessions: [visible] });
+		try {
+			const hiddenTerminal = await waitFor(() => activeXterm());
+			view.show(visible);
+			await waitFor(() => expect(activeXterm()).not.toBe(hiddenTerminal));
+
+			expect(document.querySelector(`[data-terminal-cache-key^="session:${hidden.id}:worker|"]`)).toBeInTheDocument();
+			expect(hiddenTerminal.isConnected).toBe(true);
+			expect(xtermUnmounts.value).toBe(0);
+		} finally {
+			view.restore();
+		}
+	});
+
 	it("skips layout for a retained terminal while it is parked", async () => {
 		const view = renderCachedPane({ session: sessionA, sessions: [sessionA, sessionB] });
 		try {
@@ -728,7 +748,7 @@ describe("TerminalCacheProvider", () => {
 		try {
 			const oldGeneration = await waitFor(() => activeXterm());
 			act(() => {
-				view.queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions([replacement]));
+				view.queryClient.setQueryData(hiddenWorkspaceQueryKey, workspaceWithSessions([replacement]));
 			});
 			view.show(replacement);
 
@@ -749,7 +769,7 @@ describe("TerminalCacheProvider", () => {
 		try {
 			const oldGeneration = await waitFor(() => activeXterm());
 			act(() => {
-				view.queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions([replacement]));
+				view.queryClient.setQueryData(hiddenWorkspaceQueryKey, workspaceWithSessions([replacement]));
 			});
 			view.show(replacement);
 
@@ -769,7 +789,7 @@ describe("TerminalCacheProvider", () => {
 			view.show(sessionB);
 			await waitFor(() => expect(activeXterm()).not.toBe(terminalA));
 			act(() => {
-				view.queryClient.setQueryData(workspaceQueryKey, workspaceWithSessions([sessionB]));
+				view.queryClient.setQueryData(hiddenWorkspaceQueryKey, workspaceWithSessions([sessionB]));
 			});
 
 			await waitFor(() => expect(terminalA.isConnected).toBe(false));

@@ -80,6 +80,25 @@ func TestBuild_MatchesEmbedded(t *testing.T) {
 	}
 }
 
+func TestBuild_ListOrchestratorsDocumentsBadRequest(t *testing.T) {
+	got, err := specgen.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	var doc struct {
+		Paths map[string]map[string]struct {
+			Responses map[string]any `yaml:"responses"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal(got, &doc); err != nil {
+		t.Fatalf("parse generated OpenAPI: %v", err)
+	}
+	responses := doc.Paths["/api/v1/orchestrators"]["get"].Responses
+	if _, ok := responses["400"]; !ok {
+		t.Fatal("GET /api/v1/orchestrators is missing the documented 400 response")
+	}
+}
+
 func TestBuild_InstallJobTargetRemainsAnEnum(t *testing.T) {
 	got, err := specgen.Build()
 	if err != nil {

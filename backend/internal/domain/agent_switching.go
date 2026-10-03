@@ -407,7 +407,10 @@ type AgentSwitchTargetActivation struct {
 	TargetNativeSessionRef        AgentNativeSessionID
 	TargetGenerationID            AgentGenerationID
 	RuntimeHandleID               string
-	ActivatedAt                   time.Time
+	// PresentationHiddenAt is cleared only after ownership commits; it is not
+	// part of the provider/lifecycle ownership precondition.
+	PresentationHiddenAt *time.Time
+	ActivatedAt          time.Time
 }
 
 // AgentSwitchSourceStopConfirmation records the conclusive source-controller
@@ -441,7 +444,10 @@ type AgentSwitchChatTargetActivation struct {
 	TargetGenerationID                 AgentGenerationID
 	ProviderConversationID             string
 	ControllerGeneration               string
-	ActivatedAt                        time.Time
+	// PresentationHiddenAt is cleared only after ownership commits; it is not
+	// part of the provider/lifecycle ownership precondition.
+	PresentationHiddenAt *time.Time
+	ActivatedAt          time.Time
 }
 
 var (

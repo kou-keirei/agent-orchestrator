@@ -28,6 +28,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => ({
 
 vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspaceQuery: () => ({ data: routeMocks.workspaces, isSuccess: true }),
+	useHiddenWorkspaceQuery: () => ({ data: [] }),
 }));
 
 vi.mock("../hooks/useSystemRequirementsGate", () => ({

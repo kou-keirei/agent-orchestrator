@@ -34,6 +34,8 @@ type fakeStore struct {
 	signatureWrites   int
 	chatSpawnErr      error
 	chatSpawnCalls    []domain.ConversationBranch
+	clearHiddenErr    error
+	clearHiddenResult *bool
 }
 
 func newFakeStore() *fakeStore {
@@ -113,6 +115,35 @@ func (f *fakeStore) UpdateSession(_ context.Context, rec domain.SessionRecord) e
 	return nil
 }
 
+func (f *fakeStore) SetSessionHidden(_ context.Context, id domain.SessionID, hiddenAt *time.Time) (bool, error) {
+	rec, ok := f.sessions[id]
+	if !ok {
+		return false, nil
+	}
+	rec.HiddenAt = hiddenAt
+	rec.Revision++
+	f.sessions[id] = rec
+	return true, nil
+}
+
+func (f *fakeStore) ClearSessionHiddenIfUnchanged(_ context.Context, id domain.SessionID, expectedHiddenAt *time.Time) (bool, error) {
+	if f.clearHiddenErr != nil {
+		return false, f.clearHiddenErr
+	}
+	if f.clearHiddenResult != nil {
+		return *f.clearHiddenResult, nil
+	}
+	rec, ok := f.sessions[id]
+	if !ok || (rec.HiddenAt == nil) != (expectedHiddenAt == nil) ||
+		(rec.HiddenAt != nil && !rec.HiddenAt.Equal(*expectedHiddenAt)) {
+		return false, nil
+	}
+	rec.HiddenAt = nil
+	rec.Revision++
+	f.sessions[id] = rec
+	return true, nil
+}
+
 func (f *fakeStore) UpdateSessionFromActivitySignal(_ context.Context, rec domain.SessionRecord, expected int64) (bool, error) {
 	if f.sessions[rec.ID].Revision != expected {
 		return false, nil
@@ -125,6 +156,73 @@ func (f *fakeStore) UpdateSessionFromActivitySignal(_ context.Context, rec domai
 type activityRevisionConflictStore struct {
 	*fakeStore
 	conflictNext bool
+	atomicCalls  int
+}
+
+type fakeOrchestrationBatchAcknowledgementStore struct {
+	*fakeStore
+	acknowledged []string
+}
+
+type terminalSourceStore struct {
+	*fakeStore
+	sources []string
+}
+
+func (f *terminalSourceStore) UpdateSession(ctx context.Context, rec domain.SessionRecord) error {
+	previous := f.sessions[rec.ID]
+	if err := f.fakeStore.UpdateSession(ctx, rec); err != nil {
+		return err
+	}
+	current := f.sessions[rec.ID]
+	if !previous.IsTerminated && current.IsTerminated {
+		current.TerminalRevision = current.Revision
+	} else if !current.IsTerminated {
+		current.TerminalRevision = 0
+	} else {
+		current.TerminalRevision = previous.TerminalRevision
+	}
+	f.sessions[rec.ID] = current
+	return nil
+}
+
+func (f *terminalSourceStore) RecordOrchestrationSourceState(
+	_ context.Context,
+	_ domain.ProjectID,
+	_ domain.SessionID,
+	_ domain.OrchestrationEventKind,
+	source string,
+	_ bool,
+	_ time.Time,
+) (bool, error) {
+	f.sources = append(f.sources, source)
+	return true, nil
+}
+
+func (f *fakeOrchestrationBatchAcknowledgementStore) AcknowledgeOrchestrationBatchAccepted(
+	_ context.Context,
+	_ domain.SessionID,
+	token string,
+	_ time.Time,
+) (int64, error) {
+	f.acknowledged = append(f.acknowledged, token)
+	return 1, nil
+}
+
+func (f *activityRevisionConflictStore) CommitActivityAndOrchestrationEvent(
+	ctx context.Context,
+	rec domain.SessionRecord,
+	_ domain.OrchestrationEvent,
+) (bool, error) {
+	f.atomicCalls++
+	if f.conflictNext {
+		f.conflictNext = false
+		current := f.sessions[rec.ID]
+		current.Revision = rec.Revision + 1
+		f.sessions[rec.ID] = current
+		return false, nil
+	}
+	return f.fakeStore.UpdateSessionFromActivitySignal(ctx, rec, rec.Revision)
 }
 
 func (f *activityRevisionConflictStore) UpdateSessionFromActivitySignal(
@@ -2348,6 +2446,56 @@ func TestMarkSpawnedStoresRuntimeMetadata(t *testing.T) {
 	}
 }
 
+func TestMarkSpawnedClearsPresentationHiddenState(t *testing.T) {
+	m, st, _ := newManager()
+	rec := st.sessions["mer-1"]
+	hiddenAt := time.Now().UTC().Add(-time.Hour)
+	rec.HiddenAt = &hiddenAt
+	st.sessions[rec.ID] = rec
+
+	if err := m.MarkSpawned(context.Background(), rec.ID, domain.SessionMetadata{RuntimeLaunchID: "launch-visible"}); err != nil {
+		t.Fatalf("MarkSpawned: %v", err)
+	}
+	if got := st.sessions[rec.ID].HiddenAt; got != nil {
+		t.Fatalf("HiddenAt = %v after successful activation, want nil", got)
+	}
+}
+
+func TestMarkSpawnedKeepsSuccessfulActivationWhenVisibilityClearFails(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminated bool
+		clearErr   error
+		clearRows  bool
+	}{
+		{name: "spawn persistence error", clearErr: errors.New("visibility write failed")},
+		{name: "restore CAS miss", terminated: true, clearRows: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, _ := newManager()
+			rec := working("mer-1")
+			rec.IsTerminated = tc.terminated
+			hiddenAt := time.Now().UTC().Add(-time.Hour)
+			rec.HiddenAt = &hiddenAt
+			st.sessions[rec.ID] = rec
+			st.clearHiddenErr = tc.clearErr
+			st.clearHiddenResult = &tc.clearRows
+
+			if err := m.MarkSpawned(context.Background(), rec.ID, domain.SessionMetadata{RuntimeLaunchID: "launch-visible"}); err != nil {
+				t.Fatalf("MarkSpawned: %v", err)
+			}
+			got := st.sessions[rec.ID]
+			if got.IsTerminated || got.Activity.State != domain.ActivityIdle || got.Metadata.RuntimeLaunchID != "launch-visible" {
+				t.Fatalf("successful activation was not retained: %+v", got)
+			}
+			if got.HiddenAt == nil || !got.HiddenAt.Equal(hiddenAt) {
+				t.Fatalf("presentation state = %v, want the existing hide preserved after failed clear", got.HiddenAt)
+			}
+		})
+	}
+}
+
 func TestMarkSpawnedPersistsAndPreservesDiffBase(t *testing.T) {
 	m, st, _ := newManager()
 	st.sessions["mer-1"] = domain.SessionRecord{ID: "mer-1", ProjectID: "mer", IsTerminated: true}
@@ -2385,6 +2533,7 @@ func TestCommitControllerEpochOwnsModeAndActivityFacts(t *testing.T) {
 	st.sessions["mer-1"] = domain.SessionRecord{
 		ID: "mer-1", ProjectID: "mer", Mode: domain.SessionModeTUI,
 		Activity: domain.Activity{State: domain.ActivityWaitingInput, LastActivityAt: time.Unix(10, 0)},
+		HiddenAt: func() *time.Time { at := time.Unix(5, 0); return &at }(),
 		Metadata: domain.SessionMetadata{
 			RuntimeHandleID: "runtime-1", RuntimeLaunchID: "launch-1",
 			AgentSessionID:   "native-1",
@@ -2401,8 +2550,8 @@ func TestCommitControllerEpochOwnsModeAndActivityFacts(t *testing.T) {
 		t.Fatalf("CommitControllerEpoch: changed=%v err=%v", changed, err)
 	}
 	got := st.sessions["mer-1"]
-	if got.Mode != domain.SessionModeChat || got.Activity.State != domain.ActivityIdle {
-		t.Fatalf("controller facts = mode:%q activity:%q", got.Mode, got.Activity.State)
+	if got.Mode != domain.SessionModeChat || got.Activity.State != domain.ActivityIdle || got.HiddenAt == nil {
+		t.Fatalf("controller facts = mode:%q activity:%q hidden_at:%v, want hidden", got.Mode, got.Activity.State, got.HiddenAt)
 	}
 	if got.Metadata.RuntimeHandleID != "" || got.Metadata.RuntimeLaunchID != "" ||
 		got.Metadata.AgentSessionID != "native-1" ||
@@ -2429,6 +2578,9 @@ func TestCommitControllerEpochOwnsModeAndActivityFacts(t *testing.T) {
 		t.Fatalf("restore Chat -> TUI controller epoch: changed=%v err=%v", changed, err)
 	}
 	got = st.sessions["mer-1"]
+	if got.HiddenAt == nil {
+		t.Fatal("failed handoff rollback cleared hidden_at; inactive source must remain hidden")
+	}
 	if got.Metadata.ConversationCheckpointState != domain.ConversationCheckpointComplete ||
 		got.Metadata.LatestUserPrompt != "trusted Terminal turn A" ||
 		got.Metadata.LatestAssistantUpdate != "trusted Terminal answer A" {
@@ -4100,6 +4252,28 @@ func TestActivity_SameStateRepeatAfterReceiptIsNoOp(t *testing.T) {
 	}
 }
 
+func TestActivity_SameStateTUIPromptAcknowledgesOrchestrationBatch(t *testing.T) {
+	st := &fakeOrchestrationBatchAcknowledgementStore{fakeStore: newFakeStore()}
+	rec := working("mer-1")
+	rec.Mode = domain.SessionModeTUI
+	rec.Metadata.RuntimeLaunchID = "launch-1"
+	rec.Metadata.AgentSessionID = "native-1"
+	rec.Metadata.AgentSessionIDLaunchID = "launch-1"
+	st.sessions[rec.ID] = rec
+	m := New(st, nil)
+	signal := ports.ActivitySignal{
+		Valid: true, State: domain.ActivityActive, Event: "user-prompt-submit",
+		LaunchID: "launch-1", AgentSessionID: "native-1",
+		LatestUserPrompt: "[AO AUTOMATION batch_id=batch-same] reconcile",
+	}
+	if err := m.ApplyActivitySignal(ctx, rec.ID, signal); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.acknowledged) != 1 || st.acknowledged[0] != "batch-same" {
+		t.Fatalf("acknowledged batches=%v, want batch-same", st.acknowledged)
+	}
+}
+
 func TestMarkSpawnedClearsFirstSignalAndLeavesResumeIdentityUnverified(t *testing.T) {
 	m, st, _ := newManager()
 	rec := working("mer-1")
@@ -4792,6 +4966,31 @@ func TestMarkTerminated_NilReaperSkipsWithoutProjectLookup(t *testing.T) {
 	}
 }
 
+func TestMarkTerminatedWithoutRuntimeIdentityUsesStableTerminalRevision(t *testing.T) {
+	st := &terminalSourceStore{fakeStore: newFakeStore()}
+	m := New(st, nil)
+	rec := working("mer-1")
+	rec.Kind = domain.KindWorker
+	rec.Metadata.RuntimeLaunchID = ""
+	rec.Metadata.ControllerGeneration = ""
+	st.sessions[rec.ID] = rec
+
+	if err := m.MarkTerminated(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	terminated := st.sessions[rec.ID]
+	terminated.UpdatedAt = terminated.UpdatedAt.Add(time.Hour)
+	if err := st.UpdateSession(ctx, terminated); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkTerminated(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.sources) != 2 || st.sources[0] != "terminal-revision:1" || st.sources[0] != st.sources[1] {
+		t.Fatalf("terminal source identities=%v, want the same durable identity", st.sources)
+	}
+}
+
 // TestMarkTerminated_MissingProjectSkipsRatherThanReaps is the regression for
 // failing open on a missing project record: GetProject returning ok=false,
 // err=nil is ambiguity (AO cannot know whether ContainerReap.Disabled would
@@ -5178,6 +5377,22 @@ func TestActivitySignalRetryPreservesCursorPermissionCorrelation(t *testing.T) {
 	}
 }
 
+func TestActivitySignalAtomicProjectionRetriesAfterRevisionConflict(t *testing.T) {
+	st := &activityRevisionConflictStore{fakeStore: newFakeStore(), conflictNext: true}
+	seedSignaled(st.fakeStore, "mer-1", domain.ActivityActive)
+	rec := st.sessions["mer-1"]
+	rec.Kind = domain.KindWorker
+	st.sessions["mer-1"] = rec
+	m := New(st, nil)
+	mustApply(t, m, "mer-1", sig(domain.ActivityBlocked, "permission-request", "Bash", ""))
+	if st.atomicCalls < 2 {
+		t.Fatalf("atomic activity/event barrier calls=%d, want conflict and retry", st.atomicCalls)
+	}
+	if got := stateOf(st.fakeStore, "mer-1"); got != domain.ActivityBlocked {
+		t.Fatalf("state after atomic revision retry=%q, want blocked", got)
+	}
+}
+
 // TestEmitTelemetryStampsRequestID covers the shared lifecycle emit path: an
 // HTTP-driven activity signal must tag its events with the request id so the
 // lifecycle rows join to the request, while reaper/poller ticks (a plain
@@ -5404,7 +5619,10 @@ func TestActivateAgentSwitchTargetResetsDeadProbeSequence(t *testing.T) {
 	rec.Harness = domain.HarnessClaudeCode
 	rec.Activity = domain.Activity{State: domain.ActivityExited, LastActivityAt: activatedAt.Add(-time.Minute)}
 	rec.Metadata.RuntimeLaunchID = "source-generation"
+	hiddenAt := activatedAt.Add(-2 * time.Minute)
+	rec.HiddenAt = &hiddenAt
 	store.setSession(rec)
+	store.clearHiddenErr = errors.New("visibility persistence unavailable")
 	store.setActiveSwitch(domain.AgentSwitch{
 		ID: "switch-1", SessionID: rec.ID, FromHarness: domain.HarnessClaudeCode,
 		TargetHarness: domain.HarnessCodex, State: domain.AgentSwitchStartingTarget,
@@ -5418,13 +5636,16 @@ func TestActivateAgentSwitchTargetResetsDeadProbeSequence(t *testing.T) {
 		SwitchID: "switch-1", SessionID: rec.ID, SourceHarness: domain.HarnessClaudeCode,
 		SourceGenerationID: "source-generation", ExpectedSourceRuntimeLaunchID: "source-generation",
 		TargetHarness: domain.HarnessCodex, TargetGenerationID: "target-generation",
-		RuntimeHandleID: "runtime-1", ActivatedAt: activatedAt,
+		RuntimeHandleID: "runtime-1", ActivatedAt: activatedAt, PresentationHiddenAt: &hiddenAt,
 	})
 	if err != nil || !activated {
 		t.Fatalf("ActivateAgentSwitchTarget = (%v, %v), want (true, nil)", activated, err)
 	}
 	if _, ok := m.consecutiveDeadProbes[rec.ID]; ok {
 		t.Fatal("agent-switch activation retained the source dead-probe streak")
+	}
+	if got := store.session(rec.ID); got.HiddenAt == nil || !got.HiddenAt.Equal(hiddenAt) {
+		t.Fatalf("agent-switch activation lost presentation state after clear failure: %v", got.HiddenAt)
 	}
 
 	if err := m.ApplyRuntimeObservation(ctx, rec.ID, ports.RuntimeFacts{

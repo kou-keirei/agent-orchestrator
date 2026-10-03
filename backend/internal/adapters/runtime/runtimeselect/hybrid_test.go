@@ -3,10 +3,13 @@ package runtimeselect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/conpty"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -14,6 +17,7 @@ import (
 type fakeBackend struct {
 	createHandle ports.RuntimeHandle
 	createErr    error
+	destroyErr   error
 	calls        []string
 	handles      []ports.RuntimeHandle
 	childAlive   bool
@@ -28,7 +32,7 @@ func (f *fakeBackend) record(call string, handle ports.RuntimeHandle) {
 func (f *fakeBackend) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	f.calls = append(f.calls, "create:"+string(cfg.SessionID))
 	if f.createErr != nil {
-		return ports.RuntimeHandle{}, f.createErr
+		return f.createHandle, f.createErr
 	}
 	if f.createHandle.ID != "" {
 		return f.createHandle, nil
@@ -38,7 +42,7 @@ func (f *fakeBackend) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.
 
 func (f *fakeBackend) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
 	f.record("destroy", handle)
-	return nil
+	return f.destroyErr
 }
 
 func (f *fakeBackend) GetOutput(_ context.Context, handle ports.RuntimeHandle, _ int) (string, error) {
@@ -130,6 +134,21 @@ func (fakeStream) Write(p []byte) (int, error) { return len(p), nil }
 func (fakeStream) Close() error                { return nil }
 func (fakeStream) Resize(_, _ uint16) error    { return nil }
 
+type possibleRuntimeCreateError struct {
+	handle  ports.RuntimeHandle
+	cleanup ports.RuntimeCleanupOutcome
+}
+
+func (e possibleRuntimeCreateError) Error() string { return "direct create may have applied" }
+
+func (e possibleRuntimeCreateError) PossibleHandle() ports.RuntimeHandle { return e.handle }
+
+func (e possibleRuntimeCreateError) EffectOutcome() ports.RuntimeEffectOutcome {
+	return ports.RuntimeEffectPossible
+}
+
+func (e possibleRuntimeCreateError) CleanupOutcome() ports.RuntimeCleanupOutcome { return e.cleanup }
+
 func TestHybridRuntimeCreatesDirectHandle(t *testing.T) {
 	legacy := &restartableFakeBackend{}
 	direct := &fakeBackend{}
@@ -161,6 +180,124 @@ func TestHybridRuntimeFallsBackToTmuxWhenDirectCreateFails(t *testing.T) {
 	}
 	if !reflect.DeepEqual(legacy.calls, []string{"create:session-1"}) {
 		t.Fatalf("legacy calls = %v", legacy.calls)
+	}
+}
+
+func TestHybridRuntimeCleansPossibleDirectHandleBeforeAcceptingFallback(t *testing.T) {
+	legacy := &restartableFakeBackend{}
+	direct := &fakeBackend{
+		createHandle: ports.RuntimeHandle{ID: "direct-partial"},
+		createErr: possibleRuntimeCreateError{
+			handle:  ports.RuntimeHandle{ID: "direct-partial"},
+			cleanup: ports.RuntimeCleanupNotAttempted,
+		},
+	}
+	runtime := newHybridRuntime(legacy, direct, nil, "Linux")
+
+	handle, err := runtime.Create(context.Background(), ports.RuntimeConfig{SessionID: "session-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle.ID != "session-1" {
+		t.Fatalf("fallback handle = %q, want accepted tmux handle", handle.ID)
+	}
+	if !reflect.DeepEqual(direct.calls, []string{"create:session-1", "destroy"}) || direct.handles[0].ID != "direct-partial" {
+		t.Fatalf("direct cleanup = %v handles=%v, want exact possible handle", direct.calls, direct.handles)
+	}
+	if !reflect.DeepEqual(legacy.calls, []string{"create:session-1"}) {
+		t.Fatalf("legacy calls = %v, want fallback after proven cleanup", legacy.calls)
+	}
+}
+
+func TestHybridRuntimeRetainsUnresolvedDirectHandleAndBlocksFallback(t *testing.T) {
+	legacy := &restartableFakeBackend{}
+	direct := &fakeBackend{
+		createHandle: ports.RuntimeHandle{ID: "direct-partial"},
+		createErr: possibleRuntimeCreateError{
+			handle:  ports.RuntimeHandle{ID: "direct-partial"},
+			cleanup: ports.RuntimeCleanupNotAttempted,
+		},
+		destroyErr: errors.New("direct cleanup uncertain"),
+	}
+	runtime := newHybridRuntime(legacy, direct, nil, "Linux")
+
+	_, err := runtime.Create(context.Background(), ports.RuntimeConfig{SessionID: "session-1"})
+	if err == nil {
+		t.Fatal("Create unexpectedly accepted fallback with unresolved direct handle")
+	}
+	var effectErr ports.RuntimeEffectError
+	if !errors.As(err, &effectErr) || effectErr.PossibleHandle().ID != directHandlePrefix+"direct-partial" || effectErr.CleanupOutcome() != ports.RuntimeCleanupFailed {
+		t.Fatalf("Create error = %v, want exact unresolved direct cleanup evidence", err)
+	}
+	if len(legacy.calls) != 0 {
+		t.Fatalf("legacy fallback calls = %v, want none while direct cleanup is unresolved", legacy.calls)
+	}
+}
+
+func TestHybridRuntimeFailedCreateCleanupKeepsDirectRouting(t *testing.T) {
+	for _, platform := range []string{"macOS", "Linux"} {
+		for _, returnedHandle := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/returned=%t", platform, returnedHandle), func(t *testing.T) {
+				legacy := &restartableFakeBackend{}
+				direct := &fakeBackend{
+					createErr:  possibleRuntimeCreateError{handle: ports.RuntimeHandle{ID: "review-session"}, cleanup: ports.RuntimeCleanupNotAttempted},
+					destroyErr: errors.New("direct cleanup unresolved"),
+				}
+				if returnedHandle {
+					direct.createHandle.ID = "review-session"
+				}
+				rt := newHybridRuntime(legacy, direct, nil, platform)
+				_, err := rt.Create(context.Background(), ports.RuntimeConfig{SessionID: "review-session"})
+				var effectErr ports.RuntimeEffectError
+				if !errors.As(err, &effectErr) {
+					t.Fatalf("missing possible-effect evidence: %v", err)
+				}
+				handle := effectErr.PossibleHandle()
+				if handle.ID != directHandlePrefix+"review-session" {
+					t.Fatalf("possible direct handle lost route: %+v", handle)
+				}
+				if alive, err := rt.IsAlive(context.Background(), handle); err != nil || !alive {
+					t.Fatalf("possible direct host disappeared during retry: %t, %v", alive, err)
+				}
+				if err := rt.Destroy(context.Background(), handle); !errors.Is(err, direct.destroyErr) {
+					t.Fatalf("cleanup retry lost direct failure: %v", err)
+				}
+				if len(legacy.calls) != 0 || !reflect.DeepEqual(direct.calls, []string{"create:review-session", "destroy", "alive", "destroy"}) {
+					t.Fatalf("cleanup routes: direct=%v legacy=%v", direct.calls, legacy.calls)
+				}
+				for _, raw := range direct.handles {
+					if raw.ID != "review-session" {
+						t.Fatalf("direct backend received opaque routing identity: %+v", raw)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestHybridRuntimeGenerationProbeUsesNativeDirectSessionIdentity(t *testing.T) {
+	for _, platform := range []string{"macOS", "Linux"} {
+		t.Run(platform, func(t *testing.T) {
+			legacy := &restartableFakeBackend{}
+			direct := conpty.New(conpty.Options{RunFilePath: filepath.Join(t.TempDir(), "running.json")})
+			rt := newHybridRuntime(legacy, direct, nil, platform)
+			for _, name := range []string{"review-session", "review-session-replacement-abc"} {
+				handle := ports.RuntimeHandle{ID: directHandlePrefix + name}
+				ref := ports.FencedRuntimeRef{Handle: handle, SessionID: SessionIDForHandle(handle), Generation: "launch-1"}
+				probe := rt.ProbeFencedRuntime(context.Background(), ref)
+				if probe.Liveness != ports.FencedDead || probe.Reason != ports.FencedReasonExactAbsent {
+					t.Fatalf("native session identity was rejected: ref=%+v probe=%+v", ref, probe)
+				}
+				ref.SessionID = domain.SessionID(handle.ID)
+				probe = rt.ProbeFencedRuntime(context.Background(), ref)
+				if probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonIdentityMissing {
+					t.Fatalf("opaque/foreign session identity was accepted: %+v", probe)
+				}
+			}
+			if len(legacy.calls) != 0 {
+				t.Fatalf("generation probes reached legacy runtime: %v", legacy.calls)
+			}
+		})
 	}
 }
 

@@ -178,11 +178,19 @@ function ShellLayout() {
 	const { client: cloudClient } = useCloudCp();
 	const { org: cloudOrg } = useCloudOrg();
 	const workspaceQuery = useWorkspaceQuery();
+	const hiddenWorkspaceQuery = useWorkspaceQuery({ includeHidden: true });
 	const workspaces = workspaceQuery.data ?? [];
+	// Shell-wide actions must still resolve a routed presentation-hidden session
+	// (browser links, session navigation, and new-shell context). Keep this
+	// separate from the default visible project list used by the sidebar and
+	// project-number shortcuts.
+	const actionWorkspaces = hiddenWorkspaceQuery.data ?? workspaces;
 	// Global shortcut listeners need the latest workspace list, but recreating
 	// those subscriptions for every streamed activity update is avoidable.
 	const workspacesRef = useRef(workspaces);
 	workspacesRef.current = workspaces;
+	const actionWorkspacesRef = useRef(actionWorkspaces);
+	actionWorkspacesRef.current = actionWorkspaces;
 	const daemonStatus = useDaemonStatus(queryClient);
 	const [workspaceStartupState, setWorkspaceStartupState] = useState<"loading" | "ready" | "error">("loading");
 	const workspaceStartupBaselineRef = useRef(0);
@@ -231,7 +239,7 @@ function ShellLayout() {
 	const [isKeyboardShortcutsOpen, setIsKeyboardShortcutsOpen] = useState(false);
 	const [isKeyboardShortcutsSettingsOpen, setIsKeyboardShortcutsSettingsOpen] = useState(false);
 	const routeParams = useParams({ strict: false }) as { projectId?: string; sessionId?: string };
-	const linkSession = workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === routeParams.sessionId);
+	const linkSession = actionWorkspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === routeParams.sessionId);
 	const openBrowserLink = useSessionBrowserLink(linkSession);
 	const canOpenBrowserLink = linkSession?.kind === "worker" && sessionIsActive(linkSession);
 	useEffect(() => {
@@ -300,10 +308,10 @@ function ShellLayout() {
 	const scopedProjectId = routeParams.projectId
 		? routeParams.projectId
 		: routeParams.sessionId
-			? workspaces.find((workspace) => workspace.sessions.some((session) => session.id === routeParams.sessionId))?.id
+			? actionWorkspaces.find((workspace) => workspace.sessions.some((session) => session.id === routeParams.sessionId))?.id
 			: undefined;
 	const scopedSession = routeParams.sessionId
-		? workspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === routeParams.sessionId)
+		? actionWorkspaces.flatMap((workspace) => workspace.sessions).find((session) => session.id === routeParams.sessionId)
 		: undefined;
 	// Warms the New Task composer's model-catalog cache while the user is just
 	// looking at the project, so the picker never shows a loading flash the
@@ -364,7 +372,7 @@ function ShellLayout() {
 	const navigateSession = useCallback(
 		(direction: -1 | 1) => {
 			if (!scopedProjectId) return;
-			const sessions = (workspacesRef.current.find((workspace) => workspace.id === scopedProjectId)?.sessions ?? []).filter(
+			const sessions = (actionWorkspacesRef.current.find((workspace) => workspace.id === scopedProjectId)?.sessions ?? []).filter(
 				sessionIsActive,
 			);
 			if (sessions.length === 0) return;
@@ -1086,6 +1094,7 @@ function ShellLayout() {
 						resizeAuxiliaryTargetRef={sidebarDragStripRef}
 						workspaceError={workspaceQuery.isError ? errorMessage(workspaceQuery.error) : undefined}
 						workspaces={workspaces}
+						hiddenWorkspaces={hiddenWorkspaceQuery.data ?? []}
 					/>
 					<main className={cn("flex min-w-0 flex-1 flex-col overflow-x-hidden", !sidebarHasLayout && "sidebar-hidden")}>
 						<div className="min-h-0 flex-1 overflow-x-hidden">

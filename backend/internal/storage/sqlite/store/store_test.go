@@ -1752,6 +1752,143 @@ func TestSessionPinFiresCDCEvent(t *testing.T) {
 	}
 }
 
+func TestSessionHiddenPersistsWithoutLifecycleMutation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	record := sampleRecord("mer")
+	record.IsTerminated = false
+	record.Activity.State = domain.ActivityActive
+	record.Metadata.Branch = "feature/keep-me"
+	record.Metadata.WorkspacePath = "/tmp/worktree"
+	r, _ := s.CreateSession(ctx, record)
+
+	hiddenAt := r.UpdatedAt.Add(time.Minute)
+	if ok, err := s.SetSessionHidden(ctx, r.ID, &hiddenAt); err != nil || !ok {
+		t.Fatalf("hide: ok=%v err=%v", ok, err)
+	}
+	got, found, err := s.GetSession(ctx, r.ID)
+	if err != nil || !found {
+		t.Fatalf("get hidden session: found=%v err=%v", found, err)
+	}
+	if got.HiddenAt == nil || !got.HiddenAt.Equal(hiddenAt) || !got.UpdatedAt.Equal(r.UpdatedAt) || got.IsTerminated || got.Activity.State != domain.ActivityActive || got.Metadata.Branch != record.Metadata.Branch || got.Metadata.WorkspacePath != record.Metadata.WorkspacePath {
+		t.Fatalf("hidden session facts = %+v; hide must be presentation-only", got)
+	}
+	if ok, err := s.SetSessionHidden(ctx, r.ID, nil); err != nil || !ok {
+		t.Fatalf("unhide: ok=%v err=%v", ok, err)
+	}
+	got, _, err = s.GetSession(ctx, r.ID)
+	if err != nil || got.HiddenAt != nil || got.Metadata.Branch != record.Metadata.Branch || got.Metadata.WorkspacePath != record.Metadata.WorkspacePath {
+		t.Fatalf("unhidden session = %+v, err=%v", got, err)
+	}
+}
+
+func TestSessionHiddenAtPersistsThroughCreateSession(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	record := sampleRecord("mer")
+	hiddenAt := record.CreatedAt.Add(2 * time.Minute)
+	record.HiddenAt = &hiddenAt
+
+	created, err := s.CreateSession(ctx, record)
+	if err != nil {
+		t.Fatalf("create hidden session: %v", err)
+	}
+	got, found, err := s.GetSession(ctx, created.ID)
+	if err != nil || !found {
+		t.Fatalf("read created hidden session: found=%v err=%v", found, err)
+	}
+	if got.HiddenAt == nil || !got.HiddenAt.Equal(hiddenAt) {
+		t.Fatalf("created HiddenAt = %v, want %v", got.HiddenAt, hiddenAt)
+	}
+}
+
+func TestListSessionsByProjectLoadsHiddenAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	r, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hiddenAt := r.UpdatedAt.Add(time.Minute)
+	if ok, err := s.SetSessionHidden(ctx, r.ID, &hiddenAt); err != nil || !ok {
+		t.Fatalf("hide: ok=%v err=%v", ok, err)
+	}
+	rows, err := s.ListSessions(ctx, "mer")
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID == r.ID {
+			if row.HiddenAt == nil || !row.HiddenAt.Equal(hiddenAt) {
+				t.Fatalf("listed HiddenAt = %v, want %v", row.HiddenAt, hiddenAt)
+			}
+			return
+		}
+	}
+	t.Fatalf("listed sessions did not contain %s", r.ID)
+}
+
+func TestSessionHiddenActivationCASPreservesNewerUserHide(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	r, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHide := r.UpdatedAt.Add(time.Minute)
+	newerHide := firstHide.Add(time.Minute)
+	if ok, err := s.SetSessionHidden(ctx, r.ID, &firstHide); err != nil || !ok {
+		t.Fatalf("first hide: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.SetSessionHidden(ctx, r.ID, &newerHide); err != nil || !ok {
+		t.Fatalf("newer hide: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.ClearSessionHiddenIfUnchanged(ctx, r.ID, &firstHide); err != nil || ok {
+		t.Fatalf("stale activation clear: ok=%v err=%v, want CAS miss", ok, err)
+	}
+	current, found, err := s.GetSession(ctx, r.ID)
+	if err != nil || !found || current.HiddenAt == nil || !current.HiddenAt.Equal(newerHide) {
+		t.Fatalf("newer hide after stale activation clear = found:%v hidden:%v err:%v", found, current.HiddenAt, err)
+	}
+	if ok, err := s.ClearSessionHiddenIfUnchanged(ctx, r.ID, &newerHide); err != nil || !ok {
+		t.Fatalf("matching activation clear: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestStaleFullSessionUpdateCannotOverwriteVisibility(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	record, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, found, err := s.GetSession(ctx, record.ID)
+	if err != nil || !found {
+		t.Fatalf("read stale session: found=%v err=%v", found, err)
+	}
+	hiddenAt := record.UpdatedAt.Add(time.Minute)
+	if ok, err := s.SetSessionHidden(ctx, record.ID, &hiddenAt); err != nil || !ok {
+		t.Fatalf("hide session: ok=%v err=%v", ok, err)
+	}
+	stale.Activity.State = domain.ActivityWaitingInput
+	stale.UpdatedAt = hiddenAt.Add(time.Second)
+	if err := s.UpdateSession(ctx, stale); err != nil {
+		t.Fatalf("stale lifecycle update: %v", err)
+	}
+	current, found, err := s.GetSession(ctx, record.ID)
+	if err != nil || !found {
+		t.Fatalf("read current session: found=%v err=%v", found, err)
+	}
+	if current.HiddenAt == nil || !current.HiddenAt.Equal(hiddenAt) {
+		t.Fatalf("stale full-row update overwrote hidden_at: %v, want %v", current.HiddenAt, hiddenAt)
+	}
+}
+
 func TestConcurrentSessionCreateAssignsUniqueNums(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

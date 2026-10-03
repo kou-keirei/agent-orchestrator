@@ -527,6 +527,10 @@ type WorkspaceConfig struct {
 type WorkspaceInfo struct {
 	Path   string
 	Branch string
+	// TargetSHA is the immutable review or execution target the caller expects
+	// this observation to bind. Workspace adapters may ignore it; callers still
+	// compare the returned HeadSHA before authorizing a review pass.
+	TargetSHA string
 	// BaseRef is the repository-default ref selected for session comparisons.
 	// It can differ from the remote session ref used to seed the worktree.
 	BaseRef string

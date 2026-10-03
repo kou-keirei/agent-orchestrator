@@ -177,8 +177,8 @@ type SessionRecord struct {
 	// Mode is the session's currently committed conversation controller. Every
 	// send, restore, kill, and reaper decision dispatches from it. Only the
 	// durable interface-transition coordinator may change it; the daemon default
-	// never changes an existing session. Rows written before Chat mode existed
-	// read back as SessionModeTUI.
+	// never changes an existing session. Reads preserve the persisted value;
+	// dispatchers use NormalizeSessionMode for legacy/unknown-mode compatibility.
 	Mode     SessionMode `json:"mode" enum:"chat,tui"`
 	Activity Activity    `json:"activity"`
 	// FirstSignalAt is when the FIRST agent hook callback arrived for the
@@ -188,6 +188,9 @@ type SessionRecord struct {
 	// of the API read model.
 	FirstSignalAt time.Time `json:"-"`
 	IsTerminated  bool      `json:"isTerminated"`
+	// HiddenAt is presentation-only state. It never participates in lifecycle,
+	// cleanup, runtime, terminal, or workspace decisions.
+	HiddenAt *time.Time `json:"hiddenAt,omitempty"`
 	// TerminateOnPRMerge is a user-controlled lifecycle policy. When enabled,
 	// completing the session's PR set through a merge tears down the session.
 	TerminateOnPRMerge bool            `json:"terminateOnPrMerge"`
@@ -201,6 +204,7 @@ type SessionRecord struct {
 	// one. Internal fact, not part of the API read model.
 	CleanupGeneration int64      `json:"-"`
 	Revision          int64      `json:"-"` // Database-owned row revision, independent of event timestamps.
+	TerminalRevision  int64      `json:"-"` // Stable terminal identity; -1 means an unknown restored legacy episode.
 	CreatedAt         time.Time  `json:"createdAt"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
 	IsPinned          bool       `json:"isPinned"`

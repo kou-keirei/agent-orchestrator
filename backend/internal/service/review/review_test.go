@@ -32,6 +32,27 @@ type fakeStore struct {
 	markCalls          int
 	markedIDs          []string
 	resolvedCommentIDs []string
+	nativeEvidence     []reviewNativeEvidence
+}
+
+type reviewNativeEvidence struct {
+	id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID string
+	observedAt                                                             time.Time
+}
+
+type barrierNativeStore struct {
+	*fakeStore
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *barrierNativeStore) AppendReviewRunNativeEvidence(ctx context.Context, id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID string, observedAt time.Time) (bool, error) {
+	close(s.started)
+	<-s.release
+	if !s.reviewOK || s.review.ID == "" || s.review.ReviewerLaunchID != launchID {
+		return false, nil
+	}
+	return s.fakeStore.AppendReviewRunNativeEvidence(ctx, id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID, observedAt)
 }
 
 func (f *fakeStore) GetReviewByID(_ context.Context, id string) (domain.Review, bool, error) {
@@ -74,6 +95,11 @@ func (f *fakeStore) GetReviewRun(_ context.Context, id string) (domain.ReviewRun
 		return f.run, true, nil
 	}
 	return domain.ReviewRun{}, false, nil
+}
+
+func (f *fakeStore) AppendReviewRunNativeEvidence(_ context.Context, id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID string, observedAt time.Time) (bool, error) {
+	f.nativeEvidence = append(f.nativeEvidence, reviewNativeEvidence{id: id, launchID: launchID, runSessionID: runSessionID, nativeSessionID: nativeSessionID, firstTurnID: firstTurnID, completionID: completionID, observedAt: observedAt})
+	return true, nil
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -332,6 +358,118 @@ func TestApplyReviewActivitySignalPersistsNativeReviewerSessionID(t *testing.T) 
 	}
 	if st.review.SessionID != "worker-1" {
 		t.Fatalf("worker session id changed: %+v", st.review)
+	}
+}
+
+func TestApplyReviewActivitySignalCorrelatesNativeEvidenceToExactRun(t *testing.T) {
+	st := &fakeStore{
+		reviewOK: true,
+		review:   domain.Review{ID: "review-1", SessionID: "worker-1", ReviewerLaunchID: "launch-1"},
+		run: domain.ReviewRun{
+			ID: "run-1", ReviewID: "review-1", SessionID: "worker-1", LaunchID: "launch-1", Status: domain.ReviewRunRunning,
+		},
+		ok: true,
+	}
+	svc := New(nil, st)
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		Event: "user-prompt-submit", RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-1", FirstTurnID: "turn-1",
+	}); err != nil {
+		t.Fatalf("ApplyReviewActivitySignal: %v", err)
+	}
+	if len(st.nativeEvidence) != 1 || st.nativeEvidence[0].id != "run-1" || st.nativeEvidence[0].runSessionID != "worker-1" || st.nativeEvidence[0].nativeSessionID != "native-1" || st.nativeEvidence[0].firstTurnID != "turn-1" {
+		t.Fatalf("native evidence = %+v", st.nativeEvidence)
+	}
+
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		Event: "stop", RunID: "run-1", LaunchID: "stale-launch", AgentSessionID: "native-stale", CompletionID: "turn-stale",
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("stale ApplyReviewActivitySignal err = %v, want ErrInvalid", err)
+	}
+	if len(st.nativeEvidence) != 1 {
+		t.Fatalf("stale hook appended evidence: %+v", st.nativeEvidence)
+	}
+}
+
+func TestApplyReviewActivitySignalRejectsGenerationReplacementBetweenPrevalidationAndAppend(t *testing.T) {
+	base := &fakeStore{
+		reviewOK: true,
+		review: domain.Review{
+			ID: "review-1", SessionID: "worker-1", ReviewerLaunchID: "launch-1",
+		},
+		run: domain.ReviewRun{
+			ID: "run-1", ReviewID: "review-1", SessionID: "worker-1", LaunchID: "launch-1", Status: domain.ReviewRunRunning,
+		},
+		ok: true,
+	}
+	st := &barrierNativeStore{fakeStore: base, started: make(chan struct{}), release: make(chan struct{})}
+	svc := New(nil, st)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+			RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-2", FirstTurnID: "turn-2",
+		})
+	}()
+	<-st.started
+	base.review.ReviewerLaunchID = "launch-2"
+	base.review.AgentSessionID = "native-2"
+	close(st.release)
+	if err := <-errCh; !errors.Is(err, ErrInvalid) {
+		t.Fatalf("generation replacement error = %v, want ErrInvalid", err)
+	}
+	if len(base.nativeEvidence) != 0 || base.activityUpdates != 0 {
+		t.Fatalf("stale generation persisted evidence or activity: evidence=%+v activityUpdates=%d", base.nativeEvidence, base.activityUpdates)
+	}
+	if base.review.ReviewerLaunchID != "launch-2" || base.review.AgentSessionID != "native-2" {
+		t.Fatalf("replacement generation was overwritten: %+v", base.review)
+	}
+}
+
+func TestApplyReviewActivitySignalAllowsOmittedOptionalEvidenceButRejectsContradictions(t *testing.T) {
+	st := &fakeStore{
+		reviewOK: true,
+		review:   domain.Review{ID: "review-1", SessionID: "worker-1", ReviewerLaunchID: "launch-1", AgentSessionID: "native-1"},
+		run: domain.ReviewRun{
+			ID: "run-1", ReviewID: "review-1", SessionID: "worker-1", LaunchID: "launch-1", Status: domain.ReviewRunRunning,
+			Provenance: domain.ReviewerProvenance{ProviderNative: domain.ReviewerNativeEvidence{SessionID: "native-1", FirstTurnID: "turn-1"}},
+		},
+		ok: true,
+	}
+	svc := New(nil, st)
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-1", CompletionID: "turn-1",
+	}); err != nil {
+		t.Fatalf("omitted first-turn evidence should be valid: %v", err)
+	}
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-1", FirstTurnID: "other-turn",
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("contradictory first-turn evidence err = %v, want ErrInvalid", err)
+	}
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-other", CompletionID: "completion-2",
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("contradictory native-session evidence err = %v, want ErrInvalid", err)
+	}
+}
+
+func TestApplyReviewActivitySignalRejectsCompletionForAnotherRunOnSameLaunch(t *testing.T) {
+	st := &fakeStore{
+		reviewOK: true,
+		review:   domain.Review{ID: "review-1", SessionID: "worker-1", ReviewerLaunchID: "launch-1", AgentSessionID: "native-1"},
+		batchRuns: []domain.ReviewRun{
+			{ID: "run-1", ReviewID: "review-1", SessionID: "worker-1", LaunchID: "launch-1", Status: domain.ReviewRunRunning, Provenance: domain.ReviewerProvenance{ProviderNative: domain.ReviewerNativeEvidence{SessionID: "native-1", FirstTurnID: "turn-1"}}},
+			{ID: "run-2", ReviewID: "review-1", SessionID: "worker-1", LaunchID: "launch-1", Status: domain.ReviewRunRunning, Provenance: domain.ReviewerProvenance{ProviderNative: domain.ReviewerNativeEvidence{SessionID: "native-1", FirstTurnID: "turn-2"}}},
+		},
+	}
+	svc := New(nil, st)
+
+	if err := svc.ApplyReviewActivitySignal(context.Background(), "review-1", ActivitySignal{
+		RunID: "run-1", LaunchID: "launch-1", AgentSessionID: "native-1", CompletionID: "turn-2",
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-run completion err = %v, want ErrInvalid", err)
+	}
+	if len(st.nativeEvidence) != 0 {
+		t.Fatalf("cross-run completion appended evidence: %+v", st.nativeEvidence)
 	}
 }
 

@@ -51,12 +51,19 @@ type Store interface {
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 }
 
+// visibilityStore is optional so focused read-model fakes do not need to
+// implement presentation-only writes. The production SQLite store satisfies it.
+type visibilityStore interface {
+	SetSessionHidden(context.Context, domain.SessionID, *time.Time) (bool, error)
+}
+
 // ListFilter captures API-facing session list query filters.
 type ListFilter struct {
 	ProjectID        domain.ProjectID
 	Active           *bool
 	OrchestratorOnly bool
 	Fresh            bool
+	IncludeHidden    bool
 }
 
 // commander is the command-side surface Service delegates to: the
@@ -562,7 +569,7 @@ func (s *Service) SpawnOrchestrator(
 
 func (s *Service) activeOrchestrators(ctx context.Context, projectID domain.ProjectID) ([]domain.Session, error) {
 	active := true
-	return s.List(ctx, ListFilter{ProjectID: projectID, Active: &active, OrchestratorOnly: true})
+	return s.List(ctx, ListFilter{ProjectID: projectID, Active: &active, OrchestratorOnly: true, IncludeHidden: true})
 }
 
 const orchestratorRetireNotice = "AO is replacing this project orchestrator. Stop coordinating new work now; a fresh orchestrator will take over in a new workspace."
@@ -616,7 +623,7 @@ func (s *Service) sendContinuityNotice(ctx context.Context, newSession domain.Se
 // the project. No eligible predecessor means the new session starts cold.
 func (s *Service) mostRecentTerminatedOrchestrator(ctx context.Context, projectID domain.ProjectID) (domain.Session, bool, error) {
 	inactive := false
-	all, err := s.List(ctx, ListFilter{ProjectID: projectID, Active: &inactive, OrchestratorOnly: true})
+	all, err := s.List(ctx, ListFilter{ProjectID: projectID, Active: &inactive, OrchestratorOnly: true, IncludeHidden: true})
 	if err != nil {
 		return domain.Session{}, false, fmt.Errorf("list terminated orchestrators: %w", err)
 	}
@@ -748,6 +755,33 @@ func (s *Service) ResumeAgent(ctx context.Context, id domain.SessionID) (ResumeA
 		return ResumeAgentOutcome{}, err
 	}
 	return ResumeAgentOutcome{Session: session, Mode: restoreModeView(res.Mode)}, nil
+}
+
+// Hide removes a session from default presentation lists without changing its
+// lifecycle or any owned resource. Hidden sessions remain addressable by id.
+func (s *Service) Hide(ctx context.Context, id domain.SessionID) (domain.Session, error) {
+	return s.setHidden(ctx, id, func(now time.Time) *time.Time { return &now })
+}
+
+// Unhide restores a session to default presentation lists.
+func (s *Service) Unhide(ctx context.Context, id domain.SessionID) (domain.Session, error) {
+	return s.setHidden(ctx, id, func(time.Time) *time.Time { return nil })
+}
+
+func (s *Service) setHidden(ctx context.Context, id domain.SessionID, value func(time.Time) *time.Time) (domain.Session, error) {
+	store, ok := s.store.(visibilityStore)
+	if !ok {
+		return domain.Session{}, apierr.Conflict("SESSION_VISIBILITY_UNSUPPORTED", "This build cannot change session visibility", nil)
+	}
+	now := s.now()
+	updated, err := store.SetSessionHidden(ctx, id, value(now))
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set session visibility %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
 }
 
 // InterfaceTransitionStatus returns capability and progress without launching
@@ -1124,6 +1158,9 @@ func (s *Service) listRecords(ctx context.Context, project domain.ProjectID) ([]
 }
 
 func matchesSessionFilter(rec domain.SessionRecord, filter ListFilter) bool {
+	if !filter.IncludeHidden && rec.HiddenAt != nil {
+		return false
+	}
 	if filter.Active != nil && rec.IsTerminated == *filter.Active {
 		return false
 	}

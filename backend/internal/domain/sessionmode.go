@@ -38,9 +38,10 @@ func (m SessionMode) Valid() bool {
 }
 
 // NormalizeSessionMode collapses an empty or unrecognized mode to the
-// compatibility default. Use it when reading durable state: a row written before
+// compatibility default at runtime dispatch boundaries: a row written before
 // this feature, or by a newer build that knows a mode this one does not, must
-// still dispatch somewhere safe.
+// still dispatch somewhere safe. Observational readback must preserve the raw
+// persisted value so unknown modes cannot be mistaken for valid TUI evidence.
 //
 // Do not use it on API input — see ParseSessionMode. Normalizing a requested
 // mode would silently hand the caller a TUI session when they asked for Chat.

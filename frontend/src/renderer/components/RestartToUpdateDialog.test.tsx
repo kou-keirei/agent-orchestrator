@@ -6,19 +6,23 @@ import { useUiStore } from "../stores/ui-store";
 import { TooltipProvider } from "./ui/tooltip";
 import type { UpdateStatus } from "../../main/update-settings";
 
-const { updInstall, updRelaunch, updGetStatus, updOnStatus, workspaceData } = vi.hoisted(() => ({
+const { updInstall, updRelaunch, updGetStatus, updOnStatus, workspaceData, workspaceQueryMock } = vi.hoisted(() => ({
 	updInstall: vi.fn(),
 	updRelaunch: vi.fn(),
 	updGetStatus: vi.fn(),
 	updOnStatus: vi.fn(),
 	workspaceData: { current: [] as unknown[] },
+	workspaceQueryMock: vi.fn(),
 }));
 
 vi.mock("../lib/bridge", () => ({
 	aoBridge: { updates: { getStatus: updGetStatus, install: updInstall, relaunch: updRelaunch, onStatus: updOnStatus } },
 }));
 vi.mock("../hooks/useWorkspaceQuery", () => ({
-	useWorkspaceQuery: () => ({ data: workspaceData.current }),
+	useWorkspaceQuery: (options: { includeHidden?: boolean } = {}) => {
+		workspaceQueryMock(options);
+		return { data: workspaceData.current };
+	},
 }));
 
 function session(overrides: Record<string, unknown> = {}) {
@@ -43,7 +47,7 @@ function renderDialog(status: UpdateStatus) {
 }
 
 beforeEach(() => {
-	for (const m of [updInstall, updRelaunch, updGetStatus, updOnStatus]) m.mockReset();
+	for (const m of [updInstall, updRelaunch, updGetStatus, updOnStatus, workspaceQueryMock]) m.mockReset();
 	updOnStatus.mockReturnValue(() => undefined);
 	workspaceData.current = [];
 	useUiStore.setState({ updateInstallPromptOpen: false });
@@ -88,18 +92,26 @@ it("renders the nightly build date from the UTC instant", async () => {
 
 it("names the sessions that would lose a turn and waits for confirmation", async () => {
 	workspaceData.current = [
-		{ sessions: [session(), session({ id: "s2", mode: "tui", title: "Terminal one" })] },
+		{
+			sessions: [
+				session(),
+				session({ id: "s2", mode: "tui", title: "Terminal one" }),
+				session({ id: "s-hidden", title: "Hidden chat", hiddenAt: "2026-09-22T12:00:00Z" }),
+			],
+		},
 	];
 	useUiStore.setState({ updateInstallPromptOpen: true });
 	renderDialog({ state: "downloaded", version: "1.2.3" });
 
 	const warning = await screen.findByTestId("restart-sessions-warning");
-	expect(warning).toHaveTextContent("1 chat session will lose its current turn");
+	expect(warning).toHaveTextContent("2 chat sessions will lose their current turn");
 	expect(warning).toHaveTextContent("agent-orchestrator · Fix the updater");
+	expect(warning).toHaveTextContent("agent-orchestrator · Hidden chat");
 	// The TUI session survives a quit, so naming it would be crying wolf.
 	expect(warning).not.toHaveTextContent("Terminal one");
 
 	expect(updInstall).not.toHaveBeenCalled();
+	expect(workspaceQueryMock).toHaveBeenCalledWith({ includeHidden: true });
 	await userEvent.click(screen.getByRole("button", { name: "Restart & install" }));
 	expect(updInstall).toHaveBeenCalledTimes(1);
 });

@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/runtime/runtimeselect"
 	"github.com/aoagents/agent-orchestrator/backend/internal/agentlaunch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -61,18 +64,33 @@ type Launcher interface {
 	Destroy(ctx context.Context, handleID string) error
 }
 
+// ReviewerGenerationProber is the optional runtime identity surface used by
+// cleanup reconciliation. A plain handle liveness result is insufficient when
+// a stable reviewer handle has been reused by a newer launch generation.
+type ReviewerGenerationProber interface {
+	ProbeReviewerGeneration(ctx context.Context, handleID, launchID string) ports.FencedProbeResult
+}
+
 // LaunchSpec is the engine's request to (re)launch a reviewer for one pass.
 type LaunchSpec struct {
-	RunID                string
-	BatchID              string
-	ReviewSessionID      string
-	LaunchID             string
-	WorkerID             domain.SessionID
-	ProjectID            domain.ProjectID
-	Harness              domain.ReviewerHarness
-	AgentConfig          domain.AgentConfig
-	WorkspacePath        string
-	AgentSessionID       string
+	RunID           string
+	BatchID         string
+	ReviewSessionID string
+	LaunchID        string
+	WorkerID        domain.SessionID
+	ProjectID       domain.ProjectID
+	Harness         domain.ReviewerHarness
+	AgentConfig     domain.AgentConfig
+	WorkspacePath   string
+	AgentSessionID  string
+	// PreviousHandleID is the currently authoritative runtime handle when this
+	// launch replaces an existing reviewer. The launcher keeps it intact until
+	// the replacement runtime has been created successfully; the engine then
+	// promotes the returned handle and tears down the previous one.
+	PreviousHandleID string
+	// PreviousLaunchID is the durable generation bound to a stable reviewer
+	// handle before this launch. A stable name alone is never cleanup authority.
+	PreviousLaunchID     string
 	RequireNativeHistory bool
 	PreviousRuns         []domain.ReviewRun
 	PRURL                string
@@ -242,6 +260,10 @@ func looksLikeAuthFailure(err error) bool {
 // one live reviewer is reused across passes.
 func reviewerHandleID(workerID domain.SessionID) string {
 	return "review-" + string(workerID)
+}
+
+func reviewerReplacementHandleID(stableHandleID string) string {
+	return stableHandleID + "-replacement-" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 func (l *agentLauncher) invocation(spec LaunchSpec) ports.ReviewInvocation {
@@ -435,15 +457,32 @@ func (l *agentLauncher) launchReviewerTerminalWithMode(ctx context.Context, spec
 			return LaunchResult{}, fmt.Errorf("reviewer command: %w", err)
 		}
 	}
-	handleID := reviewerHandleID(spec.WorkerID)
-	// The reviewer handle is stable per worker, so a still-live pane from a
-	// previous pass would otherwise block `tmux new-session` (duplicate name) or,
-	// worse, keep serving under its old harness. Destroy any stale pane on this
-	// handle first so the reviewer always (re)launches under spec.Harness's
-	// sandbox/permissions/env — which are applied only here at Create, never by
-	// Notify. Destroy is idempotent when no pane exists (first spawn / dead pane).
-	if err := l.runtime.Destroy(ctx, ports.RuntimeHandle{ID: handleID}); err != nil {
-		return LaunchResult{}, fmt.Errorf("reviewer replace stale pane: %w", err)
+	effectiveSpec := spec
+	if restoring && !nativeResumed {
+		// A restore fallback is a fresh provider process, not a continuation of
+		// the old native generation. Its hooks must not be accepted for runs that
+		// belonged to the retired conversation.
+		effectiveSpec.LaunchID = uuid.NewString()
+	}
+	stableHandleID := reviewerHandleID(spec.WorkerID)
+	handleID := stableHandleID
+	previousHandleID := strings.TrimSpace(spec.PreviousHandleID)
+	if previousHandleID != "" {
+		alive, err := l.runtime.IsAlive(ctx, ports.RuntimeHandle{ID: previousHandleID})
+		if err != nil {
+			return LaunchResult{}, fmt.Errorf("probe previous reviewer pane: %w", err)
+		}
+		if alive {
+			// Create the replacement under a provisional runtime handle. The
+			// incumbent remains usable if Create or any post-create readiness step
+			// fails; the engine promotes this handle only after the new runtime is
+			// ready and the predecessor run has been terminalized.
+			handleID = reviewerReplacementHandleID(stableHandleID)
+		} else if err := l.runtime.Destroy(ctx, ports.RuntimeHandle{ID: previousHandleID}); err != nil {
+			return LaunchResult{}, fmt.Errorf("reviewer replace stale pane: %w", reviewerCleanupEvidence(err, previousHandleID))
+		}
+	} else if err := l.prepareUnboundStableReviewerHandle(ctx, spec, stableHandleID); err != nil {
+		return LaunchResult{}, err
 	}
 	workingDirectory := cmd.WorkingDirectory
 	if workingDirectory == "" {
@@ -453,24 +492,146 @@ func (l *agentLauncher) launchReviewerTerminalWithMode(ctx context.Context, spec
 		SessionID:     domain.SessionID(handleID),
 		WorkspacePath: workingDirectory,
 		Argv:          cmd.Argv,
-		Env:           l.runtimeEnv(ctx, spec, cmd.Argv, cmd.Env),
+		Env:           l.runtimeEnv(ctx, effectiveSpec, cmd.Argv, cmd.Env),
 	})
 	if err != nil {
 		return LaunchResult{}, fmt.Errorf("reviewer runtime: %w", err)
 	}
 	if cmd.InitialMessage != "" {
 		if err := l.waitForPromptReadiness(ctx, reviewer, handle); err != nil {
-			return LaunchResult{}, fmt.Errorf("reviewer prompt readiness: %w", err)
+			return LaunchResult{}, l.cleanupFailedReviewerLaunch(ctx, handle, fmt.Errorf("reviewer prompt readiness: %w", err))
 		}
 		if err := l.runtime.SendMessage(ctx, handle, cmd.InitialMessage); err != nil {
-			return LaunchResult{}, fmt.Errorf("reviewer initial message: %w", err)
+			return LaunchResult{}, l.cleanupFailedReviewerLaunch(ctx, handle, fmt.Errorf("reviewer initial message: %w", err))
 		}
 	}
 	agentSessionID := strings.TrimSpace(cmd.AgentSessionID)
 	if agentSessionID == "" {
 		agentSessionID = strings.TrimSpace(spec.AgentSessionID)
 	}
-	return LaunchResult{HandleID: handle.ID, LaunchID: strings.TrimSpace(spec.LaunchID), AgentSessionID: agentSessionID, NativeResumed: nativeResumed}, nil
+	return LaunchResult{HandleID: handle.ID, LaunchID: strings.TrimSpace(effectiveSpec.LaunchID), AgentSessionID: agentSessionID, NativeResumed: nativeResumed}, nil
+}
+
+// prepareUnboundStableReviewerHandle handles the restore/startup case where
+// the durable handle was not carried into the launch request. The stable name
+// is reusable, so it is not runtime identity and must never be destroyed
+// without an exact generation probe.
+func (l *agentLauncher) prepareUnboundStableReviewerHandle(ctx context.Context, spec LaunchSpec, stableHandleID string) error {
+	previousLaunchID := strings.TrimSpace(spec.PreviousLaunchID)
+	if previousLaunchID == "" {
+		alive, err := l.runtime.IsAlive(ctx, ports.RuntimeHandle{ID: stableHandleID})
+		if err != nil {
+			return fmt.Errorf("probe unbound reviewer handle %q: %w", stableHandleID, err)
+		}
+		if alive {
+			return reviewerGenerationCleanupFailure(
+				errors.New("stable reviewer handle is live but its previous launch generation is unavailable"),
+				stableHandleID,
+				previousLaunchID,
+			)
+		}
+		// No runtime is present, so Create can safely claim the stable name. No
+		// Destroy is needed and no handle-only cleanup is attempted.
+		return nil
+	}
+
+	prober, ok := l.runtime.(ports.FencedRuntimeProber)
+	if !ok {
+		return reviewerGenerationCleanupFailure(
+			errors.New("exact reviewer runtime-generation probe is unavailable"),
+			stableHandleID,
+			previousLaunchID,
+		)
+	}
+	probe := prober.ProbeFencedRuntime(ctx, ports.FencedRuntimeRef{
+		Handle:     ports.RuntimeHandle{ID: stableHandleID},
+		SessionID:  domain.SessionID(stableHandleID),
+		Generation: previousLaunchID,
+	})
+	switch {
+	case probe.Liveness == ports.FencedAlive && probe.Reason == ports.FencedReasonExactMatch,
+		probe.Liveness == ports.FencedDead && probe.Reason == ports.FencedReasonExactAbsent:
+		if err := l.runtime.Destroy(ctx, ports.RuntimeHandle{ID: stableHandleID}); err != nil {
+			return fmt.Errorf("reviewer replace exact stale pane: %w", reviewerCleanupEvidenceForGeneration(err, stableHandleID, previousLaunchID))
+		}
+		return nil
+	default:
+		return reviewerGenerationCleanupFailure(
+			fmt.Errorf("stable reviewer handle %q is not authoritatively bound to previous generation %q (liveness=%s reason=%s)", stableHandleID, previousLaunchID, probe.Liveness, probe.Reason),
+			stableHandleID,
+			previousLaunchID,
+		)
+	}
+}
+
+func (l *agentLauncher) cleanupFailedReviewerLaunch(ctx context.Context, handle ports.RuntimeHandle, cause error) error {
+	cleanupCtx := context.WithoutCancel(ctx)
+	if err := l.runtime.Destroy(cleanupCtx, handle); err != nil {
+		return errors.Join(cause, reviewerCleanupEvidence(err, handle.ID))
+	}
+	return cause
+}
+
+type reviewerRuntimeCleanupFailure struct {
+	cause           error
+	handle          ports.RuntimeHandle
+	generation      string
+	generationBound bool
+}
+
+func (e reviewerRuntimeCleanupFailure) Error() string {
+	return fmt.Sprintf("cleanup reviewer runtime handle %q: %v", e.handle.ID, e.cause)
+}
+
+func (e reviewerRuntimeCleanupFailure) Unwrap() error { return e.cause }
+
+func (e reviewerRuntimeCleanupFailure) PossibleHandle() ports.RuntimeHandle { return e.handle }
+
+func (e reviewerRuntimeCleanupFailure) EffectOutcome() ports.RuntimeEffectOutcome {
+	return ports.RuntimeEffectPossible
+}
+
+func (e reviewerRuntimeCleanupFailure) CleanupOutcome() ports.RuntimeCleanupOutcome {
+	return ports.RuntimeCleanupFailed
+}
+
+func (e reviewerRuntimeCleanupFailure) CleanupGeneration() string { return e.generation }
+
+func (e reviewerRuntimeCleanupFailure) CleanupGenerationBound() bool { return e.generationBound }
+
+func reviewerGenerationCleanupFailure(cause error, handleID, generation string) error {
+	handleID = strings.TrimSpace(handleID)
+	generation = strings.TrimSpace(generation)
+	if generation != "" && handleID != "" {
+		marker := reviewerCleanupPendingMarkerForGeneration(handleID, generation)
+		if !strings.Contains(cause.Error(), marker) {
+			cause = fmt.Errorf("%w\n%s", cause, marker)
+		}
+	}
+	return reviewerRuntimeCleanupFailure{
+		cause:           cause,
+		handle:          ports.RuntimeHandle{ID: handleID},
+		generation:      generation,
+		generationBound: true,
+	}
+}
+
+func reviewerCleanupEvidence(err error, handleID string) error {
+	if err == nil {
+		return nil
+	}
+	var effectErr ports.RuntimeEffectError
+	if errors.As(err, &effectErr) && strings.TrimSpace(effectErr.PossibleHandle().ID) != "" {
+		return err
+	}
+	return reviewerRuntimeCleanupFailure{cause: err, handle: ports.RuntimeHandle{ID: strings.TrimSpace(handleID)}}
+}
+
+func reviewerCleanupEvidenceForGeneration(err error, handleID, generation string) error {
+	if err == nil {
+		return nil
+	}
+	return reviewerGenerationCleanupFailure(err, handleID, generation)
 }
 
 func (l *agentLauncher) waitForPromptReadiness(ctx context.Context, reviewer ports.Reviewer, handle ports.RuntimeHandle) error {
@@ -534,7 +695,7 @@ func outputContainsAny(output string, patterns []string) bool {
 }
 
 func (l *agentLauncher) runtimeEnv(ctx context.Context, spec LaunchSpec, argv []string, base map[string]string) map[string]string {
-	env := make(map[string]string, len(base)+3)
+	env := make(map[string]string, len(base)+2)
 	for k, v := range base {
 		env[k] = v
 	}
@@ -644,6 +805,28 @@ func (l *agentLauncher) Alive(ctx context.Context, handleID string) (bool, error
 		return false, nil
 	}
 	return l.runtime.IsAlive(ctx, ports.RuntimeHandle{ID: handleID})
+}
+
+// ProbeReviewerGeneration delegates reviewer generation authority to the
+// existing AO runtime fence. Missing identity or an adapter without the
+// fenced probe is deliberately unknown, never a reason to destroy by handle.
+func (l *agentLauncher) ProbeReviewerGeneration(ctx context.Context, handleID, launchID string) ports.FencedProbeResult {
+	handleID = strings.TrimSpace(handleID)
+	launchID = strings.TrimSpace(launchID)
+	handle := ports.RuntimeHandle{ID: handleID}
+	sessionID := runtimeselect.SessionIDForHandle(handle)
+	if sessionID == "" || launchID == "" {
+		return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonIdentityMissing}
+	}
+	prober, ok := l.runtime.(ports.FencedRuntimeProber)
+	if !ok {
+		return ports.FencedProbeResult{Liveness: ports.FencedUnknown, Reason: ports.FencedReasonIdentityMissing}
+	}
+	return prober.ProbeFencedRuntime(ctx, ports.FencedRuntimeRef{
+		Handle:     handle,
+		SessionID:  sessionID,
+		Generation: launchID,
+	})
 }
 
 func (l *agentLauncher) Reusable(harness domain.ReviewerHarness) bool {

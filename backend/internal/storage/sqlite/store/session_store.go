@@ -51,7 +51,9 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 }
 
 // UpdateSession writes the full mutable state of an existing session. The
-// id/project/num/created_at are immutable and not touched here.
+// id/project/num/created_at are immutable and not touched here. Presentation
+// visibility is intentionally excluded: lifecycle callers may hold a stale
+// SessionRecord, so hidden_at is persisted only through SetSessionHidden.
 func (s *Store) UpdateSession(ctx context.Context, rec domain.SessionRecord) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -129,6 +131,60 @@ func (s *Store) UpdateSessionFromActivitySignal(
 	return rows > 0, nil
 }
 
+// CommitActivityAndOrchestrationEvent is the production atomic boundary for a
+// normalized lifecycle transition and its pending delivery row.
+func (s *Store) CommitActivityAndOrchestrationEvent(ctx context.Context, rec domain.SessionRecord, event domain.OrchestrationEvent) (bool, error) {
+	activity := normalActivity(rec.Activity, rec.UpdatedAt)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var applied bool
+	err := s.inTxDB(ctx, "commit activity and orchestration event", func(q *gen.Queries, db gen.DBTX) error {
+		rows, err := q.UpdateSessionFromActivitySignal(ctx, activityUpdateParams(rec, activity))
+		if err != nil || rows == 0 {
+			return err
+		}
+		applied = true
+		if event.ProjectID == "" {
+			return nil
+		}
+		_, err = db.ExecContext(ctx, `INSERT INTO orchestration_events
+			(id,project_id,worker_id,kind,source_revision,enqueued_at,next_attempt_at)
+			VALUES (?,?,?,?,?,?,?) ON CONFLICT(project_id,worker_id,kind,source_revision) DO NOTHING`,
+			event.ID, event.ProjectID, event.WorkerID, event.Kind, event.SourceRevision, event.EnqueuedAt, event.NextAttemptAt)
+		return err
+	})
+	return applied, err
+}
+
+func activityUpdateParams(rec domain.SessionRecord, activity domain.Activity) gen.UpdateSessionFromActivitySignalParams {
+	return gen.UpdateSessionFromActivitySignalParams{
+		ActivityState:                    activity.State,
+		ActivityLastAt:                   activity.LastActivityAt,
+		FirstSignalAt:                    timeToNullTime(rec.FirstSignalAt),
+		AgentSessionID:                   rec.Metadata.AgentSessionID,
+		AgentSessionIDLaunchID:           rec.Metadata.AgentSessionIDLaunchID,
+		NativeIdentityObservedAt:         timeToNullTime(rec.Metadata.NativeIdentityObservedAt),
+		LatestUserPrompt:                 rec.Metadata.LatestUserPrompt,
+		LatestUserPromptAt:               timeToNullTime(rec.Metadata.LatestUserPromptAt),
+		LatestAssistantUpdate:            rec.Metadata.LatestAssistantUpdate,
+		LatestAssistantUpdateAt:          timeToNullTime(rec.Metadata.LatestAssistantUpdateAt),
+		ConversationCheckpointState:      normalizedConversationCheckpointState(rec.Metadata),
+		ConversationCheckpointGeneration: rec.Metadata.ConversationCheckpointGeneration,
+		ConversationCheckpointNativeID:   rec.Metadata.ConversationCheckpointNativeID,
+		ConversationCheckpointTurnID:     rec.Metadata.ConversationCheckpointTurnID,
+		NativeCheckpointEvidence:         rec.Metadata.NativeCheckpointEvidence,
+		ConversationCheckpointUnsettled:  rec.Metadata.ConversationCheckpointUnsettled,
+		NativeTranscriptPath:             rec.Metadata.NativeTranscriptPath,
+		UpdatedAt:                        rec.UpdatedAt,
+		ID:                               rec.ID,
+		ExpectedRevision:                 rec.Revision,
+		ExpectedHarness:                  rec.Harness,
+		ExpectedSessionMode:              domain.NormalizeSessionMode(rec.Mode),
+		ExpectedRuntimeLaunchID:          rec.Metadata.RuntimeLaunchID,
+		ExpectedControllerGeneration:     rec.Metadata.ControllerGeneration,
+	}
+}
+
 // RecordSessionLatestUserPrompt persists pane-delivered user direction without
 // rewriting lifecycle ownership. Because the provider hook may be lost, the
 // same atomic write clears any prior assistant pairing and trusted checkpoint
@@ -201,6 +257,37 @@ func (s *Store) SetSessionPinned(ctx context.Context, id domain.SessionID, isPin
 	})
 	if err != nil {
 		return false, fmt.Errorf("set session pinned %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// SetSessionHidden updates presentation-only visibility state. It deliberately
+// does not read or write any lifecycle, runtime, terminal, or workspace fact.
+func (s *Store) SetSessionHidden(ctx context.Context, id domain.SessionID, hiddenAt *time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.SetSessionHidden(ctx, gen.SetSessionHiddenParams{
+		HiddenAt: timePtrToNullTime(hiddenAt),
+		ID:       id,
+	})
+	if err != nil {
+		return false, fmt.Errorf("set session hidden %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// ClearSessionHiddenIfUnchanged clears visibility only when the activation
+// boundary still observes the same presentation state. A newer user hide wins
+// the race and remains hidden.
+func (s *Store) ClearSessionHiddenIfUnchanged(ctx context.Context, id domain.SessionID, expectedHiddenAt *time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ClearSessionHiddenIfUnchanged(ctx, gen.ClearSessionHiddenIfUnchangedParams{
+		ID:               id,
+		ExpectedHiddenAt: timePtrToNullTime(expectedHiddenAt),
+	})
+	if err != nil {
+		return false, fmt.Errorf("clear session hidden %s: %w", id, err)
 	}
 	return rows > 0, nil
 }
@@ -456,6 +543,7 @@ func mapListAllSessionsRows(rows []gen.ListAllSessionsRow) []domain.SessionRecor
 func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 	return domain.SessionRecord{
 		Revision:          row.Revision,
+		TerminalRevision:  row.TerminalRevision,
 		ID:                row.ID,
 		ProjectID:         projectIDValue(row.ProjectID),
 		IssueID:           row.IssueID,
@@ -465,13 +553,16 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 		ReviewerConfig:    unmarshalAgentConfig(row.ReviewerAgentConfig),
 		AutoReviewEnabled: row.AutoReviewEnabled,
 		DisplayName:       row.DisplayName,
-		Mode:              domain.NormalizeSessionMode(row.SessionMode),
+		// Preserve persisted mode evidence for observational readback. Runtime
+		// dispatchers apply their compatibility fallback at the action boundary.
+		Mode: row.SessionMode,
 		Activity: domain.Activity{
 			State:          row.ActivityState,
 			LastActivityAt: row.ActivityLastAt,
 		},
 		FirstSignalAt:      nullTimeToTime(row.FirstSignalAt),
 		IsTerminated:       row.IsTerminated,
+		HiddenAt:           nullTimeToTimePtr(row.HiddenAt),
 		IsPinned:           row.IsPinned,
 		PinnedAt:           nullTimeToTimePtr(row.PinnedAt),
 		TerminateOnPRMerge: row.TerminateOnPRMerge,
@@ -552,6 +643,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		WorkspacePath:                    rec.Metadata.WorkspacePath,
 		WorkspaceRepoPath:                rec.Metadata.WorkspaceRepoPath,
 		ExecutionBaseSha:                 rec.Metadata.ExecutionBaseSHA,
+		HiddenAt:                         timePtrToNullTime(rec.HiddenAt),
 		DiffBaseSha:                      rec.Metadata.DiffBaseSHA,
 		DiffBaseRef:                      rec.Metadata.DiffBaseRef,
 		RuntimeHandleID:                  rec.Metadata.RuntimeHandleID,

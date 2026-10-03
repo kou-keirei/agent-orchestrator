@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,18 @@ type interfaceTransitionReader interface {
 	) (domain.SessionInterfaceTransition, bool, error)
 }
 
+type activityOrchestrationStore interface {
+	CommitActivityAndOrchestrationEvent(context.Context, domain.SessionRecord, domain.OrchestrationEvent) (bool, error)
+}
+
+type orchestrationBatchAcknowledgementStore interface {
+	AcknowledgeOrchestrationBatchAccepted(context.Context, domain.SessionID, string, time.Time) (int64, error)
+}
+
+type orchestrationSourceStateStore interface {
+	RecordOrchestrationSourceState(context.Context, domain.ProjectID, domain.SessionID, domain.OrchestrationEventKind, string, bool, time.Time) (bool, error)
+}
+
 // chatSpawnStore commits the lifecycle facts and the provider boundary in one
 // transaction. A fresh provider must never become the durable session owner
 // while the conversation head still names the provider it replaced.
@@ -99,6 +112,32 @@ type preparedChatSpawnStore interface {
 		*domain.ChatProviderHandoff,
 		func(context.Context) error,
 	) error
+}
+
+// sessionVisibilityActivator clears presentation state only after lifecycle
+// persistence has committed a genuinely active provider/controller boundary.
+// It is intentionally separate from the full session update path so a stale
+// read-modify-write cannot restore an old hidden_at value.
+type sessionVisibilityActivator interface {
+	ClearSessionHiddenIfUnchanged(context.Context, domain.SessionID, *time.Time) (bool, error)
+}
+
+func (m *Manager) clearPresentationHiddenAfterActivation(ctx context.Context, id domain.SessionID, expected *time.Time) {
+	if expected == nil {
+		return
+	}
+	visibility, ok := m.store.(sessionVisibilityActivator)
+	if !ok {
+		return
+	}
+	cleared, err := visibility.ClearSessionHiddenIfUnchanged(ctx, id, expected)
+	if err != nil {
+		slog.Default().Warn("lifecycle: failed to clear presentation-hidden state after activation", "session", id, "err", err)
+	} else if !cleared {
+		// A false CAS means a newer user hide won the race. Preserve it; this
+		// is a presentation outcome, never a provider ownership failure.
+		slog.Default().Info("lifecycle: presentation-hidden state changed during activation", "session", id)
+	}
 }
 
 // agentSwitchSourceStopStore and agentSwitchTargetActivationStore are the
@@ -270,6 +309,16 @@ type Manager struct {
 	// consecutive dead readings while workers retain the single-sample policy.
 	// The counter is memory-only and guarded by mu.
 	consecutiveDeadProbes map[domain.SessionID]int
+	orchestrationWake     func(domain.ProjectID)
+}
+
+// SetOrchestrationWake connects durable event commits to the daemon dispatcher.
+// Startup recovery remains authoritative, so events committed before wiring
+// are found by the dispatcher's initial database scan.
+func (m *Manager) SetOrchestrationWake(wake func(domain.ProjectID)) {
+	m.mu.Lock()
+	m.orchestrationWake = wake
+	m.mu.Unlock()
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.
@@ -520,6 +569,13 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		return err
 	}
 	if terminated {
+		if rec, ok, readErr := m.store.GetSession(ctx, id); readErr != nil {
+			return readErr
+		} else if ok {
+			if eventErr := m.recordWorkerTerminalEvent(ctx, rec); eventErr != nil {
+				return eventErr
+			}
+		}
 		// Route reaper-observed death through the same container-reap hook as
 		// every other terminal path (#2652): a crash/SIGKILL detected by the
 		// runtime reaper must not leave the session's Docker containers behind
@@ -976,6 +1032,10 @@ retryProjection:
 				m.mu.Unlock()
 				return nil
 			}
+			if err := m.acknowledgeOrchestrationBatch(ctx, id, s, now); err != nil {
+				m.mu.Unlock()
+				return err
+			}
 			m.mu.Unlock()
 			return m.acknowledgeAgentSwitchTarget(ctx, id, s, now)
 		}
@@ -995,7 +1055,38 @@ retryProjection:
 		delete(m.flights, id)
 	}
 	next.UpdatedAt = now
-	applied, retry, err := project(next)
+	var applied bool
+	var retry bool
+	var orchestrationProject domain.ProjectID
+	if event, emit := normalizedActivityEvent(rec, next); emit {
+		if atomicStore, ok := m.store.(activityOrchestrationStore); ok {
+			applied, err = atomicStore.CommitActivityAndOrchestrationEvent(ctx, next, event)
+			if !applied && err == nil {
+				// The atomic store owns both the session CAS and the outbox insert.
+				// A revision miss is the same contention boundary as the narrow
+				// activity update path: restore reducer-side correlation and reduce
+				// this signal again from a fresh durable snapshot.
+				m.restoreToolFlightLocked(id, toolFlightBeforeProjection)
+				current, found, readErr := m.store.GetSession(ctx, id)
+				if readErr != nil || !found {
+					err = readErr
+				} else if current.Revision != observedRevision {
+					if projectionAttempts >= maxActivitySignalProjectionRetries {
+						slog.Default().Warn("lifecycle: activity projection contention", "session", id, "event", s.Event, "attempts", projectionAttempts+1)
+						err = fmt.Errorf("%w for %s: concurrent session writes exhausted %d attempts", ports.ErrActivityProjectionContention, id, projectionAttempts+1)
+					} else {
+						projectionAttempts++
+						retry = true
+					}
+				}
+			}
+		} else {
+			applied, retry, err = project(next)
+		}
+		orchestrationProject = event.ProjectID
+	} else {
+		applied, retry, err = project(next)
+	}
 	if err != nil {
 		m.mu.Unlock()
 		return err
@@ -1006,6 +1097,12 @@ retryProjection:
 	if !applied {
 		m.mu.Unlock()
 		return nil
+	}
+	if s.Event == "user-prompt-submit" {
+		if err := m.acknowledgeOrchestrationBatch(ctx, id, s, now); err != nil {
+			m.mu.Unlock()
+			return err
+		}
 	}
 	// Transition into the needs-input family (waiting_input or blocked) pings
 	// the user; an in-family escalation (waiting_input -> blocked) does not
@@ -1023,7 +1120,11 @@ retryProjection:
 	// that pinged them has nothing left to resolve.
 	resolutions := needsInputResolutions(rec, next, now)
 	waitingEvents := m.waitingInputEvents(next, prevState, prevAt, now)
+	orchestrationWake := m.orchestrationWake
 	m.mu.Unlock()
+	if orchestrationProject != "" && orchestrationWake != nil {
+		orchestrationWake(orchestrationProject)
+	}
 	if err := m.acknowledgeAgentSwitchTarget(ctx, id, s, now); err != nil {
 		return err
 	}
@@ -1033,6 +1134,67 @@ retryProjection:
 	m.emitNotification(ctx, intent)
 	m.resolveNotifications(ctx, resolutions...)
 	return nil
+}
+
+func orchestrationBatchID(prompt string) (string, bool) {
+	const prefix = "[AO AUTOMATION batch_id="
+	if !strings.HasPrefix(prompt, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(prompt, prefix)
+	end := strings.IndexByte(rest, ']')
+	if end < 1 || end > 128 {
+		return "", false
+	}
+	token := rest[:end]
+	for _, r := range token {
+		if r != '-' && r != '_' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return "", false
+		}
+	}
+	return token, true
+}
+
+func (m *Manager) acknowledgeOrchestrationBatch(ctx context.Context, id domain.SessionID, s ports.ActivitySignal, at time.Time) error {
+	if s.Event != "user-prompt-submit" {
+		return nil
+	}
+	token, ok := orchestrationBatchID(s.LatestUserPrompt)
+	if !ok {
+		return nil
+	}
+	acknowledger, supported := m.store.(orchestrationBatchAcknowledgementStore)
+	if !supported {
+		return nil
+	}
+	if _, err := acknowledger.AcknowledgeOrchestrationBatchAccepted(ctx, id, token, at); err != nil {
+		return fmt.Errorf("acknowledge orchestration batch: %w", err)
+	}
+	return nil
+}
+
+func normalizedActivityEvent(previous, next domain.SessionRecord) (domain.OrchestrationEvent, bool) {
+	if next.Kind != domain.KindWorker || next.IsStandalone() || next.IsTerminated || previous.Activity.State == next.Activity.State {
+		return domain.OrchestrationEvent{}, false
+	}
+	var kind domain.OrchestrationEventKind
+	switch next.Activity.State {
+	case domain.ActivityIdle:
+		kind = domain.OrchestrationWorkerTurnSettled
+	case domain.ActivityBlocked, domain.ActivityWaitingInput:
+		kind = domain.OrchestrationWorkerBlocked
+	default:
+		return domain.OrchestrationEvent{}, false
+	}
+	// Revision is the durable session row identity for this transition. The
+	// update that commits next increments the stored revision, so source
+	// revision names the resulting row rather than a wall-clock timestamp.
+	revision := strconv.FormatInt(next.Revision+1, 10)
+	return domain.OrchestrationEvent{
+		ID: fmt.Sprintf("oe:%s:%s:%s", next.ID, kind, revision), ProjectID: next.ProjectID,
+		WorkerID: next.ID, Kind: kind, SourceRevision: revision,
+		EnqueuedAt: next.UpdatedAt.UTC(), NextAttemptAt: next.UpdatedAt.UTC(),
+	}, true
 }
 
 // stagePendingAgentSwitchNativeMetadata persists provider-assigned startup
@@ -1589,6 +1751,13 @@ func (m *Manager) markSpawned(
 				return nil, err
 			}
 		}
+		// Only the successful durable activation boundary may restore default
+		// presentation. Keep this write visibility-specific; the activation
+		// record above deliberately does not carry hidden_at from its snapshot.
+		// Activation clears only the state read before the durable activation
+		// boundary. If a user hid the session while activation was in flight,
+		// the CAS misses and the newer presentation choice remains in force.
+		m.clearPresentationHiddenAfterActivation(ctx, id, rec.HiddenAt)
 		if launchGenerationChanged || controllerGenerationChanged {
 			m.resetDeadProbeStreakLocked(id)
 		}
@@ -1766,6 +1935,7 @@ func (m *Manager) ActivateAgentSwitchTarget(
 	changed, err := writer.ActivateAgentSwitchTarget(ctx, activation)
 	if changed {
 		m.resetDeadProbeStreakLocked(activation.SessionID)
+		m.clearPresentationHiddenAfterActivation(ctx, activation.SessionID, activation.PresentationHiddenAt)
 	}
 	return changed, err
 }
@@ -1785,6 +1955,7 @@ func (m *Manager) ActivateChatAgentSwitchTarget(
 	changed, err := writer.ActivateChatAgentSwitchTarget(ctx, activation)
 	if changed {
 		m.resetDeadProbeStreakLocked(activation.SessionID)
+		m.clearPresentationHiddenAfterActivation(ctx, activation.SessionID, activation.PresentationHiddenAt)
 	}
 	return changed, err
 }
@@ -1806,6 +1977,9 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 			m.mu.Lock()
 			m.resetDeadProbeStreakLocked(id)
 			m.mu.Unlock()
+			if err := m.recordWorkerTerminalEvent(ctx, rec); err != nil {
+				return err
+			}
 			m.reapSessionContainers(ctx, id)
 			return nil
 		}
@@ -1848,6 +2022,9 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 		}
 		switch outcome {
 		case terminationApplied, terminationAlreadyApplied:
+			if err := m.recordWorkerTerminalEvent(ctx, rec); err != nil {
+				return err
+			}
 			m.reapSessionContainers(ctx, id)
 			return nil
 		case terminationLaunchChanged:
@@ -1859,6 +2036,35 @@ func (m *Manager) MarkTerminated(ctx context.Context, id domain.SessionID) error
 			continue
 		}
 	}
+}
+
+func (m *Manager) recordWorkerTerminalEvent(ctx context.Context, rec domain.SessionRecord) error {
+	if rec.Kind != domain.KindWorker || rec.IsStandalone() {
+		return nil
+	}
+	store, ok := m.store.(orchestrationSourceStateStore)
+	if !ok {
+		return nil
+	}
+	source := strings.TrimSpace(rec.Metadata.RuntimeLaunchID)
+	if source == "" {
+		source = strings.TrimSpace(rec.Metadata.ControllerGeneration)
+	}
+	if source == "" {
+		// Read the committed terminal fact rather than predicting a row revision
+		// from a pre-mutation snapshot. Later metadata writes advance Revision
+		// and UpdatedAt without changing the terminal transition's identity.
+		current, found, err := m.store.GetSession(ctx, rec.ID)
+		if err != nil {
+			return err
+		}
+		if !found || !current.IsTerminated || current.TerminalRevision < 0 {
+			return fmt.Errorf("lifecycle: terminal revision unavailable for session %q", rec.ID)
+		}
+		source = "terminal-revision:" + strconv.FormatInt(current.TerminalRevision, 10)
+	}
+	_, err := store.RecordOrchestrationSourceState(ctx, rec.ProjectID, rec.ID, domain.OrchestrationWorkerTerminated, source, true, m.clock())
+	return err
 }
 
 // reapSessionContainers is the container leg of #2652 (the container-owning

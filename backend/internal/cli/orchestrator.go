@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -44,7 +45,11 @@ func newOrchestratorListCommand(ctx *commandContext) *cobra.Command {
 
 func (c *commandContext) listOrchestrators(ctx context.Context, cmd *cobra.Command, opts orchestratorListOptions) error {
 	var res sessionListResponse
-	if err := c.getJSON(ctx, "orchestrators", &res); err != nil {
+	// This command is the explicit orchestrator history path. It must reveal
+	// presentation-hidden orchestrators as promised by session ls output.
+	params := url.Values{}
+	params.Set("includeHidden", "true")
+	if err := c.getJSON(ctx, apiPath("orchestrators", params), &res); err != nil {
 		return err
 	}
 	orchestrators := filterAndSortOrchestrators(res.Sessions)

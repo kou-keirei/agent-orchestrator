@@ -5,7 +5,7 @@ import { aoBridge } from "../lib/bridge";
 import type { CloudCpSession } from "../lib/cloud-cp";
 import { createRendererCloudCpClient } from "./useCloudCp";
 import { settingsQueryKey, type Settings } from "./useSettings";
-import { cloudSessionsQueryKey, workspaceQueryKey } from "./useWorkspaceQuery";
+import { cloudSessionsQueryKey, hiddenWorkspaceQueryKey, workspaceQueryKey } from "./useWorkspaceQuery";
 import { useTerminalResetStore } from "../stores/terminal-reset-store";
 
 export type RestoreSessionResult =
@@ -58,6 +58,7 @@ export function useRestoreSession(): (sessionId: string) => Promise<RestoreSessi
 					// listing (and the merged board) so the UI reflects it immediately.
 					await queryClient.invalidateQueries({ queryKey: cloudSessionsQueryKey });
 					await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+					await queryClient.invalidateQueries({ queryKey: hiddenWorkspaceQueryKey });
 					// Restore re-provisions a fresh sandbox under the same session id but
 					// a NEW worker epoch, so the old terminal is dead. Bump the reset nonce
 					// so the pane rebuilds from scratch (new mux factory, cursor at 0) and
@@ -88,6 +89,7 @@ export function useRestoreSession(): (sessionId: string) => Promise<RestoreSessi
 					return { status: "error", message };
 				}
 				await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+				await queryClient.invalidateQueries({ queryKey: hiddenWorkspaceQueryKey });
 				if (data?.restoreMode === "saved_prompt") {
 					void aoBridge.notifications
 						.show({

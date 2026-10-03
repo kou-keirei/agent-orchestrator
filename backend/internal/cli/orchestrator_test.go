@@ -50,7 +50,7 @@ func TestOrchestratorList_TableOutput(t *testing.T) {
 	if strings.Contains(out, "demo-worker") {
 		t.Fatalf("worker session should not be shown in orchestrator ls:\n%s", out)
 	}
-	want := []string{"GET /api/v1/orchestrators"}
+	want := []string{"GET /api/v1/orchestrators?includeHidden=true"}
 	if got := log.all(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %#v, want %#v", got, want)
 	}

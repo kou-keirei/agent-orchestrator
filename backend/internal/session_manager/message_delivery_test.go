@@ -74,6 +74,33 @@ func TestWaitForMessageDeliveryReadyWaitsForTerminalIdleMarker(t *testing.T) {
 	}
 }
 
+func TestWaitForMessageDeliveryReadyRetainsTUIModeFallback(t *testing.T) {
+	for _, mode := range []domain.SessionMode{"", "voice", domain.SessionModeTUI} {
+		t.Run(string(mode), func(t *testing.T) {
+			st := newFakeStore()
+			st.sessions["orch"] = domain.SessionRecord{
+				ID: "orch", ProjectID: "ao", Kind: domain.KindOrchestrator,
+				Harness: domain.HarnessCodex, Mode: mode,
+				Activity: domain.Activity{State: domain.ActivityIdle},
+				Metadata: domain.SessionMetadata{RuntimeHandleID: "orch"},
+			}
+			runtime := &fakeRuntime{outputs: []string{"starting", "ready"}}
+			m := New(Deps{Runtime: runtime, Agents: singleAgent{agent: terminalReadyAgent{}}, Store: st})
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := m.WaitForMessageDeliveryReady(ctx, "orch"); err != nil {
+				t.Fatalf("mode=%q readiness: %v", mode, err)
+			}
+			if runtime.outputCalls < 2 {
+				t.Fatalf("mode=%q terminal output calls=%d, want TUI readiness polling", mode, runtime.outputCalls)
+			}
+			if got := st.sessions["orch"].Mode; got != mode {
+				t.Fatalf("dispatcher changed persisted mode=%q to %q", mode, got)
+			}
+		})
+	}
+}
+
 func TestWaitForMessageDeliveryReadyHonorsContextWhileTerminalStarts(t *testing.T) {
 	st := newFakeStore()
 	st.sessions["orch"] = domain.SessionRecord{

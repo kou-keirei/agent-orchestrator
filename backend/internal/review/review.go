@@ -51,6 +51,104 @@ type Store interface {
 	ListRunningReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
 }
 
+// ReviewRunNativeEvidenceAppender is the optional persistence capability used
+// for provider-native reviewer hook facts. Keeping it optional preserves the
+// transport-neutral test/store boundary while production SQLite can enforce
+// launch-generation and append-only semantics in one statement.
+type ReviewRunNativeEvidenceAppender interface {
+	AppendReviewRunNativeEvidence(ctx stdctx.Context, id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID string, observedAt time.Time) (bool, error)
+}
+
+// ReviewerCleanupObligationStore is the optional durable surface for a runtime
+// handle that may have escaped before a ReviewRun could be attributed. Keeping
+// it optional preserves small transport-neutral fakes; production SQLite must
+// implement it so this cleanup identity cannot exist only in an error value.
+type ReviewerCleanupObligationStore interface {
+	InsertReviewerCleanupObligation(stdctx.Context, domain.ReviewerCleanupObligation) error
+	ListUnresolvedReviewerCleanupObligations(stdctx.Context, domain.SessionID) ([]domain.ReviewerCleanupObligation, error)
+	ResolveReviewerCleanupObligation(stdctx.Context, string, time.Time) (bool, error)
+}
+
+// ReviewerCleanupMarkerStore clears the exact ReviewRun cleanup marker after
+// the runtime destroy has succeeded. It is optional so transport-neutral fakes
+// can remain small; production SQLite implements the compare-and-clear.
+type ReviewerCleanupMarkerStore interface {
+	ResolveReviewRunCleanupMarker(stdctx.Context, string, string, string) (bool, error)
+}
+
+// ReviewerReplacementAcceptor is the optional durable transition used when a
+// live reviewer generation is replaced. Implementations must verify the exact
+// incumbent and predecessor snapshots, then commit the replacement review row
+// and predecessor terminalization atomically with any retired-host cleanup
+// obligation. Keeping this capability optional
+// preserves the transport-neutral test/store boundary; production SQLite
+// provides the transaction.
+type ReviewerReplacementAcceptor interface {
+	AcceptReviewerReplacement(ctx stdctx.Context, incumbent, replacement domain.Review, predecessors []domain.ReviewRun, clearAgentSession bool, retiredCleanup domain.ReviewerCleanupObligation) error
+}
+
+const reviewerCleanupPendingPrefix = "[ao reviewer cleanup pending handle: "
+
+func reviewerCleanupPendingMarker(handleID string) string {
+	return reviewerCleanupPendingPrefix + strings.TrimSpace(handleID) + "]"
+}
+
+func reviewerCleanupPendingMarkerForGeneration(handleID, launchID string) string {
+	marker := reviewerCleanupPendingPrefix + strings.TrimSpace(handleID)
+	if launchID != "" {
+		marker += " generation: " + strings.TrimSpace(launchID)
+	}
+	return marker + "]"
+}
+
+func reviewerCleanupPendingIdentity(body string) (marker, handleID, launchID string, ok bool) {
+	for {
+		start := strings.Index(body, reviewerCleanupPendingPrefix)
+		if start < 0 {
+			return
+		}
+		value := body[start:]
+		end := strings.IndexByte(value, ']')
+		if end < 0 {
+			return
+		}
+		// A malformed earlier marker must not consume a later valid marker.
+		if next := strings.Index(value[len(reviewerCleanupPendingPrefix):], reviewerCleanupPendingPrefix); next >= 0 && next+len(reviewerCleanupPendingPrefix) < end {
+			body = value[next+len(reviewerCleanupPendingPrefix):]
+			continue
+		}
+		candidate := value[:end+1]
+		body = value[end+1:]
+		content := strings.TrimSpace(candidate[len(reviewerCleanupPendingPrefix) : len(candidate)-1])
+		candidateHandle, candidateLaunch := content, ""
+		const generationPrefix = " generation:"
+		if index := strings.LastIndex(content, generationPrefix); index >= 0 {
+			candidateHandle = strings.TrimSpace(content[:index])
+			candidateLaunch = strings.TrimSpace(content[index+len(generationPrefix):])
+		}
+		if candidateHandle == "" {
+			continue
+		}
+		// Prefer exact generation evidence over an earlier unbound marker.
+		if candidateLaunch != "" {
+			return candidate, candidateHandle, candidateLaunch, true
+		}
+		if !ok {
+			marker, handleID, launchID, ok = candidate, candidateHandle, candidateLaunch, true
+		}
+	}
+}
+
+func reviewerCleanupPendingHandle(body string) string {
+	_, handleID, _, _ := reviewerCleanupPendingIdentity(body)
+	return handleID
+}
+
+func reviewerCleanupPendingGeneration(body string) string {
+	_, _, launchID, _ := reviewerCleanupPendingIdentity(body)
+	return launchID
+}
+
 // Sessions resolves the worker session under review.
 type Sessions interface {
 	GetSession(ctx stdctx.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
@@ -73,6 +171,10 @@ type Deps struct {
 	PRs      PRs
 	Projects Projects
 	Launcher Launcher
+	// Workspace is the AO-owned read-only observation surface. Production wiring
+	// supplies the workspace router; nil is a deliberate fail-closed error when
+	// a new run would otherwise lack a target binding.
+	Workspace ports.WorkspaceObserver
 
 	// Clock and NewID are injectable for deterministic tests.
 	Clock func() time.Time
@@ -81,13 +183,14 @@ type Deps struct {
 
 // Engine is the core code-review engine.
 type Engine struct {
-	store    Store
-	sessions Sessions
-	prs      PRs
-	projects Projects
-	launcher Launcher
-	clock    func() time.Time
-	newID    func() string
+	store     Store
+	sessions  Sessions
+	prs       PRs
+	projects  Projects
+	launcher  Launcher
+	workspace ports.WorkspaceObserver
+	clock     func() time.Time
+	newID     func() string
 
 	// triggerMu guards triggerLocks; triggerLocks holds one mutex per worker
 	// session so concurrent Trigger calls for the same worker serialise (see
@@ -114,6 +217,7 @@ func New(d Deps) *Engine {
 		prs:          d.PRs,
 		projects:     d.Projects,
 		launcher:     d.Launcher,
+		workspace:    d.Workspace,
 		clock:        clock,
 		newID:        newID,
 		triggerLocks: make(map[domain.SessionID]*sync.Mutex),
@@ -248,6 +352,9 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 	if err != nil {
 		return TriggerResult{}, err
 	}
+	if err := e.retryPendingReviewerCleanup(ctx, workerID, runs); err != nil {
+		return TriggerResult{}, err
+	}
 
 	if err := overrideConfig.Validate(); err != nil {
 		return TriggerResult{}, fmt.Errorf("%w: reviewer config: %w", ErrInvalid, err)
@@ -314,19 +421,58 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 	}
 
 	now := e.clock()
-	reviewRow, err = e.upsertReview(ctx, worker, harness, reviewRow.ReviewerHandleID, reviewRow.AgentSessionID, reviewRow.ReviewerLaunchID, domain.ActivityActive, now)
-	if err != nil {
-		return TriggerResult{}, err
+	if !hasReview {
+		reviewRow, err = e.upsertReview(ctx, worker, harness, "", "", "", "", now)
+		if err != nil {
+			return TriggerResult{}, err
+		}
 	}
-
+	// Decide the reviewer generation before inserting any pass. The generation
+	// is part of the immutable run binding, so a run can never be retrofitted
+	// with the launch that happened to follow it.
+	reuseHandle := false
+	launchID := ""
+	if !hasConfigOverride && reviewRow.ReviewerHandleID != "" && reviewerPaneReusable(reviewRow, hadRunningReviewer) {
+		alive, aliveErr := e.launcher.Alive(ctx, reviewRow.ReviewerHandleID)
+		if aliveErr != nil {
+			return TriggerResult{}, aliveErr
+		}
+		reuseHandle = alive
+		if reuseHandle {
+			launchID = reviewRow.ReviewerLaunchID
+		}
+	}
+	if launchID == "" {
+		launchID = e.newID()
+	}
 	var created []domain.ReviewRun
 	type staleSupersede struct {
 		prURL     string
 		targetSHA string
 	}
 	var pendingSupersedes []staleSupersede
-	var restarted []domain.ReviewRun
+	var runningToReplace []domain.ReviewRun
 	batchID := ""
+	failRuns := func(start int, cause error) error {
+		// Refusal/cancellation must settle every inserted pass, including when
+		// another settlement fails. Keep the original cause and all write errors.
+		cleanupCtx := stdctx.WithoutCancel(ctx)
+		resultErr := cause
+		for _, run := range created[start:] {
+			updated, updateErr := e.store.UpdateReviewRunResult(cleanupCtx, run.ID, domain.ReviewRunFailed, domain.VerdictNone, reviewerFailureBodyForLaunch(cause, run.LaunchID), "", run.AutoInjectReview)
+			if updateErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("settle unlaunched review run %q: %w", run.ID, updateErr))
+			} else if !updated {
+				resultErr = errors.Join(resultErr, fmt.Errorf("settle unlaunched review run %q: running row was not updated", run.ID))
+			}
+		}
+		return resultErr
+	}
+	type preparedReview struct {
+		state       PRReviewState
+		observation ports.WorkspaceObservation
+	}
+	var prepared []preparedReview
 	for _, reviewState := range reviews {
 		// A PR that is already up to date has nothing due — unless the caller asked
 		// for a different reviewer than the one that produced that verdict. Picking
@@ -340,14 +486,23 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 		if !eligible && !secondOpinionWanted(reviewState, hasHarnessOverride, hasConfigOverride, harness) {
 			continue
 		}
+		workspaceObservation, observeErr := e.observeReviewWorkspace(ctx, worker, reviewState.TargetSHA)
+		if observeErr != nil {
+			return TriggerResult{}, observeErr
+		}
+		if strings.TrimSpace(workspaceObservation.HeadSHA) != strings.TrimSpace(reviewState.TargetSHA) {
+			return TriggerResult{}, fmt.Errorf("%w: observed workspace HEAD %q does not match review target %q", ErrInvalid, workspaceObservation.HeadSHA, reviewState.TargetSHA)
+		}
+		prepared = append(prepared, preparedReview{state: reviewState, observation: workspaceObservation})
+	}
+	// Validate the entire batch before inserting running rows or superseding
+	// incumbents: one checkout cannot satisfy different PR heads at once.
+	for _, item := range prepared {
+		reviewState, workspaceObservation := item.state, item.observation
 		if hasConfigOverride {
 			pendingSupersedes = append(pendingSupersedes, staleSupersede{prURL: reviewState.PRURL, targetSHA: reviewState.TargetSHA})
-			if reviewState.LatestRun != nil && reviewState.LatestRun.Status == domain.ReviewRunRunning && (reviewState.LatestRun.Harness == harness || reviewState.LatestRun.Harness == "") {
-				restarted = append(restarted, *reviewState.LatestRun)
-				continue
-			}
 		} else if _, err := e.store.SupersedeStaleRunningReviewRuns(ctx, workerID, reviewState.PRURL, reviewState.TargetSHA, "superseded by a review trigger for a newer commit"); err != nil {
-			return TriggerResult{}, err
+			return TriggerResult{}, failRuns(0, err)
 		}
 		if batchID == "" {
 			batchID = e.newID()
@@ -361,6 +516,9 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 			TriggerSource: source,
 			PRURL:         reviewState.PRURL,
 			TargetSHA:     reviewState.TargetSHA,
+			TargetBinding: reviewTargetBinding(worker, reviewState.TargetSHA, workspaceObservation, now),
+			Provenance:    reviewProvenance(override, overrideConfig, resolvedHarness, resolvedConfig, harness, config, hasHarnessOverride || hasConfigOverride),
+			LaunchID:      launchID,
 			Status:        domain.ReviewRunRunning,
 			Verdict:       domain.VerdictNone,
 			CreatedAt:     now,
@@ -371,41 +529,42 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 		if err := e.store.InsertReviewRun(ctx, run); err != nil {
 			if errors.Is(err, domain.ErrDuplicateReviewRun) {
 				if existing, ok, getErr := e.store.GetReviewRunBySessionPRSHAAndHarness(ctx, workerID, reviewState.PRURL, reviewState.TargetSHA, harness); getErr != nil {
-					return TriggerResult{}, getErr
+					return TriggerResult{}, failRuns(0, getErr)
 				} else if ok {
 					reviews = replaceReviewLatestRun(reviews, reviewState.PRURL, reviewState.TargetSHA, existing)
 					continue
 				}
 			}
-			return TriggerResult{}, err
+			return TriggerResult{}, failRuns(0, err)
 		}
 		created = append(created, run)
 		reviews = replaceReviewLatestRun(reviews, reviewState.PRURL, reviewState.TargetSHA, run)
+		if predecessor, ok := runningReviewRunForReplacement(runs, workerID, reviewState, reviewRow.ID, harness, reviewRow.ReviewerLaunchID); ok {
+			// A replacement gets a fresh launch generation. Close the exact
+			// predecessor after the replacement is ready and before the old pane is
+			// destroyed, regardless of whether the old row predates launch binding
+			// or already carries one. Stale rows for another target are handled by
+			// the existing supersession query below; same-target rows never use a
+			// broad cancellation. Record it only after the replacement run was
+			// actually inserted so a duplicate-writer race cannot cancel an
+			// unpaired predecessor.
+			runningToReplace = append(runningToReplace, predecessor)
+		}
 	}
-	if len(created) == 0 && len(restarted) == 0 {
+	if len(created) == 0 {
 		return TriggerResult{Run: firstReusableRun(reviews), ReviewerHandleID: reviewRow.ReviewerHandleID, Created: false, Reviews: reviews, Runs: runs}, nil
 	}
-
-	failRuns := func(start int, err error) error {
-		for _, run := range created[start:] {
-			if _, updateErr := e.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunFailed, domain.VerdictNone, err.Error(), "", run.AutoInjectReview); updateErr != nil {
-				return updateErr
-			}
-		}
-		return err
-	}
-
-	queueRuns := append([]domain.ReviewRun{}, restarted...)
-	queueRuns = append(queueRuns, created...)
+	queueRuns := append([]domain.ReviewRun{}, created...)
 	queue := reviewQueue(queueRuns)
 	launchRun := queueRuns[0]
-	previousHandleID := reviewRow.ReviewerHandleID
-	previousAgentSessionID := reviewRow.AgentSessionID
+	incumbentReview := reviewRow
+	previousHandleID := incumbentReview.ReviewerHandleID
 	launchAgentSessionID := reviewRow.AgentSessionID
 	if hasConfigOverride {
 		launchAgentSessionID = ""
 	}
 	persistedAgentSessionID := launchAgentSessionID
+	var retiredCleanup domain.ReviewerCleanupObligation
 	handleID := ""
 	if !hasConfigOverride && reviewRow.ReviewerHandleID != "" && reviewerPaneReusable(reviewRow, hadRunningReviewer) {
 		alive, err := e.launcher.Alive(ctx, reviewRow.ReviewerHandleID)
@@ -416,28 +575,53 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 			handleID = reviewRow.ReviewerHandleID
 		}
 	}
-	if handleID == "" {
+	if !reuseHandle {
 		// Each pass gets a fresh reviewer process on the same stable terminal
 		// handle when there is no resumable live agent session to notify.
 		if err := e.launcher.Preflight(ctx, harness, worker.Metadata.WorkspacePath); err != nil {
 			return TriggerResult{}, failRuns(0, fmt.Errorf("reviewer preflight: %w", err))
 		}
-		launchID := e.newID()
-		reviewRow, err = e.upsertReview(ctx, worker, harness, reviewRow.ReviewerHandleID, launchAgentSessionID, launchID, "", now)
-		if err != nil {
-			return TriggerResult{}, failRuns(0, err)
-		}
-		launch, err := e.launcher.Spawn(ctx, reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, launchAgentSessionID, launchID))
+		launchSpec := reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, launchAgentSessionID, launchID)
+		launchSpec.PreviousHandleID = previousHandleID
+		launchSpec.PreviousLaunchID = strings.TrimSpace(incumbentReview.ReviewerLaunchID)
+		launch, err := e.launcher.Spawn(ctx, launchSpec)
 		if err != nil {
 			return TriggerResult{}, failRuns(0, fmt.Errorf("launch reviewer: %w", err))
 		}
 		handleID = launch.HandleID
-		if launch.LaunchID != "" {
-			reviewRow.ReviewerLaunchID = launch.LaunchID
+		if strings.TrimSpace(handleID) == "" {
+			return TriggerResult{}, failRuns(0, errors.New("launch reviewer: launcher returned an empty handle"))
+		}
+		effectiveLaunchID := launchID
+		if returnedLaunchID := strings.TrimSpace(launch.LaunchID); returnedLaunchID != "" {
+			if returnedLaunchID != launchID {
+				launchErr := fmt.Errorf("launch reviewer returned launch generation %q, expected %q", returnedLaunchID, launchID)
+				if destroyErr := e.launcher.Destroy(stdctx.WithoutCancel(ctx), handleID); destroyErr != nil {
+					launchErr = errors.Join(launchErr, reviewerCleanupEvidence(destroyErr, handleID))
+				}
+				return TriggerResult{}, failRuns(0, launchErr)
+			}
+			effectiveLaunchID = returnedLaunchID
 		}
 		if launch.AgentSessionID != "" {
 			persistedAgentSessionID = launch.AgentSessionID
 		}
+		replacementReview := incumbentReview
+		replacementReview.ReviewerHandleID = handleID
+		replacementReview.AgentSessionID = persistedAgentSessionID
+		replacementReview.ReviewerLaunchID = effectiveLaunchID
+		replacementReview.UpdatedAt = now
+		if previousHandleID != "" && previousHandleID != handleID {
+			retiredCleanup = e.reviewerCleanupObligation(workerID, incumbentReview, true, []domain.ReviewRun{launchRun}, incumbentReview.Harness, incumbentReview.ReviewerLaunchID, incumbentReview.AgentSessionID, previousHandleID)
+		}
+		if err := e.acceptReviewerReplacement(ctx, incumbentReview, replacementReview, runningToReplace, hasConfigOverride && persistedAgentSessionID == "", retiredCleanup); err != nil {
+			acceptErr := fmt.Errorf("accept reviewer replacement: %w", err)
+			if destroyErr := e.launcher.Destroy(stdctx.WithoutCancel(ctx), handleID); destroyErr != nil {
+				acceptErr = errors.Join(acceptErr, reviewerCleanupEvidence(destroyErr, handleID))
+			}
+			return TriggerResult{}, failRuns(0, acceptErr)
+		}
+		reviewRow = replacementReview
 	} else {
 		if err := e.launcher.Notify(ctx, handleID, reviewLaunchSpec(worker, harness, config, launchRun, queue, 0, reviewRow.AgentSessionID, reviewRow.ReviewerLaunchID)); err != nil {
 			return TriggerResult{}, failRuns(0, fmt.Errorf("notify reviewer: %w", err))
@@ -445,38 +629,31 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 	}
 	for _, stale := range pendingSupersedes {
 		if _, err := e.store.SupersedeStaleRunningReviewRuns(ctx, workerID, stale.prURL, stale.targetSHA, "superseded by a review trigger for a newer commit"); err != nil {
-			if handleID != "" {
-				_ = e.launcher.Destroy(ctx, handleID)
-			}
-			return TriggerResult{}, failRuns(0, err)
+			return TriggerResult{}, fmt.Errorf("reviewer replacement accepted but stale-run supersession failed: %w", err)
 		}
 	}
-	if hasConfigOverride && persistedAgentSessionID == "" && reviewRow.ID != "" {
-		if _, err := e.store.UpdateReviewAgentSessionID(ctx, reviewRow.ID, ""); err != nil {
-			if handleID != "" {
-				_ = e.launcher.Destroy(ctx, handleID)
+	if previousHandleID != "" && previousHandleID != handleID {
+		if err := e.launcher.Destroy(stdctx.WithoutCancel(ctx), previousHandleID); err != nil {
+			teardownErr := fmt.Errorf("destroy previous reviewer %q after replacement acceptance: %w", previousHandleID, reviewerCleanupEvidence(err, previousHandleID))
+			// Acceptance already committed this obligation. Reaffirm the same
+			// identity idempotently; a storage refusal cannot erase that commit.
+			if cleanupErr := e.persistReviewerCleanupObligation(ctx, retiredCleanup); cleanupErr != nil {
+				teardownErr = errors.Join(teardownErr, cleanupErr)
 			}
-			return TriggerResult{}, failRuns(0, err)
+			return TriggerResult{}, teardownErr
 		}
-	}
-	reviewRow, err = e.upsertReview(ctx, worker, harness, handleID, persistedAgentSessionID, reviewRow.ReviewerLaunchID, "", now)
-	if err != nil {
-		if handleID != "" {
-			_ = e.launcher.Destroy(ctx, handleID)
-		}
-		return TriggerResult{}, err
-	}
-	if hasConfigOverride && previousHandleID != "" && previousHandleID != handleID {
-		if err := e.launcher.Destroy(ctx, previousHandleID); err != nil {
-			if _, rollbackErr := e.upsertReview(ctx, worker, harness, previousHandleID, previousAgentSessionID, "", "", now); rollbackErr != nil {
-				return TriggerResult{}, failRuns(0, fmt.Errorf("destroy previous reviewer: %w; rollback review row: %w", err, rollbackErr))
+		if retiredCleanup.ID != "" {
+			store, ok := e.store.(ReviewerCleanupObligationStore)
+			if !ok {
+				return TriggerResult{}, errors.New("durable reviewer cleanup obligations are unavailable")
 			}
-			if handleID != "" {
-				if destroyNewErr := e.launcher.Destroy(ctx, handleID); destroyNewErr != nil {
-					return TriggerResult{}, failRuns(0, fmt.Errorf("destroy previous reviewer: %w; cleanup replacement reviewer: %w", err, destroyNewErr))
-				}
+			cleared, err := store.ResolveReviewerCleanupObligation(stdctx.WithoutCancel(ctx), retiredCleanup.ID, e.clock())
+			if err != nil {
+				return TriggerResult{}, fmt.Errorf("clear retired reviewer cleanup obligation %q: %w", retiredCleanup.ID, err)
 			}
-			return TriggerResult{}, failRuns(0, fmt.Errorf("destroy previous reviewer: %w", err))
+			if !cleared {
+				return TriggerResult{}, fmt.Errorf("retired reviewer cleanup obligation %q was not unresolved", retiredCleanup.ID)
+			}
 		}
 	}
 	for i := range created {
@@ -485,8 +662,61 @@ func (e *Engine) TriggerWithSource(ctx stdctx.Context, workerID domain.SessionID
 	triggerRuns := append([]domain.ReviewRun{}, created...)
 	triggerRuns = append(triggerRuns, runs...)
 	resultRun := launchRun
-	createdFlag := len(created) > 0 || len(restarted) > 0
+	createdFlag := len(created) > 0
 	return TriggerResult{Run: resultRun, ReviewerHandleID: handleID, Created: createdFlag, Reviews: reviews, Runs: triggerRuns, CreatedRuns: created}, nil
+}
+
+func (e *Engine) observeReviewWorkspace(ctx stdctx.Context, worker domain.SessionRecord, targetSHA string) (ports.WorkspaceObservation, error) {
+	if e.workspace == nil {
+		return ports.WorkspaceObservation{}, fmt.Errorf("%w: AO workspace observer is unavailable", ErrInvalid)
+	}
+	workspacePath := strings.TrimSpace(worker.Metadata.WorkspacePath)
+	executionBase := strings.TrimSpace(worker.Metadata.ExecutionBaseSHA)
+	if workspacePath == "" || executionBase == "" {
+		return ports.WorkspaceObservation{}, fmt.Errorf("%w: reviewer target binding requires workspace path and execution base SHA", ErrInvalid)
+	}
+	observation, err := e.workspace.ObserveWorkspace(ctx, ports.WorkspaceInfo{
+		Path:             workspacePath,
+		Branch:           worker.Metadata.Branch,
+		TargetSHA:        targetSHA,
+		BaseRef:          worker.Metadata.DiffBaseRef,
+		ExecutionBaseSHA: executionBase,
+		SessionID:        worker.ID,
+		ProjectID:        worker.ProjectID,
+	})
+	if err != nil {
+		return ports.WorkspaceObservation{}, fmt.Errorf("%w: observe reviewer workspace: %v", ErrInvalid, err)
+	}
+	if strings.TrimSpace(observation.Path) != workspacePath || strings.TrimSpace(observation.HeadSHA) == "" {
+		return ports.WorkspaceObservation{}, fmt.Errorf("%w: reviewer target binding observation is incomplete", ErrInvalid)
+	}
+	return observation, nil
+}
+
+func reviewTargetBinding(worker domain.SessionRecord, targetSHA string, observation ports.WorkspaceObservation, observedAt time.Time) domain.ReviewTargetBinding {
+	return domain.ReviewTargetBinding{
+		TargetSHA:           targetSHA,
+		ExecutionBaseSHA:    worker.Metadata.ExecutionBaseSHA,
+		DiffBaseSHA:         worker.Metadata.DiffBaseSHA,
+		DiffBaseRef:         worker.Metadata.DiffBaseRef,
+		WorkspacePath:       worker.Metadata.WorkspacePath,
+		ObservedHeadSHA:     observation.HeadSHA,
+		ObservedBranch:      observation.Branch,
+		WorkspaceDirty:      observation.Dirty,
+		WorkspaceDirtyKnown: true,
+		IndexStaged:         observation.Staged,
+		IndexStagedKnown:    true,
+		ObservationPhase:    "review_run_creation",
+		ObservedAt:          observedAt,
+	}
+}
+
+func reviewProvenance(requestedHarness domain.ReviewerHarness, requestedConfig domain.AgentConfig, configuredHarness domain.ReviewerHarness, configuredConfig domain.AgentConfig, resolvedHarness domain.ReviewerHarness, resolvedConfig domain.AgentConfig, requested bool) domain.ReviewerProvenance {
+	return domain.ReviewerProvenance{
+		Requested:  domain.ReviewerSettings{Harness: requestedHarness, Model: requestedConfig.Model, Effort: requestedConfig.Effort, Mode: requestedConfig.Mode, Permission: requestedConfig.Permissions, Observed: requested},
+		Configured: domain.ReviewerSettings{Harness: configuredHarness, Model: configuredConfig.Model, Effort: configuredConfig.Effort, Mode: configuredConfig.Mode, Permission: configuredConfig.Permissions, Observed: true},
+		AOResolved: domain.ReviewerSettings{Harness: resolvedHarness, Model: resolvedConfig.Model, Effort: resolvedConfig.Effort, Mode: resolvedConfig.Mode, Permission: resolvedConfig.Permissions, Observed: true},
+	}
 }
 
 func autoReviewSessionReason(worker domain.SessionRecord, now time.Time) string {
@@ -646,6 +876,26 @@ func (e *Engine) RestoreReviewer(ctx stdctx.Context, workerID domain.SessionID) 
 	return e.restoreReviewerLocked(ctx, workerID, worker, harness, config)
 }
 
+// ReconcileReviewerCleanup retries durable reviewer cleanup independently of
+// reviewer restoration. Startup calls this even when the worker runtime is
+// adopted in place, so a live-session adoption cannot skip cleanup obligations
+// left by a prior crash.
+func (e *Engine) ReconcileReviewerCleanup(ctx stdctx.Context, workerID domain.SessionID) error {
+	if workerID == "" {
+		return fmt.Errorf("%w: worker session id is required", ErrInvalid)
+	}
+	if _, ok := e.store.(ReviewerCleanupObligationStore); !ok {
+		return errors.New("durable reviewer cleanup obligations are unavailable")
+	}
+	unlock := e.lockWorker(workerID)
+	defer unlock()
+	runs, err := e.store.ListReviewRunsBySession(ctx, workerID)
+	if err != nil {
+		return err
+	}
+	return e.retryPendingReviewerCleanup(ctx, workerID, runs)
+}
+
 func (e *Engine) restoreReviewerLocked(
 	ctx stdctx.Context,
 	workerID domain.SessionID,
@@ -668,6 +918,9 @@ func (e *Engine) restoreReviewerLocked(
 	if err != nil {
 		return RestoreReviewerResult{}, err
 	}
+	if err := e.retryPendingReviewerCleanup(ctx, workerID, runs); err != nil {
+		return RestoreReviewerResult{}, err
+	}
 	previousRuns := reviewRunsForHarness(runs, harness)
 	if !hasReview && len(previousRuns) == 0 {
 		return RestoreReviewerResult{}, nil
@@ -681,21 +934,46 @@ func (e *Engine) restoreReviewerLocked(
 			return RestoreReviewerResult{ReviewerHandleID: reviewRow.ReviewerHandleID, Restored: false}, nil
 		}
 	}
+	priorReview := reviewRow
+	previousLaunchID := strings.TrimSpace(reviewRow.ReviewerLaunchID)
 	agentSessionID := ""
 	if hasReview {
 		agentSessionID = reviewRow.AgentSessionID
 	} else {
-		reviewRow, err = e.upsertReview(ctx, worker, harness, "", "", "", domain.ActivityIdle, e.clock())
+		// Keep the first restore attempt in memory. There is no durable
+		// generation to fence until a live handle has been accepted.
+		reviewRow = domain.Review{
+			ID:                    e.newID(),
+			SessionID:             worker.ID,
+			ProjectID:             worker.ProjectID,
+			Harness:               harness,
+			ReviewerActivityState: domain.ActivityIdle,
+			CreatedAt:             e.clock(),
+			UpdatedAt:             e.clock(),
+		}
+	}
+	// A native restore continues the generation already bound to its running
+	// pass. A restore with no uniquely attributable running pass gets a fresh
+	// idle generation; restore itself never rewrites a ReviewRun binding.
+	restoreRuns, launchID, restoreRunID, attributionRejected := restoreRunAttribution(previousRuns, reviewRow, harness)
+	if attributionRejected {
+		return RestoreReviewerResult{}, fmt.Errorf("%w: reviewer restore run attribution is ambiguous or has a mismatched launch generation", ErrInvalid)
+	}
+	if launchID == "" {
+		launchID = e.newID()
+	}
+	if hasReview {
+		// Claim the generation before provider hooks can arrive, but retain the
+		// exact prior row so any failed restore can restore the old authority.
+		reviewRow, err = e.upsertReview(ctx, worker, harness, reviewRow.ReviewerHandleID, agentSessionID, launchID, "", e.clock())
 		if err != nil {
 			return RestoreReviewerResult{}, err
 		}
-	}
-	launchID := e.newID()
-	reviewRow, err = e.upsertReview(ctx, worker, harness, reviewRow.ReviewerHandleID, agentSessionID, launchID, "", e.clock())
-	if err != nil {
-		return RestoreReviewerResult{}, err
+	} else {
+		reviewRow.ReviewerLaunchID = launchID
 	}
 	launch, err := e.launcher.RestoreTerminal(ctx, LaunchSpec{
+		RunID:                restoreRunID,
 		ReviewSessionID:      reviewRow.ID,
 		LaunchID:             launchID,
 		WorkerID:             worker.ID,
@@ -704,43 +982,398 @@ func (e *Engine) restoreReviewerLocked(
 		AgentConfig:          config,
 		WorkspacePath:        worker.Metadata.WorkspacePath,
 		AgentSessionID:       agentSessionID,
+		PreviousLaunchID:     previousLaunchID,
 		RequireNativeHistory: harness == domain.ReviewerCodex,
 		PreviousRuns:         previousRuns,
 	})
 	if err != nil {
 		restoreErr := fmt.Errorf("restore reviewer: %w", err)
-		if failErr := e.failRunningRestoredRuns(ctx, previousRuns, restoreErr.Error()); failErr != nil {
+		if err := e.recordPossibleReviewerCleanup(ctx, worker.ID, reviewRow, hasReview, restoreRuns, harness, launchID, agentSessionID, err); err != nil {
+			restoreErr = errors.Join(restoreErr, err)
+		}
+		if rollbackErr := e.rollbackRestoreReview(ctx, hasReview, priorReview, "", false); rollbackErr != nil {
+			restoreErr = errors.Join(restoreErr, rollbackErr)
+		}
+		if failErr := e.failRunningRestoredRuns(ctx, restoreRuns, restoreErr, launchID); failErr != nil {
 			return RestoreReviewerResult{}, errors.Join(restoreErr, failErr)
 		}
 		return RestoreReviewerResult{}, restoreErr
 	}
-	if !launch.NativeResumed {
+	if len(restoreRuns) > 0 && !launch.NativeResumed {
 		const reason = "reviewer native conversation was unavailable during restore; retry the review"
-		if err := e.failRunningRestoredRuns(ctx, previousRuns, reason); err != nil {
-			_ = e.launcher.Destroy(ctx, launch.HandleID)
-			return RestoreReviewerResult{}, err
+		if strings.TrimSpace(launch.HandleID) == "" {
+			failureErr := errors.New(reason + "; restore returned an empty runtime handle")
+			if rollbackErr := e.rollbackRestoreReview(ctx, hasReview, priorReview, "", false); rollbackErr != nil {
+				failureErr = errors.Join(failureErr, rollbackErr)
+			}
+			if failErr := e.failRunningRestoredRuns(ctx, restoreRuns, failureErr, launchID); failErr != nil {
+				return RestoreReviewerResult{}, errors.Join(failureErr, failErr)
+			}
+			return RestoreReviewerResult{}, failureErr
 		}
+		cleanupErr := e.cleanupRestoredReviewer(ctx, worker.ID, reviewRow, hasReview, restoreRuns, harness, launch.LaunchID, agentSessionID, launch.HandleID)
+		failureErr := error(errors.New(reason))
+		if cleanupErr != nil {
+			failureErr = errors.Join(failureErr, cleanupErr)
+		}
+		rollbackErr := e.rollbackRestoreReview(ctx, hasReview, priorReview, launch.HandleID, cleanupErr == nil)
+		if rollbackErr != nil {
+			failureErr = errors.Join(failureErr, rollbackErr)
+		}
+		if err := e.failRunningRestoredRuns(ctx, restoreRuns, failureErr, launch.LaunchID); err != nil {
+			return RestoreReviewerResult{}, errors.Join(failureErr, err)
+		}
+		if cleanupErr != nil || rollbackErr != nil {
+			return RestoreReviewerResult{}, failureErr
+		}
+		// The fresh fallback was destroyed and is never an authoritative
+		// reviewer handle. Restore reports the durable run failure only.
+		return RestoreReviewerResult{}, nil
+	}
+	if strings.TrimSpace(launch.HandleID) == "" || strings.TrimSpace(launch.LaunchID) == "" {
+		restoreErr := errors.New("restore reviewer returned incomplete runtime authority")
+		if strings.TrimSpace(launch.HandleID) != "" {
+			restoreErr = errors.Join(restoreErr, e.cleanupRestoredReviewer(ctx, worker.ID, reviewRow, hasReview, restoreRuns, harness, launch.LaunchID, agentSessionID, launch.HandleID))
+		}
+		if rollbackErr := e.rollbackRestoreReview(ctx, hasReview, priorReview, launch.HandleID, false); rollbackErr != nil {
+			restoreErr = errors.Join(restoreErr, rollbackErr)
+		}
+		if failErr := e.failRunningRestoredRuns(ctx, restoreRuns, restoreErr, launch.LaunchID); failErr != nil {
+			return RestoreReviewerResult{}, errors.Join(restoreErr, failErr)
+		}
+		return RestoreReviewerResult{}, restoreErr
 	}
 	if launch.AgentSessionID != "" {
 		agentSessionID = launch.AgentSessionID
 	}
-	if _, err := e.upsertReview(ctx, worker, harness, launch.HandleID, agentSessionID, launch.LaunchID, "", e.clock()); err != nil {
-		_ = e.launcher.Destroy(ctx, launch.HandleID)
-		return RestoreReviewerResult{}, err
+	if _, err := e.persistRestoredReview(ctx, worker, harness, hasReview, reviewRow, launch.HandleID, agentSessionID, launch.LaunchID); err != nil {
+		persistErr := fmt.Errorf("persist restored reviewer: %w", err)
+		cleanupErr := e.cleanupRestoredReviewer(ctx, worker.ID, reviewRow, hasReview, restoreRuns, harness, launch.LaunchID, agentSessionID, launch.HandleID)
+		if cleanupErr != nil {
+			persistErr = errors.Join(persistErr, cleanupErr)
+		}
+		if rollbackErr := e.rollbackRestoreReview(ctx, hasReview, priorReview, launch.HandleID, cleanupErr == nil); rollbackErr != nil {
+			persistErr = errors.Join(persistErr, rollbackErr)
+		}
+		if failErr := e.failRunningRestoredRuns(ctx, restoreRuns, persistErr, launch.LaunchID); failErr != nil {
+			return RestoreReviewerResult{}, errors.Join(persistErr, failErr)
+		}
+		return RestoreReviewerResult{}, persistErr
 	}
 	return RestoreReviewerResult{ReviewerHandleID: launch.HandleID, Restored: true}, nil
 }
 
-func (e *Engine) failRunningRestoredRuns(ctx stdctx.Context, runs []domain.ReviewRun, body string) error {
+func (e *Engine) persistRestoredReview(
+	ctx stdctx.Context,
+	worker domain.SessionRecord,
+	harness domain.ReviewerHarness,
+	hasReview bool,
+	review domain.Review,
+	handleID, agentSessionID, launchID string,
+) (domain.Review, error) {
+	if hasReview {
+		return e.upsertReview(ctx, worker, harness, handleID, agentSessionID, launchID, "", e.clock())
+	}
+	review.ReviewerHandleID = strings.TrimSpace(handleID)
+	review.AgentSessionID = strings.TrimSpace(agentSessionID)
+	review.ReviewerLaunchID = strings.TrimSpace(launchID)
+	review.UpdatedAt = e.clock()
+	if err := e.store.UpsertReview(ctx, review); err != nil {
+		return domain.Review{}, err
+	}
+	return review, nil
+}
+
+func reviewerCleanupHandleFromError(err error) (string, bool) {
+	var effectErr ports.RuntimeEffectError
+	if !errors.As(err, &effectErr) || effectErr.CleanupOutcome() == ports.RuntimeCleanupSucceeded {
+		return "", false
+	}
+	handleID := strings.TrimSpace(effectErr.PossibleHandle().ID)
+	return handleID, handleID != ""
+}
+
+type reviewerCleanupGenerationProvider interface {
+	CleanupGeneration() string
+}
+
+type reviewerCleanupGenerationBinding interface {
+	CleanupGenerationBound() bool
+}
+
+func reviewerCleanupGenerationFromError(err error) string {
+	var provider reviewerCleanupGenerationProvider
+	if errors.As(err, &provider) {
+		return strings.TrimSpace(provider.CleanupGeneration())
+	}
+	return ""
+}
+
+func (e *Engine) recordReviewerCleanupObligation(
+	ctx stdctx.Context,
+	workerID domain.SessionID,
+	review domain.Review,
+	hasReview bool,
+	runs []domain.ReviewRun,
+	harness domain.ReviewerHarness,
+	launchID, agentSessionID, handleID string,
+) error {
+	return e.persistReviewerCleanupObligation(ctx, e.reviewerCleanupObligation(workerID, review, hasReview, runs, harness, launchID, agentSessionID, handleID))
+}
+
+func (e *Engine) reviewerCleanupObligation(
+	workerID domain.SessionID,
+	review domain.Review,
+	hasReview bool,
+	runs []domain.ReviewRun,
+	harness domain.ReviewerHarness,
+	launchID, agentSessionID, handleID string,
+) domain.ReviewerCleanupObligation {
+	obligation := domain.ReviewerCleanupObligation{
+		ID:             e.newID(),
+		SessionID:      workerID,
+		Harness:        harness,
+		HandleID:       strings.TrimSpace(handleID),
+		LaunchID:       strings.TrimSpace(launchID),
+		AgentSessionID: strings.TrimSpace(agentSessionID),
+		Status:         domain.ReviewerCleanupUnresolved,
+		CreatedAt:      e.clock(),
+		UpdatedAt:      e.clock(),
+	}
+	if hasReview {
+		obligation.ReviewID = strings.TrimSpace(review.ID)
+	}
+	if len(runs) == 1 {
+		obligation.RunID = strings.TrimSpace(runs[0].ID)
+	}
+	return obligation
+}
+
+func (e *Engine) persistReviewerCleanupObligation(ctx stdctx.Context, obligation domain.ReviewerCleanupObligation) error {
+	store, ok := e.store.(ReviewerCleanupObligationStore)
+	if !ok {
+		return errors.New("durable reviewer cleanup obligations are unavailable")
+	}
+	if obligation.HandleID == "" {
+		return errors.New("durable reviewer cleanup obligation has an empty handle")
+	}
+	if err := store.InsertReviewerCleanupObligation(stdctx.WithoutCancel(ctx), obligation); err != nil {
+		return fmt.Errorf("persist reviewer cleanup obligation for handle %q: %w", obligation.HandleID, err)
+	}
+	return nil
+}
+
+// recordPossibleReviewerCleanup handles the launcher's own failed cleanup path.
+// When a ReviewRun is attributable, its existing marker remains the sole
+// cleanup authority; otherwise this path persists the exact possible handle.
+func (e *Engine) recordPossibleReviewerCleanup(
+	ctx stdctx.Context,
+	workerID domain.SessionID,
+	review domain.Review,
+	hasReview bool,
+	runs []domain.ReviewRun,
+	harness domain.ReviewerHarness,
+	launchID, agentSessionID string,
+	launchErr error,
+) error {
+	if len(runs) != 0 {
+		return nil
+	}
+	handleID, ok := reviewerCleanupHandleFromError(launchErr)
+	if !ok {
+		return nil
+	}
+	var binding reviewerCleanupGenerationBinding
+	if errors.As(launchErr, &binding) && binding.CleanupGenerationBound() {
+		launchID = reviewerCleanupGenerationFromError(launchErr)
+	} else if cleanupLaunchID := reviewerCleanupGenerationFromError(launchErr); cleanupLaunchID != "" {
+		launchID = cleanupLaunchID
+	}
+	return e.recordReviewerCleanupObligation(ctx, workerID, review, hasReview, runs, harness, launchID, agentSessionID, handleID)
+}
+
+// cleanupRestoredReviewer records the obligation before attempting destruction
+// when no ReviewRun can carry it. A successful destroy then clears that exact
+// durable row; a failed destroy leaves the row unresolved for restart retry.
+func (e *Engine) cleanupRestoredReviewer(
+	ctx stdctx.Context,
+	workerID domain.SessionID,
+	review domain.Review,
+	hasReview bool,
+	runs []domain.ReviewRun,
+	harness domain.ReviewerHarness,
+	launchID, agentSessionID, handleID string,
+) error {
+	handleID = strings.TrimSpace(handleID)
+	if handleID == "" {
+		return nil
+	}
+	cleanupCtx := stdctx.WithoutCancel(ctx)
+	var obligationStore ReviewerCleanupObligationStore
+	var obligationID string
+	var recordErr error
+	if len(runs) == 0 {
+		obligationStore, _ = e.store.(ReviewerCleanupObligationStore)
+		if obligationStore == nil {
+			recordErr = errors.New("durable reviewer cleanup obligations are unavailable")
+		} else {
+			obligation := domain.ReviewerCleanupObligation{
+				ID:             e.newID(),
+				SessionID:      workerID,
+				Harness:        harness,
+				HandleID:       handleID,
+				LaunchID:       strings.TrimSpace(launchID),
+				AgentSessionID: strings.TrimSpace(agentSessionID),
+				Status:         domain.ReviewerCleanupUnresolved,
+				CreatedAt:      e.clock(),
+				UpdatedAt:      e.clock(),
+			}
+			if hasReview {
+				obligation.ReviewID = strings.TrimSpace(review.ID)
+			}
+			obligationID = obligation.ID
+			if err := obligationStore.InsertReviewerCleanupObligation(cleanupCtx, obligation); err != nil {
+				recordErr = fmt.Errorf("persist reviewer cleanup obligation for handle %q: %w", handleID, err)
+			}
+		}
+	}
+	if recordErr != nil {
+		return recordErr
+	}
+	authorities, err := e.store.ListReviewsBySession(cleanupCtx, workerID)
+	if err != nil {
+		return fmt.Errorf("list reviewer cleanup authorities for %q: %w", workerID, err)
+	}
+	if !reviewerCleanupAuthorityMatches(authorities, workerID, harness, review.ID, launchID, handleID) {
+		return fmt.Errorf("reviewer cleanup handle %q rejected by launch-generation fence", handleID)
+	}
+
+	destroyErr := e.launcher.Destroy(cleanupCtx, handleID)
+	if destroyErr != nil {
+		destroyErr = reviewerCleanupEvidence(destroyErr, handleID)
+		return destroyErr
+	}
+	if obligationStore != nil && obligationID != "" {
+		if cleared, err := obligationStore.ResolveReviewerCleanupObligation(cleanupCtx, obligationID, e.clock()); err != nil {
+			return errors.Join(recordErr, fmt.Errorf("clear reviewer cleanup obligation %q: %w", obligationID, err))
+		} else if !cleared {
+			return fmt.Errorf("reviewer cleanup obligation %q was not unresolved", obligationID)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) rollbackRestoreReview(ctx stdctx.Context, hadReview bool, prior domain.Review, attemptedHandle string, cleanupProven bool) error {
+	if !hadReview {
+		return nil
+	}
+	if cleanupProven && strings.TrimSpace(attemptedHandle) != "" && strings.TrimSpace(prior.ReviewerHandleID) == strings.TrimSpace(attemptedHandle) {
+		prior.ReviewerHandleID = ""
+	}
+	if err := e.store.UpsertReview(ctx, prior); err != nil {
+		return fmt.Errorf("restore prior reviewer authority: %w", err)
+	}
+	return nil
+}
+
+func (e *Engine) failRunningRestoredRuns(ctx stdctx.Context, runs []domain.ReviewRun, cause error, cleanupLaunchID string) error {
 	for _, run := range runs {
 		if run.Status != domain.ReviewRunRunning {
 			continue
 		}
+		generation := strings.TrimSpace(cleanupLaunchID)
+		if generation == "" {
+			generation = run.LaunchID
+		}
+		body := reviewerFailureBodyForLaunch(cause, generation)
 		if _, err := e.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunFailed, domain.VerdictNone, body, "", run.AutoInjectReview); err != nil {
 			return fmt.Errorf("fail review run %q after reviewer restore: %w", run.ID, err)
 		}
 	}
 	return nil
+}
+
+// restoreRunAttribution returns only the running passes that can be truthfully
+// tied to this restore attempt. A durable reviewer generation is stronger than
+// same-session/same-harness coincidence; a lone legacy row without a launch id
+// remains attributable, but ambiguous rows and non-empty generation mismatches
+// are rejected rather than reinterpreted as legacy.
+func restoreRunAttribution(runs []domain.ReviewRun, review domain.Review, harness domain.ReviewerHarness) (attributable []domain.ReviewRun, launchID, runID string, rejected bool) {
+	preferExactReviewID := false
+	if strings.TrimSpace(review.ID) != "" {
+		for _, run := range runs {
+			if run.Status == domain.ReviewRunRunning && run.SessionID == review.SessionID && run.Harness == harness && run.ReviewID == review.ID {
+				preferExactReviewID = true
+				break
+			}
+		}
+	}
+	candidates := make([]domain.ReviewRun, 0, len(runs))
+	for _, run := range runs {
+		if run.Status != domain.ReviewRunRunning || run.SessionID != review.SessionID || run.Harness != harness {
+			continue
+		}
+		if preferExactReviewID && run.ReviewID != review.ID {
+			continue
+		}
+		if strings.TrimSpace(review.ID) != "" && strings.TrimSpace(run.ReviewID) != "" && run.ReviewID != review.ID {
+			continue
+		}
+		candidates = append(candidates, run)
+	}
+	if len(candidates) == 0 {
+		return nil, "", "", false
+	}
+
+	expectedLaunchID := strings.TrimSpace(review.ReviewerLaunchID)
+	if expectedLaunchID != "" {
+		matching := make([]domain.ReviewRun, 0, len(candidates))
+		mismatched := false
+		for _, run := range candidates {
+			runLaunchID := strings.TrimSpace(run.LaunchID)
+			if runLaunchID == expectedLaunchID {
+				matching = append(matching, run)
+			} else if runLaunchID != "" {
+				mismatched = true
+			}
+		}
+		if len(matching) > 0 {
+			if len(matching) == 1 {
+				return matching, expectedLaunchID, matching[0].ID, false
+			}
+			return matching, expectedLaunchID, "", false
+		}
+		if mismatched {
+			return nil, "", "", true
+		}
+	}
+
+	uniqueLaunchID := ""
+	emptyLaunchCount := 0
+	for _, run := range candidates {
+		current := strings.TrimSpace(run.LaunchID)
+		if current == "" {
+			emptyLaunchCount++
+			continue
+		}
+		if uniqueLaunchID == "" {
+			uniqueLaunchID = current
+		} else if uniqueLaunchID != current {
+			return nil, "", "", true
+		}
+	}
+	if uniqueLaunchID != "" && emptyLaunchCount == 0 {
+		if len(candidates) == 1 {
+			return candidates, uniqueLaunchID, candidates[0].ID, false
+		}
+		return candidates, uniqueLaunchID, "", false
+	}
+	if len(candidates) == 1 {
+		// Keep an existing durable generation for a lone legacy predecessor so
+		// restore does not make its native hooks stale before the launch returns.
+		return candidates, expectedLaunchID, candidates[0].ID, false
+	}
+	return nil, "", "", true
 }
 
 // TeardownReviewerTerminal destroys reviewer panes before shutdown removes the
@@ -899,6 +1532,62 @@ func secondOpinionWanted(state PRReviewState, hasHarnessOverride, hasConfigOverr
 		latestHarness = harness
 	}
 	return latestHarness != harness
+}
+
+func runningReviewRunForReplacement(runs []domain.ReviewRun, sessionID domain.SessionID, state PRReviewState, reviewID string, harness domain.ReviewerHarness, reviewerLaunchID string) (domain.ReviewRun, bool) {
+	reviewerLaunchID = strings.TrimSpace(reviewerLaunchID)
+	preferExactReviewID := false
+	if strings.TrimSpace(reviewID) != "" {
+		for _, run := range runs {
+			if run.SessionID == sessionID && run.PRURL == state.PRURL && run.TargetSHA == state.TargetSHA && run.Status == domain.ReviewRunRunning && run.Harness == harness && run.ReviewID == reviewID {
+				preferExactReviewID = true
+				break
+			}
+		}
+	}
+	var predecessor domain.ReviewRun
+	var legacyPredecessor domain.ReviewRun
+	found := false
+	legacyFound := false
+	legacyAmbiguous := false
+	for _, run := range runs {
+		if run.SessionID != sessionID || run.PRURL != state.PRURL || run.TargetSHA != state.TargetSHA || run.Status != domain.ReviewRunRunning {
+			continue
+		}
+		if run.Harness != harness && run.Harness != "" {
+			continue
+		}
+		if preferExactReviewID && run.ReviewID != reviewID {
+			continue
+		}
+		if strings.TrimSpace(reviewID) != "" && strings.TrimSpace(run.ReviewID) != "" && run.ReviewID != reviewID {
+			continue
+		}
+		runLaunchID := strings.TrimSpace(run.LaunchID)
+		if runLaunchID == "" {
+			if !legacyFound {
+				legacyPredecessor = run
+				legacyFound = true
+			} else {
+				legacyAmbiguous = true
+			}
+			continue
+		}
+		if runLaunchID != reviewerLaunchID {
+			continue
+		}
+		if !found || run.CreatedAt.After(predecessor.CreatedAt) || (run.CreatedAt.Equal(predecessor.CreatedAt) && run.ID > predecessor.ID) {
+			predecessor = run
+			found = true
+		}
+	}
+	if found {
+		return predecessor, true
+	}
+	if legacyFound && !legacyAmbiguous {
+		return legacyPredecessor, true
+	}
+	return domain.ReviewRun{}, false
 }
 
 func replaceReviewLatestRun(reviews []PRReviewState, prURL, targetSHA string, run domain.ReviewRun) []PRReviewState {
@@ -1247,4 +1936,213 @@ func (e *Engine) upsertReview(ctx stdctx.Context, worker domain.SessionRecord, h
 		return domain.Review{}, err
 	}
 	return review, nil
+}
+
+func (e *Engine) acceptReviewerReplacement(ctx stdctx.Context, incumbent, replacement domain.Review, predecessors []domain.ReviewRun, clearAgentSession bool, retiredCleanup domain.ReviewerCleanupObligation) error {
+	if acceptor, ok := e.store.(ReviewerReplacementAcceptor); ok {
+		return acceptor.AcceptReviewerReplacement(ctx, incumbent, replacement, predecessors, clearAgentSession, retiredCleanup)
+	}
+	return errors.New("atomic reviewer replacement persistence is unavailable")
+}
+
+func reviewerFailureBody(err error) string {
+	if err == nil {
+		return ""
+	}
+	body := err.Error()
+	var effectErr ports.RuntimeEffectError
+	if errors.As(err, &effectErr) && effectErr.CleanupOutcome() != ports.RuntimeCleanupSucceeded {
+		if handleID := strings.TrimSpace(effectErr.PossibleHandle().ID); handleID != "" && !strings.Contains(body, reviewerCleanupPendingPrefix) {
+			marker := reviewerCleanupPendingMarker(handleID)
+			body += "\n" + marker
+		}
+	}
+	return body
+}
+
+func (e *Engine) retryPendingReviewerCleanup(ctx stdctx.Context, sessionID domain.SessionID, runs []domain.ReviewRun) error {
+	var cleanupErr error
+	reviews, err := e.store.ListReviewsBySession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("list reviewer cleanup authorities for %q: %w", sessionID, err)
+	}
+	if store, ok := e.store.(ReviewerCleanupObligationStore); ok {
+		obligations, err := store.ListUnresolvedReviewerCleanupObligations(ctx, sessionID)
+		if err != nil {
+			return fmt.Errorf("list reviewer cleanup obligations for %q: %w", sessionID, err)
+		}
+		for _, obligation := range obligations {
+			authorityMatches := reviewerCleanupAuthorityMatches(reviews, obligation.SessionID, obligation.Harness, obligation.ReviewID, obligation.LaunchID, obligation.HandleID)
+			newerGenerations := reviewerCleanupNewerRunningGenerations(runs, obligation.SessionID, obligation.Harness, obligation.ReviewID, obligation.LaunchID)
+			destroy, resolve, decisionErr := e.reviewerCleanupDecision(ctx, authorityMatches, obligation.HandleID, obligation.LaunchID, newerGenerations)
+			if decisionErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reviewer cleanup obligation %q: %w", obligation.ID, decisionErr))
+				continue
+			}
+			if destroy {
+				if err := e.launcher.Destroy(stdctx.WithoutCancel(ctx), obligation.HandleID); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("retry reviewer cleanup obligation %q handle %q: %w", obligation.ID, obligation.HandleID, err))
+					continue
+				}
+			}
+			if resolve {
+				if cleared, err := store.ResolveReviewerCleanupObligation(stdctx.WithoutCancel(ctx), obligation.ID, e.clock()); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("clear reviewer cleanup obligation %q: %w", obligation.ID, err))
+				} else if !cleared {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reviewer cleanup obligation %q was not unresolved", obligation.ID))
+				}
+			}
+		}
+	}
+	markerStore, hasMarkerStore := e.store.(ReviewerCleanupMarkerStore)
+	seen := make(map[string]struct{})
+	for _, run := range runs {
+		pendingBody := run.Body
+		for {
+			marker, handleID, launchID, ok := reviewerCleanupPendingIdentity(pendingBody)
+			if !ok {
+				if strings.Contains(pendingBody, reviewerCleanupPendingPrefix) {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("review run %q malformed cleanup marker retained because identity is unavailable", run.ID))
+				}
+				break
+			}
+			pendingBody = strings.ReplaceAll(pendingBody, marker, "")
+			key := run.ID + "\x00" + marker
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if !hasMarkerStore {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("review run %q cleanup marker cannot be reconciled without durable marker storage", run.ID))
+				continue
+			}
+			authorityMatches := reviewerCleanupAuthorityMatches(reviews, run.SessionID, run.Harness, run.ReviewID, launchID, handleID)
+			newerGenerations := reviewerCleanupNewerRunningGenerations(runs, run.SessionID, run.Harness, run.ReviewID, launchID)
+			destroy, resolve, decisionErr := e.reviewerCleanupDecision(ctx, authorityMatches, handleID, launchID, newerGenerations)
+			if decisionErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("review run %q cleanup marker: %w", run.ID, decisionErr))
+				continue
+			}
+			if destroy {
+				if err := e.launcher.Destroy(stdctx.WithoutCancel(ctx), handleID); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("retry reviewer cleanup for run %q handle %q: %w", run.ID, handleID, err))
+					continue
+				}
+			}
+			if resolve {
+				clearedBody := strings.ReplaceAll(run.Body, marker, "")
+				if launchID != "" {
+					// These legacy duplicates refer to the same handle. Clear them
+					// only after its generation-bound cleanup is proven released.
+					legacy := reviewerCleanupPendingMarker(handleID)
+					clearedBody = strings.ReplaceAll(clearedBody, legacy, "")
+					pendingBody = strings.ReplaceAll(pendingBody, legacy, "")
+				}
+				clearedBody = strings.TrimSpace(clearedBody)
+				if cleared, err := markerStore.ResolveReviewRunCleanupMarker(stdctx.WithoutCancel(ctx), run.ID, marker, clearedBody); err != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("clear reviewer cleanup marker for run %q: %w", run.ID, err))
+				} else if !cleared {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("clear reviewer cleanup marker for run %q: marker was not unresolved", run.ID))
+				} else {
+					run.Body = clearedBody
+				}
+			}
+			if !destroy && !resolve {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("review run %q cleanup marker retained because generation authority is unavailable", run.ID))
+			}
+		}
+	}
+	return cleanupErr
+}
+
+// reviewerCleanupDecision establishes exact runtime-generation authority before
+// permitting any destructive cleanup. A newer running review generation is
+// probed first: while it is live but not yet durably adopted, cleanup remains
+// unresolved; once the durable review authority advances, the old obligation
+// can clear without destroying the reused handle. A dead exact generation is
+// already gone. Every other uncertainty remains retryable and fail-closed.
+func (e *Engine) reviewerCleanupDecision(ctx stdctx.Context, authorityMatches bool, handleID, launchID string, newerGenerations []string) (destroy, resolve bool, err error) {
+	prober, ok := e.launcher.(ReviewerGenerationProber)
+	if !ok {
+		return false, false, errors.New("exact reviewer runtime-generation authority is unavailable")
+	}
+	for _, newerGeneration := range newerGenerations {
+		probe := prober.ProbeReviewerGeneration(ctx, handleID, newerGeneration)
+		if probe.Liveness != ports.FencedAlive || probe.Reason != ports.FencedReasonExactMatch {
+			continue
+		}
+		if authorityMatches {
+			return false, false, fmt.Errorf("launch-generation fence: newer reviewer generation %q is live but not durably adopted", newerGeneration)
+		}
+		return false, true, nil
+	}
+	probe := prober.ProbeReviewerGeneration(ctx, handleID, launchID)
+	switch {
+	case authorityMatches && probe.Liveness == ports.FencedAlive && probe.Reason == ports.FencedReasonExactMatch:
+		return true, true, nil
+	case probe.Liveness == ports.FencedDead && probe.Reason == ports.FencedReasonExactAbsent:
+		return false, true, nil
+	case !authorityMatches && probe.Liveness == ports.FencedUnknown && probe.Reason == ports.FencedReasonGenerationMismatch:
+		return false, true, nil
+	default:
+		if !authorityMatches {
+			return false, false, fmt.Errorf("launch-generation fence: generation authority unavailable (durable_match=%t liveness=%s reason=%s)", authorityMatches, probe.Liveness, probe.Reason)
+		}
+		return false, false, fmt.Errorf("generation authority unavailable (durable_match=%t liveness=%s reason=%s)", authorityMatches, probe.Liveness, probe.Reason)
+	}
+}
+
+func reviewerCleanupNewerRunningGenerations(runs []domain.ReviewRun, sessionID domain.SessionID, harness domain.ReviewerHarness, reviewID, launchID string) []string {
+	if strings.TrimSpace(reviewID) == "" {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var generations []string
+	for _, run := range runs {
+		generation := strings.TrimSpace(run.LaunchID)
+		if run.SessionID != sessionID || run.Harness != harness || run.ReviewID != reviewID || run.Status != domain.ReviewRunRunning || generation == "" || generation == strings.TrimSpace(launchID) {
+			continue
+		}
+		if _, ok := seen[generation]; ok {
+			continue
+		}
+		seen[generation] = struct{}{}
+		generations = append(generations, generation)
+	}
+	return generations
+}
+
+func reviewerCleanupAuthorityMatches(reviews []domain.Review, sessionID domain.SessionID, harness domain.ReviewerHarness, reviewID, launchID, handleID string) bool {
+	if strings.TrimSpace(launchID) == "" || strings.TrimSpace(handleID) == "" {
+		return false
+	}
+	for _, review := range reviews {
+		if review.SessionID != sessionID || (harness != "" && review.Harness != harness) {
+			continue
+		}
+		if reviewID != "" {
+			if review.ID != reviewID {
+				continue
+			}
+		} else if strings.TrimSpace(review.ReviewerHandleID) != strings.TrimSpace(handleID) {
+			continue
+		}
+		return strings.TrimSpace(review.ReviewerLaunchID) == strings.TrimSpace(launchID)
+	}
+	return false
+}
+
+func reviewerFailureBodyForLaunch(err error, launchID string) string {
+	body := reviewerFailureBody(err)
+	handleID, ok := reviewerCleanupHandleFromError(err)
+	if !ok || strings.TrimSpace(launchID) == "" {
+		return body
+	}
+	var binding reviewerCleanupGenerationBinding
+	if errors.As(err, &binding) && binding.CleanupGenerationBound() {
+		return body
+	}
+	legacy := reviewerCleanupPendingMarker(handleID)
+	generation := reviewerCleanupPendingMarkerForGeneration(handleID, launchID)
+	return strings.Replace(body, legacy, generation, 1)
 }

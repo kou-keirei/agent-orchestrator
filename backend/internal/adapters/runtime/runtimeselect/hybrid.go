@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -15,6 +16,12 @@ import (
 // remain permanently routed to tmux. The version leaves room for a future host
 // protocol migration without guessing from session metadata.
 const directHandlePrefix = "ptyhost-v1:"
+
+// SessionIDForHandle decodes the routing envelope owned by this adapter. The
+// native tmux/PTY session name is distinct from the persisted opaque handle.
+func SessionIDForHandle(handle ports.RuntimeHandle) domain.SessionID {
+	return domain.SessionID(strings.TrimPrefix(handle.ID, directHandlePrefix))
+}
 
 // routedBackend captures the capabilities the daemon conditionally consumes.
 // Both tmux and the detached PTY host provide them; keeping them on the router
@@ -62,6 +69,21 @@ func (r *hybridRuntime) Create(ctx context.Context, cfg ports.RuntimeConfig) (po
 		"session_id", cfg.SessionID,
 		"err", err,
 	)
+	if possible := possibleCreateHandle(handle, err); possible.ID != "" {
+		cleanupErr := error(nil)
+		var existingEffectErr ports.RuntimeEffectError
+		if !errors.As(err, &existingEffectErr) || existingEffectErr.CleanupOutcome() != ports.RuntimeCleanupSucceeded {
+			cleanupErr = r.direct.Destroy(ctx, possible)
+		}
+		// Cleanup above consumes the native handle. Evidence leaving the router
+		// must retain its direct-host envelope for later probes and retries.
+		possible.ID = directHandlePrefix + possible.ID
+		effectErr := newHybridRuntimeEffectError(err, possible, cleanupErr)
+		if cleanupErr != nil {
+			return ports.RuntimeHandle{}, effectErr
+		}
+		err = effectErr
+	}
 	fallback, fallbackErr := r.legacy.Create(ctx, cfg)
 	if fallbackErr != nil {
 		return ports.RuntimeHandle{}, errors.Join(
@@ -70,6 +92,51 @@ func (r *hybridRuntime) Create(ctx context.Context, cfg ports.RuntimeConfig) (po
 		)
 	}
 	return fallback, nil
+}
+
+func possibleCreateHandle(handle ports.RuntimeHandle, err error) ports.RuntimeHandle {
+	if handle.ID != "" {
+		return handle
+	}
+	var effectErr ports.RuntimeEffectError
+	if errors.As(err, &effectErr) {
+		return effectErr.PossibleHandle()
+	}
+	return ports.RuntimeHandle{}
+}
+
+type hybridRuntimeEffectError struct {
+	cause      error
+	handle     ports.RuntimeHandle
+	cleanup    ports.RuntimeCleanupOutcome
+	cleanupErr error
+}
+
+func newHybridRuntimeEffectError(cause error, handle ports.RuntimeHandle, cleanupErr error) hybridRuntimeEffectError {
+	cleanup := ports.RuntimeCleanupSucceeded
+	if cleanupErr != nil {
+		cleanup = ports.RuntimeCleanupFailed
+	}
+	return hybridRuntimeEffectError{cause: cause, handle: handle, cleanup: cleanup, cleanupErr: cleanupErr}
+}
+
+func (e hybridRuntimeEffectError) Error() string {
+	if e.cleanupErr != nil {
+		return fmt.Sprintf("direct runtime create failed for possible handle %q: %v; cleanup: %v", e.handle.ID, e.cause, e.cleanupErr)
+	}
+	return fmt.Sprintf("direct runtime create failed for possible handle %q: %v", e.handle.ID, e.cause)
+}
+
+func (e hybridRuntimeEffectError) Unwrap() error { return e.cause }
+
+func (e hybridRuntimeEffectError) PossibleHandle() ports.RuntimeHandle { return e.handle }
+
+func (e hybridRuntimeEffectError) EffectOutcome() ports.RuntimeEffectOutcome {
+	return ports.RuntimeEffectPossible
+}
+
+func (e hybridRuntimeEffectError) CleanupOutcome() ports.RuntimeCleanupOutcome {
+	return e.cleanup
 }
 
 func (r *hybridRuntime) Destroy(ctx context.Context, handle ports.RuntimeHandle) error {
@@ -155,7 +222,7 @@ func (r *hybridRuntime) Restart(ctx context.Context, handle ports.RuntimeHandle,
 
 func (r *hybridRuntime) route(handle ports.RuntimeHandle) (routedBackend, ports.RuntimeHandle) {
 	if strings.HasPrefix(handle.ID, directHandlePrefix) {
-		handle.ID = strings.TrimPrefix(handle.ID, directHandlePrefix)
+		handle.ID = string(SessionIDForHandle(handle))
 		return r.direct, handle
 	}
 	return r.legacy, handle

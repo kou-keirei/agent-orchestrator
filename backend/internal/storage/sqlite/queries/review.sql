@@ -45,11 +45,22 @@ WHERE id = ?
     OR (? = '' AND reviewer_launch_id = ''));
 
 -- name: InsertReviewRun :exec
-INSERT INTO review_run (id, review_id, session_id, batch_id, harness, trigger_source, pr_url, target_sha, status, verdict, body, github_review_id, created_at, auto_inject_review)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO review_run (id, review_id, session_id, batch_id, harness, trigger_source, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, github_review_id, created_at, auto_inject_review)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdateReviewRunResult :execrows
 UPDATE review_run SET status = ?, verdict = ?, body = ?, github_review_id = ?, auto_inject_review = ? WHERE id = ? AND status = 'running';
+
+-- name: AppendReviewRunNativeEvidence :execrows
+UPDATE review_run SET
+    provider_native_session_id = CASE WHEN sqlc.arg(native_session_id) != '' AND provider_native_session_id = '' THEN sqlc.arg(native_session_id) ELSE provider_native_session_id END,
+    provider_native_first_turn_id = CASE WHEN sqlc.arg(first_turn_id) != '' AND provider_native_first_turn_id = '' THEN sqlc.arg(first_turn_id) ELSE provider_native_first_turn_id END,
+    provider_native_completion_id = CASE WHEN sqlc.arg(completion_id) != '' AND provider_native_completion_id = '' THEN sqlc.arg(completion_id) ELSE provider_native_completion_id END,
+    provider_native_observed_at = CASE WHEN sqlc.narg(observed_at) IS NOT NULL AND provider_native_observed_at IS NULL THEN sqlc.narg(observed_at) ELSE provider_native_observed_at END
+WHERE id = sqlc.arg(id) AND launch_id = sqlc.arg(launch_id) AND session_id = sqlc.arg(session_id) AND status = 'running'
+  AND (provider_native_session_id = '' OR sqlc.arg(native_session_id) = '' OR provider_native_session_id = sqlc.arg(native_session_id))
+  AND (provider_native_first_turn_id = '' OR sqlc.arg(first_turn_id) = '' OR provider_native_first_turn_id = sqlc.arg(first_turn_id))
+  AND (provider_native_completion_id = '' OR sqlc.arg(completion_id) = '' OR provider_native_completion_id = sqlc.arg(completion_id));
 
 -- name: SupersedeStaleRunningReviewRuns :execrows
 UPDATE review_run SET status = 'failed', body = ? WHERE session_id = ? AND pr_url = ? AND target_sha != ? AND status = 'running' AND verdict = '';
@@ -64,27 +75,27 @@ UPDATE review_run SET status = 'cancelled', body = ? WHERE session_id = ? AND ha
 UPDATE review_run SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'complete' AND delivered_at IS NULL;
 
 -- name: GetReviewRun :one
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE id = ?;
 
 -- name: GetReviewRunBySessionPRAndSHA :one
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE session_id = ? AND pr_url = ? AND target_sha = ? ORDER BY created_at DESC LIMIT 1;
 
 -- name: GetReviewRunBySessionPRSHAAndHarness :one
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE session_id = ? AND pr_url = ? AND target_sha = ? AND harness = ? ORDER BY created_at DESC LIMIT 1;
 
 -- name: ListReviewRunsBySession :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE session_id = ? ORDER BY created_at DESC;
 
 -- name: ListRunningReviewRunsBySession :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE session_id = ? AND status = 'running' AND verdict = '' ORDER BY created_at DESC;
 
 -- name: ListReviewRunsByBatch :many
-SELECT id, review_id, session_id, harness, pr_url, target_sha, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source
+SELECT id, review_id, session_id, harness, pr_url, target_sha, target_binding_json, reviewer_provenance_json, launch_id, status, verdict, body, created_at, github_review_id, delivered_at, batch_id, auto_inject_review, trigger_source, provider_native_session_id, provider_native_first_turn_id, provider_native_completion_id, provider_native_observed_at
 FROM review_run WHERE session_id = ? AND batch_id = ? ORDER BY created_at ASC, id ASC;
 
 -- name: ListCurrentHeadReviewRunsBySession :many

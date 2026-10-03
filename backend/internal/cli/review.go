@@ -21,21 +21,66 @@ const (
 	reviewSubmitRetryInterval = 250 * time.Millisecond
 )
 
+type reviewTargetBinding struct {
+	TargetSHA           string    `json:"targetSha"`
+	ExecutionBaseSHA    string    `json:"executionBaseSha"`
+	DiffBaseSHA         string    `json:"diffBaseSha"`
+	DiffBaseRef         string    `json:"diffBaseRef"`
+	WorkspacePath       string    `json:"workspacePath"`
+	ObservedHeadSHA     string    `json:"observedHeadSha"`
+	ObservedBranch      string    `json:"observedBranch"`
+	WorkspaceDirty      bool      `json:"workspaceDirty"`
+	WorkspaceDirtyKnown bool      `json:"workspaceDirtyKnown"`
+	IndexStaged         bool      `json:"indexStaged"`
+	IndexStagedKnown    bool      `json:"indexStagedKnown"`
+	ObservationPhase    string    `json:"observationPhase"`
+	ObservedAt          time.Time `json:"observedAt"`
+}
+
+type reviewerSettings struct {
+	Harness    string `json:"harness"`
+	Model      string `json:"model"`
+	Effort     string `json:"effort"`
+	Mode       string `json:"mode"`
+	Permission string `json:"permission"`
+	Observed   bool   `json:"observed"`
+}
+
+type reviewerNativeEvidence struct {
+	SessionID    string    `json:"sessionId"`
+	FirstTurnID  string    `json:"firstTurnId"`
+	CompletionID string    `json:"completionId"`
+	ObservedAt   time.Time `json:"observedAt"`
+}
+
+type reviewerProvenance struct {
+	Requested         reviewerSettings       `json:"requested"`
+	Configured        reviewerSettings       `json:"configured"`
+	AOResolved        reviewerSettings       `json:"aoResolved"`
+	ProviderEffective reviewerSettings       `json:"providerEffective"`
+	ProviderNative    reviewerNativeEvidence `json:"providerNative"`
+}
+
 // reviewRun mirrors the daemon's domain.ReviewRun for the CLI client.
 type reviewRun struct {
-	ID             string     `json:"id"`
-	ReviewID       string     `json:"reviewId"`
-	SessionID      string     `json:"sessionId"`
-	BatchID        string     `json:"batchId"`
-	Harness        string     `json:"harness"`
-	PRURL          string     `json:"prUrl"`
-	TargetSHA      string     `json:"targetSha"`
-	Status         string     `json:"status"`
-	Verdict        string     `json:"verdict"`
-	Body           string     `json:"body"`
-	GithubReviewID string     `json:"githubReviewId"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	ID               string              `json:"id"`
+	ReviewID         string              `json:"reviewId"`
+	SessionID        string              `json:"sessionId"`
+	BatchID          string              `json:"batchId"`
+	Harness          string              `json:"harness"`
+	PRURL            string              `json:"prUrl"`
+	TargetSHA        string              `json:"targetSha"`
+	TargetBinding    reviewTargetBinding `json:"targetBinding"`
+	Provenance       reviewerProvenance  `json:"provenance"`
+	LaunchID         string              `json:"launchId"`
+	Status           string              `json:"status"`
+	Verdict          string              `json:"verdict"`
+	Body             string              `json:"body"`
+	GithubReviewID   string              `json:"githubReviewId"`
+	TriggerSource    string              `json:"triggerSource"`
+	AutoInjectReview bool                `json:"autoInjectReview"`
+	CreatedAt        time.Time           `json:"createdAt"`
+	DeliveredAt      *time.Time          `json:"deliveredAt,omitempty"`
 }
 
 type reviewState struct {
@@ -51,6 +96,7 @@ type reviewState struct {
 type listReviewsResponse struct {
 	ReviewerHandleID string        `json:"reviewerHandleId"`
 	Reviews          []reviewState `json:"reviews"`
+	Runs             []reviewRun   `json:"runs"`
 }
 
 // triggerReviewResponse mirrors controllers.TriggerReviewResponse. Only the

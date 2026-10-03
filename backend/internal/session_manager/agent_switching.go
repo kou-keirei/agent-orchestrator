@@ -909,6 +909,7 @@ func (m *Manager) executeAgentSwitch(ctx context.Context, admitted *admittedAgen
 		TargetNativeSessionRef:        target.native.ID,
 		TargetGenerationID:            target.launchID,
 		RuntimeHandleID:               handle.ID,
+		PresentationHiddenAt:          rec.HiddenAt,
 		ActivatedAt:                   activatedAt,
 	}
 	recorder.boundary(domain.AgentSwitchFailureTargetActivationCommit)
@@ -3562,6 +3563,7 @@ func (m *Manager) reconcileStartingTarget(ctx context.Context, store ports.Agent
 		TargetNativeSessionRef:        *sw.TargetNativeSessionRef,
 		TargetGenerationID:            sw.TargetGenerationID,
 		RuntimeHandleID:               handle.ID,
+		PresentationHiddenAt:          rec.HiddenAt,
 		ActivatedAt:                   m.clock(),
 	})
 	if err != nil {

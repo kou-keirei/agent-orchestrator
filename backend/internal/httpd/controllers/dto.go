@@ -160,6 +160,7 @@ type ListSessionsQuery struct {
 	Active           *bool  `query:"active,omitempty" description:"When true, return non-terminated sessions; when false, return terminated sessions."`
 	OrchestratorOnly *bool  `query:"orchestratorOnly,omitempty" description:"When true, return only orchestrator sessions."`
 	Fresh            *bool  `query:"fresh,omitempty" description:"When true, return only fresh non-terminated sessions."`
+	IncludeHidden    *bool  `query:"includeHidden,omitempty" description:"When true, include presentation-hidden sessions."`
 }
 
 // CleanupSessionsQuery is the query string accepted by POST /api/v1/sessions/cleanup.
@@ -249,9 +250,15 @@ type WorkspaceTreeEntry struct {
 // curated SessionPRFacts shape. One session can own many PRs (e.g. a stack), so
 // prs is a list. The embedded domain.Session.Metadata and domain.Session.PRs
 // fields are json:"-"; these curated fields are what serialize.
+//
+// ContinuationReadback is an additive, observational projection of the
+// authoritative identity and generation facts needed by a same-session
+// continuation client. It deliberately reports unavailable facts instead of
+// filling them from another source.
 type SessionView struct {
 	domain.Session
-	Branch string `json:"branch,omitempty"`
+	Branch               string                      `json:"branch,omitempty"`
+	ContinuationReadback SessionContinuationReadback `json:"continuationReadback"`
 	// TerminalGeneration is an opaque renderer fence. A restarted controller
 	// may deliberately reuse its terminal handle; clients must still discard the
 	// old attachment when this value changes.
@@ -275,6 +282,37 @@ type SessionView struct {
 	LastUserMessageAt *time.Time       `json:"lastUserMessageAt,omitempty"`
 	PRs               []SessionPRFacts `json:"prs"`
 	ActiveAgentSwitch *AgentSwitchView `json:"activeAgentSwitch,omitempty"`
+}
+
+// SessionContinuationReadback is the authoritative, mode-specific readback
+// for one AO session. The identity envelope is always present; Chat and TUI
+// remain explicit even when the current mode makes one of them inapplicable.
+type SessionContinuationReadback struct {
+	SessionID domain.SessionID        `json:"sessionId"`
+	ProjectID domain.ProjectID        `json:"projectId"`
+	Harness   domain.AgentHarness     `json:"harness"`
+	Mode      domain.SessionMode      `json:"mode"`
+	Available bool                    `json:"available"`
+	Reason    string                  `json:"reason"`
+	Chat      SessionContinuationChat `json:"chat"`
+	TUI       SessionContinuationTUI  `json:"tui"`
+}
+
+// SessionContinuationChat contains only the durable Chat controller facts.
+type SessionContinuationChat struct {
+	Available              bool   `json:"available"`
+	Reason                 string `json:"reason"`
+	ProviderConversationID string `json:"providerConversationId"`
+	ControllerGeneration   string `json:"controllerGeneration"`
+}
+
+// SessionContinuationTUI contains only the durable TUI runtime facts.
+type SessionContinuationTUI struct {
+	Available              bool   `json:"available"`
+	Reason                 string `json:"reason"`
+	AgentSessionID         string `json:"agentSessionId"`
+	RuntimeLaunchID        string `json:"runtimeLaunchId"`
+	AgentSessionIDLaunchID string `json:"agentSessionIdLaunchId"`
 }
 
 // ListSessionsResponse is the body of GET /api/v1/sessions.
@@ -1175,6 +1213,9 @@ type SetReviewActivityRequest struct {
 	Event          string `json:"event,omitempty" description:"AO hook sub-command that produced this signal."`
 	AgentSessionID string `json:"agentSessionId,omitempty" description:"Native reviewer session identifier used to resume its transcript."`
 	LaunchID       string `json:"launchId,omitempty" description:"AO process generation that produced the signal."`
+	RunID          string `json:"runId,omitempty" description:"Exact review pass that produced the native evidence."`
+	FirstTurnID    string `json:"firstTurnId,omitempty" description:"Provider-native first-turn identifier observed by AO."`
+	CompletionID   string `json:"completionId,omitempty" description:"Provider-native completion identifier observed by AO."`
 }
 
 // SetReviewActivityResponse is the body of POST /api/v1/reviews/{reviewSessionID}/activity.
@@ -1561,6 +1602,36 @@ type AgentInstallJobsResponse struct {
 	Jobs []systeminstall.Job `json:"jobs"`
 }
 
+type OrchestrationEventResponse struct {
+	ID                   string                            `json:"id"`
+	ProjectID            domain.ProjectID                  `json:"projectId"`
+	WorkerID             domain.SessionID                  `json:"workerId"`
+	Kind                 domain.OrchestrationEventKind     `json:"kind"`
+	SourceRevision       string                            `json:"sourceRevision"`
+	State                domain.OrchestrationDeliveryState `json:"state"`
+	AttemptCount         int                               `json:"attemptCount"`
+	EnqueuedAt           time.Time                         `json:"enqueuedAt"`
+	NextAttemptAt        time.Time                         `json:"nextAttemptAt"`
+	LeaseExpiresAt       *time.Time                        `json:"leaseExpiresAt,omitempty"`
+	DestinationSessionID domain.SessionID                  `json:"destinationSessionId,omitempty"`
+	SubmittedAt          *time.Time                        `json:"submittedAt,omitempty"`
+	AcknowledgedAt       *time.Time                        `json:"acknowledgedAt,omitempty"`
+	AttentionRequiredAt  *time.Time                        `json:"attentionRequiredAt,omitempty"`
+	LastError            string                            `json:"lastError,omitempty"`
+}
+type ListOrchestrationEventsResponse struct {
+	Events []OrchestrationEventResponse `json:"events"`
+}
+type ListOrchestrationEventsQuery struct {
+	Limit int `query:"limit,omitempty" minimum:"1" maximum:"100"`
+}
+type RetryOrchestrationEventResponse struct {
+	Retried bool `json:"retried"`
+}
+type OrchestrationEventIDParam struct {
+	EventID string `path:"eventId"`
+}
+
 // ListNotificationsQuery is the query string accepted by GET /api/v1/notifications.
 type ListNotificationsQuery struct {
 	Status string `query:"status,omitempty" enum:"unread,all,unresolved" description:"Notification filter. Defaults to unread (unseen); unresolved returns notifications whose underlying issue is still open; all includes read history."`
@@ -1591,7 +1662,7 @@ type NotificationResponse struct {
 	SessionID string    `json:"sessionId"`
 	ProjectID string    `json:"projectId"`
 	PRURL     string    `json:"prUrl"`
-	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged"`
+	Type      string    `json:"type" enum:"needs_input,ready_to_merge,pr_merged,pr_closed_unmerged,orchestration_attention"`
 	Title     string    `json:"title"`
 	Body      string    `json:"body"`
 	Status    string    `json:"status" enum:"unread,read" description:"Seen state. unread means the user has not opened the notification panel since it arrived."`
@@ -2258,7 +2329,7 @@ type ConversationSnapshotResponse struct {
 	Controller          string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
 	PermissionFloor     string                   `json:"permissionFloor,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 	NativeEvidence      NativePermissionEvidence `json:"nativeEvidence"`
-	DispatchConformance ChatDispatchConformance `json:"dispatchConformance"`
+	DispatchConformance ChatDispatchConformance  `json:"dispatchConformance"`
 	LatestSequence      int64                    `json:"latestSequence"`
 	OldestSequence      int64                    `json:"oldestSequence,omitempty"`
 	HasMoreBefore       bool                     `json:"hasMoreBefore"`
@@ -2323,18 +2394,18 @@ type ConversationSnapshotResponse struct {
 // conversation. Unknown fields are intentional when the provider cannot expose
 // effective state, especially across a persistent-host reconnect.
 type NativePermissionEvidence struct {
-	SessionID                 string `json:"sessionId,omitempty"`
-	ControllerGeneration      string `json:"controllerGeneration,omitempty"`
-	ProviderConversationID    string `json:"providerConversationId,omitempty"`
-	ProviderTurnID            string `json:"providerTurnId,omitempty"`
-	Provider                  string `json:"provider,omitempty"`
-	RequestedPermission       string `json:"requestedPermission,omitempty"`
-	EffectivePermission       string `json:"effectivePermission,omitempty"`
-	ApprovalPolicy            string `json:"approvalPolicy,omitempty"`
-	ThreadSandbox             string `json:"threadSandbox,omitempty"`
-	TurnSandbox               string `json:"turnSandbox,omitempty"`
-	PreventiveCapability      bool   `json:"preventiveCapability"`
-	ProofStatus               string `json:"proofStatus" enum:"PROVEN,UNPROVEN,DEFERRED_WITH_EXACT_REASON"`
+	SessionID              string `json:"sessionId,omitempty"`
+	ControllerGeneration   string `json:"controllerGeneration,omitempty"`
+	ProviderConversationID string `json:"providerConversationId,omitempty"`
+	ProviderTurnID         string `json:"providerTurnId,omitempty"`
+	Provider               string `json:"provider,omitempty"`
+	RequestedPermission    string `json:"requestedPermission,omitempty"`
+	EffectivePermission    string `json:"effectivePermission,omitempty"`
+	ApprovalPolicy         string `json:"approvalPolicy,omitempty"`
+	ThreadSandbox          string `json:"threadSandbox,omitempty"`
+	TurnSandbox            string `json:"turnSandbox,omitempty"`
+	PreventiveCapability   bool   `json:"preventiveCapability"`
+	ProofStatus            string `json:"proofStatus" enum:"PROVEN,UNPROVEN,DEFERRED_WITH_EXACT_REASON"`
 }
 
 // ChatDispatchConformance is provider-native dispatch evidence carried through
@@ -2342,16 +2413,16 @@ type NativePermissionEvidence struct {
 // with provider-selected and first-turn values. AO does not authorize or accept
 // the dispatch here.
 type ChatDispatchConformance struct {
-	Status           string                    `json:"status"`
-	Reason           string                    `json:"reason,omitempty"`
-	ChildResultValid bool                      `json:"childResultValid"`
-	EffortOverride   bool                      `json:"effortOverride"`
-	Requested         ChatDispatchEvidence     `json:"requested"`
-	Configured        ChatDispatchEvidence     `json:"configured"`
-	Dispatched        ChatDispatchEvidence     `json:"dispatched"`
-	ProviderSelected  ChatDispatchEvidence     `json:"providerSelected"`
-	ObservedFirstTurn ChatDispatchEvidence     `json:"observedFirstTurn"`
-	Variant           ChatDispatchVariant      `json:"variant"`
+	Status            string               `json:"status"`
+	Reason            string               `json:"reason,omitempty"`
+	ChildResultValid  bool                 `json:"childResultValid"`
+	EffortOverride    bool                 `json:"effortOverride"`
+	Requested         ChatDispatchEvidence `json:"requested"`
+	Configured        ChatDispatchEvidence `json:"configured"`
+	Dispatched        ChatDispatchEvidence `json:"dispatched"`
+	ProviderSelected  ChatDispatchEvidence `json:"providerSelected"`
+	ObservedFirstTurn ChatDispatchEvidence `json:"observedFirstTurn"`
+	Variant           ChatDispatchVariant  `json:"variant"`
 }
 
 type ChatDispatchEvidence struct {

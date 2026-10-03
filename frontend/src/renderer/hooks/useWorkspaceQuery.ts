@@ -22,6 +22,7 @@ import {
 	toSessionStatus,
 	newestActiveOrchestrator,
 	attentionZone,
+	sessionIsActive,
 	workerSessions,
 	type WorkspaceSession,
 	type WorkspaceSummary,
@@ -30,6 +31,27 @@ import {
 } from "../types/workspace";
 
 const AD_HOC_AGENTS_WORKSPACE_NAME = "Ad hoc agents";
+
+function mergeWorkspaceSnapshots(
+	primary: readonly WorkspaceSummary[],
+	additional: readonly WorkspaceSummary[],
+): WorkspaceSummary[] {
+	const merged = new Map(primary.map((workspace) => [workspace.id, workspace]));
+	for (const workspace of additional) {
+		const existing = merged.get(workspace.id);
+		if (!existing) {
+			merged.set(workspace.id, workspace);
+			continue;
+		}
+		const sessions = new Map(existing.sessions.map((session) => [session.id, session]));
+		// Additional snapshots fill gaps without replacing current visible rows.
+		for (const session of workspace.sessions) {
+			if (!sessions.has(session.id)) sessions.set(session.id, session);
+		}
+		merged.set(workspace.id, { ...existing, sessions: [...sessions.values()] });
+	}
+	return [...merged.values()];
+}
 
 function placeStandaloneWorkspaceLast(workspaces: WorkspaceSummary[]): WorkspaceSummary[] {
 	const standalone = workspaces.find((workspace) => workspace.id === STANDALONE_WORKSPACE_ID);
@@ -108,6 +130,7 @@ function toWorkspaceSession(
 		displayStatus: session.displayStatus || undefined,
 		statusReadiness,
 		isTerminated: session.isTerminated,
+		hiddenAt: session.hiddenAt ?? undefined,
 		chatProviderPreserved: session.chatProviderPreserved,
 		terminateOnPrMerge: session.terminateOnPrMerge ?? false,
 		autoInjectReview: session.autoInjectReview ?? true,
@@ -176,6 +199,7 @@ function toLocalWorkspaceSession(
 		kanbanColumn,
 		displayStatus: session.displayStatus || undefined,
 		isTerminated: session.isTerminated,
+		hiddenAt: session.hiddenAt ?? undefined,
 		terminateOnPrMerge: session.terminateOnPrMerge ?? false,
 		autoInjectReview: session.autoInjectReview ?? true,
 		autoInjectCI: session.autoInjectCI ?? true,
@@ -199,7 +223,7 @@ function toLocalWorkspaceSession(
 // and always hits the real daemon.
 type FakeAgentSeam = { snapshot: () => WorkspaceSummary[] };
 
-async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
+async function fetchWorkspaces(includeHidden = false): Promise<WorkspaceSummary[]> {
 	if (usesPreviewWorkspaceData) {
 		const fake =
 			typeof window !== "undefined"
@@ -212,7 +236,10 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 	}
 
 	const [{ data: projectsData, error: projectsError }, { data: sessionsData, error: sessionsError }] =
-		await Promise.all([apiClient.GET("/api/v1/projects"), apiClient.GET("/api/v1/sessions")]);
+		await Promise.all([
+			apiClient.GET("/api/v1/projects"),
+			apiClient.GET("/api/v1/sessions", { params: { query: includeHidden ? { includeHidden: true } : {} } }),
+		]);
 
 	if (projectsError || sessionsError) {
 		agentSwitchVisibility.setQueryHealthy("active", false, "workspaces");
@@ -253,12 +280,26 @@ async function fetchWorkspaces(): Promise<WorkspaceSummary[]> {
 // with the router's defaultPreload: "intent") and the hook reads the same cache.
 export const workspaceQueryOptions = {
 	queryKey: workspaceQueryKey,
-	queryFn: fetchWorkspaces,
+	queryFn: () => fetchWorkspaces(false),
 	retry: 1,
 	staleTime: 10_000,
 	refetchInterval: (query: Query<WorkspaceSummary[]>) =>
 		workspaceStatusesChecking(query.state.data) ? 300 : 15_000,
 };
+
+export const hiddenWorkspaceQueryKey = ["workspaces", "include-hidden"] as const;
+export const hiddenWorkspaceQueryOptions = {
+	queryKey: hiddenWorkspaceQueryKey,
+	queryFn: () => fetchWorkspaces(true),
+	retry: 1,
+	staleTime: 10_000,
+	refetchInterval: (query: Query<WorkspaceSummary[]>) =>
+		workspaceStatusesChecking(query.state.data) ? 300 : 15_000,
+};
+
+export function useHiddenWorkspaceQuery(options: WorkspaceSubscriptionOptions = {}) {
+	return useQuery({ ...hiddenWorkspaceQueryOptions, subscribed: options.subscribed });
+}
 
 // Cloud projects are a separate query so a control-plane failure can never
 // break the local list: on error TanStack keeps this query's last known data,
@@ -332,6 +373,8 @@ function toCloudWorkspace(
 
 type WorkspaceSubscriptionOptions = {
 	subscribed?: boolean;
+	/** Explicit history surfaces opt into presentation-hidden local sessions. */
+	includeHidden?: boolean;
 };
 
 export function useCloudProjectsQuery(options: WorkspaceSubscriptionOptions = {}) {
@@ -374,7 +417,10 @@ export function useCloudSessionsQuery(options: WorkspaceSubscriptionOptions = {}
 }
 
 export function useWorkspaceQuery(options: WorkspaceSubscriptionOptions = {}) {
-	const local = useQuery({ ...workspaceQueryOptions, subscribed: options.subscribed });
+	const local = useQuery({
+		...(options.includeHidden ? hiddenWorkspaceQueryOptions : workspaceQueryOptions),
+		subscribed: options.subscribed,
+	});
 	const cloud = useCloudProjectsQuery(options);
 	const cloudSessions = useCloudSessionsQuery(options);
 	const { org, ready } = useCloudOrg();
@@ -413,9 +459,14 @@ export function useWorkspaceSession(sessionId: string) {
 	);
 	const local = useQuery({ ...workspaceQueryOptions, select: selectLocalSession });
 	const localWorkspaces = useQuery({ ...workspaceQueryOptions, subscribed: false, enabled: Boolean(sessionId) });
+	const hidden = useQuery({
+		...hiddenWorkspaceQueryOptions,
+		select: selectLocalSession,
+		enabled: Boolean(sessionId) && local.data === undefined,
+	});
 	const direct = useQuery({
 		queryKey: ["session", sessionId],
-		enabled: Boolean(sessionId) && local.data === undefined,
+		enabled: Boolean(sessionId) && local.data === undefined && hidden.isFetched && hidden.data === undefined,
 		retry: (attempt, error) => apiErrorCode(error) === "SESSION_NOT_FOUND" && attempt < 4,
 		retryDelay: 250,
 		queryFn: async () => {
@@ -450,7 +501,8 @@ export function useWorkspaceSession(sessionId: string) {
 	}, [cloud.data, cloudSessions.data, org?.id, ready, sessionId]);
 	useEffect(() => {
 		if (!resolvedDirectSession) return;
-		queryClient.setQueryData<WorkspaceSummary[]>(workspaceQueryKey, (current) => {
+		const cacheKey = resolvedDirectSession.hiddenAt ? hiddenWorkspaceQueryKey : workspaceQueryKey;
+		queryClient.setQueryData<WorkspaceSummary[]>(cacheKey, (current) => {
 			if (!current) return current;
 			let changed = false;
 			const next = current.map((workspace) => {
@@ -464,8 +516,8 @@ export function useWorkspaceSession(sessionId: string) {
 	}, [queryClient, resolvedDirectSession]);
 	return {
 		...local,
-		data: local.data ?? resolvedDirectSession ?? cloudSession,
-		isLoading: local.isLoading || direct.isLoading,
+		data: local.data ?? hidden.data ?? resolvedDirectSession ?? cloudSession,
+		isLoading: local.isLoading || hidden.isLoading || direct.isLoading,
 	};
 }
 
@@ -499,7 +551,18 @@ function selectWorkspaceScope(
 		: undefined;
 	return {
 		project, session,
-		hasWorkerSessions: workspace ? workerSessions(workspace.sessions).length > 0 : false,
+		// Hidden live workers stay out of shell/topbar presence and empty-state
+		// decisions. Direct session and orchestrator resolution above remains
+		// inclusive so durable action targets are not lost.
+		hasWorkerSessions: workspace
+			? workerSessions(workspace.sessions).some(
+					(candidate) =>
+						!candidate.hiddenAt ||
+						candidate.isTerminated === true ||
+						candidate.status === "terminated" ||
+						candidate.kanbanColumn === "archive",
+				)
+			: false,
 		orchestrator: workspace ? newestActiveOrchestrator(workspace.sessions) : undefined,
 	};
 }
@@ -513,7 +576,14 @@ export function useWorkspaceScope(projectId?: string, sessionId?: string) {
 		() => (workspaces: WorkspaceSummary[]) => selectWorkspaceScope(workspaces, projectId, sessionId),
 		[projectId, sessionId],
 	);
-	const local = useQuery({ ...workspaceQueryOptions, select: selectLocalScope });
+	// Keep visible rows authoritative for shell presentation state. Merge the
+	// hidden-inclusive snapshot only for routed-session and action resolution.
+	const local = useQuery({ ...workspaceQueryOptions });
+	const hiddenLocal = useQuery({ ...hiddenWorkspaceQueryOptions });
+	const localScope = useMemo(() => {
+		const workspaces = mergeWorkspaceSnapshots(local.data ?? [], hiddenLocal.data ?? []);
+		return workspaces.length > 0 ? selectLocalScope(workspaces) : undefined;
+	}, [hiddenLocal.data, local.data, selectLocalScope]);
 	const cloud = useCloudProjectsQuery();
 	const cloudSessions = useCloudSessionsQuery();
 	const { org, ready } = useCloudOrg();
@@ -524,9 +594,9 @@ export function useWorkspaceScope(projectId?: string, sessionId?: string) {
 	}, [cloud.data, cloudSessions.data, org?.id, projectId, ready, sessionId]);
 	// Match useWorkspaceQuery's local-first semantics: do not reveal cloud
 	// records before the local workspace query has resolved successfully.
-	const data = local.data?.project || local.data?.session || !local.isSuccess
-		? local.data
-		: cloudScope ?? local.data;
+	const data = localScope?.project || localScope?.session || !local.isSuccess
+		? localScope
+		: cloudScope ?? localScope;
 	return { ...local, data };
 }
 
@@ -534,6 +604,7 @@ function selectTraySessions(workspaces: WorkspaceSummary[]): TraySessionEntry[] 
 	const entries: TraySessionEntry[] = [];
 	for (const workspace of workspaces) {
 		for (const session of workerSessions(workspace.sessions)) {
+			if (!sessionIsActive(session)) continue;
 			const zone = attentionZone(session);
 			if ((zone === "merge" && session.status === "merged") || (zone !== "action" && zone !== "merge")) continue;
 			entries.push({
@@ -554,7 +625,9 @@ function selectTraySessions(workspaces: WorkspaceSummary[]): TraySessionEntry[] 
  * query boundary so ordinary streamed activity does not wake the runtime.
  */
 export function useWorkspaceTraySessions() {
-	const local = useQuery({ ...workspaceQueryOptions, select: selectTraySessions });
+	// Tray attention is operational shell state, so hidden sessions still need to
+	// participate even though ordinary board/sidebar queries stay presentation-only.
+	const local = useQuery({ ...hiddenWorkspaceQueryOptions, select: selectTraySessions });
 	const cloud = useCloudProjectsQuery();
 	const cloudSessions = useCloudSessionsQuery();
 	const { org, ready } = useCloudOrg();

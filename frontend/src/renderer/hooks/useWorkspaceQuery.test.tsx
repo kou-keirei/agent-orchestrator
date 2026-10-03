@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
@@ -36,7 +36,7 @@ vi.mock("./useCloudOrg", () => ({
 	useCloudOrg: () => ({ org: cloudState.org, isLoading: false, error: undefined, ready: cloudState.ready }),
 }));
 
-import { useWorkspaceQuery, useWorkspaceScope, useWorkspaceSession, useWorkspaceTraySessions, workspaceQueryKey } from "./useWorkspaceQuery";
+import { hiddenWorkspaceQueryKey, useHiddenWorkspaceQuery, useWorkspaceQuery, useWorkspaceScope, useWorkspaceSession, useWorkspaceTraySessions, workspaceQueryKey } from "./useWorkspaceQuery";
 
 function wrapper({ children }: { children: ReactNode }) {
 	// The hook pins its own retry policy; retryDelay 0 keeps the error tests fast.
@@ -67,6 +67,16 @@ beforeEach(() => {
 });
 
 describe("useWorkspaceQuery", () => {
+	it("uses the explicit include-hidden session-list path", async () => {
+		respondWith({
+			projects: { data: { projects: [] }, error: undefined },
+			sessions: { data: { sessions: [] }, error: undefined },
+		});
+		const { result } = renderHook(() => useHiddenWorkspaceQuery(), { wrapper });
+		await waitFor(() => expect(result.current.isSuccess).toBe(true));
+		expect(getMock).toHaveBeenCalledWith("/api/v1/sessions", { params: { query: { includeHidden: true } } });
+	});
+
 	it.each(["checking", "unavailable"] as const)("does not expose unverified activity while %s", async (statusReadiness) => {
 		respondWith({
 			projects: { data: { projects: [{ id: "p1", name: "Project", path: "/tmp/project" }] } },
@@ -334,6 +344,61 @@ describe("useWorkspaceQuery", () => {
 		});
 	});
 
+	it("keeps a hidden direct session out of the visible workspace cache", async () => {
+		getMock.mockImplementation(async (url: string) => {
+			if (url === "/api/v1/sessions/{sessionId}") {
+				return {
+					data: {
+						session: {
+							id: "sess-hidden",
+							projectId: "proj-1",
+							displayName: "hidden orchestrator",
+							harness: "codex",
+							kind: "orchestrator",
+							mode: "tui",
+							status: "working",
+							kanbanColumn: "building",
+							displayStatus: "Working",
+							autoInjectReview: true,
+							autoInjectCI: true,
+							autoReviewEnabled: false,
+							isPinned: false,
+							isTerminated: false,
+							hiddenAt: "2026-09-04T10:00:02Z",
+							terminateOnPrMerge: false,
+							prs: [],
+							activity: { state: "idle", lastActivityAt: "2026-09-04T10:00:00Z" },
+							createdAt: "2026-09-04T10:00:00Z",
+							updatedAt: "2026-09-04T10:00:01Z",
+						},
+					},
+					error: undefined,
+				};
+			}
+			throw new Error(`unexpected GET ${url}`);
+		});
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+		queryClient.setQueryData<WorkspaceSummary[]>(workspaceQueryKey, [{
+			id: "proj-1", name: "workspace3", path: "/tmp/workspace3", sessions: [],
+		}]);
+		queryClient.setQueryData<WorkspaceSummary[]>(hiddenWorkspaceQueryKey, [{
+			id: "proj-1", name: "workspace3", path: "/tmp/workspace3", sessions: [],
+		}]);
+		const localWrapper = ({ children }: { children: ReactNode }) => (
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+		);
+
+		const { result } = renderHook(() => useWorkspaceSession("sess-hidden"), { wrapper: localWrapper });
+
+		await waitFor(() => expect(result.current.data?.id).toBe("sess-hidden"));
+		await waitFor(() => {
+			const visible = queryClient.getQueryData<WorkspaceSummary[]>(workspaceQueryKey);
+			const hidden = queryClient.getQueryData<WorkspaceSummary[]>(hiddenWorkspaceQueryKey);
+			expect(visible?.[0]?.sessions).toHaveLength(0);
+			expect(hidden?.[0]?.sessions.map((session) => session.id)).toEqual(["sess-hidden"]);
+		});
+	});
+
 	it("groups projectless sessions as ad hoc agents after projects", async () => {
 		respondWith({
 			projects: { data: { projects: [{ id: "proj-1", name: "my-app", path: "/p" }] }, error: undefined },
@@ -591,9 +656,11 @@ describe("useWorkspaceQuery", () => {
 			projects: { data: { projects: [{ id: "proj-1", name: "my-app", path: "/p" }] }, error: undefined },
 			sessions: {
 				data: {
-					sessions: [
-						{ id: "needs-input", projectId: "proj-1", displayName: "Needs input", harness: "codex", status: "needs_input", updatedAt: "2026-08-01T00:00:00Z" },
-						{ id: "mergeable", projectId: "proj-1", displayName: "Mergeable", harness: "codex", status: "mergeable", updatedAt: "2026-08-01T00:00:00Z" },
+						sessions: [
+							{ id: "needs-input", projectId: "proj-1", displayName: "Needs input", harness: "codex", status: "needs_input", updatedAt: "2026-08-01T00:00:00Z" },
+							{ id: "hidden-needs-input", projectId: "proj-1", displayName: "Hidden needs input", harness: "codex", status: "needs_input", hiddenAt: "2026-09-22T12:00:00Z", updatedAt: "2026-08-01T00:00:00Z" },
+							{ id: "hidden-terminated", projectId: "proj-1", displayName: "Hidden terminated", harness: "codex", status: "needs_input", isTerminated: true, hiddenAt: "2026-09-22T12:00:00Z", updatedAt: "2026-08-01T00:00:00Z" },
+							{ id: "mergeable", projectId: "proj-1", displayName: "Mergeable", harness: "codex", status: "mergeable", updatedAt: "2026-08-01T00:00:00Z" },
 						{ id: "working", projectId: "proj-1", displayName: "Working", harness: "codex", status: "working", updatedAt: "2026-08-01T00:00:00Z" },
 						{ id: "merged", projectId: "proj-1", displayName: "Merged", harness: "codex", status: "merged", updatedAt: "2026-08-01T00:00:00Z" },
 						{ id: "orchestrator", projectId: "proj-1", displayName: "Orchestrator", harness: "codex", kind: "orchestrator", status: "needs_input", updatedAt: "2026-08-01T00:00:00Z" },
@@ -607,22 +674,107 @@ describe("useWorkspaceQuery", () => {
 		await waitFor(() => expect(result.current.isSuccess).toBe(true));
 		expect(result.current.data).toEqual([
 			{ projectId: "proj-1", projectName: "my-app", sessionId: "needs-input", title: "Needs input", zone: "action" },
+			{ projectId: "proj-1", projectName: "my-app", sessionId: "hidden-needs-input", title: "Hidden needs input", zone: "action" },
 			{ projectId: "proj-1", projectName: "my-app", sessionId: "mergeable", title: "Mergeable", zone: "merge" },
 		]);
 	});
 });
 
 describe("useWorkspaceScope board presentation", () => {
+	it.each(["visible", "hidden"] as const)("keeps visible session state when the %s snapshot arrives first", async (first) => {
+		const currentWorker = {
+			id: "worker", projectId: "p", kind: "worker", harness: "codex",
+			displayName: "Current worker", isTerminated: false, status: "working",
+			updatedAt: "2026-10-01T12:00:00Z", activity: { state: "active" },
+		};
+		const hiddenSessions = [
+			{ ...currentWorker, displayName: "Stale worker", hiddenAt: "2026-09-22T12:00:00Z", updatedAt: "2026-09-22T12:00:00Z" },
+			{ id: "hidden-orchestrator", projectId: "p", kind: "orchestrator", harness: "codex", status: "working", isTerminated: false, hiddenAt: "2026-09-22T12:00:00Z" },
+			{ id: "hidden-archive", projectId: "p", kind: "worker", harness: "codex", status: "terminated", isTerminated: true, hiddenAt: "2026-09-22T12:00:00Z" },
+		];
+		let releaseSecond!: () => void;
+		const secondSnapshot = new Promise<void>((resolve) => { releaseSecond = resolve; });
+		getMock.mockImplementation(async (url: string, options?: { params?: { query?: { includeHidden?: boolean } } }) => {
+			if (url === "/api/v1/projects") return { data: { projects: [{ id: "p", name: "project", path: "/repo" }] } };
+			if (url !== "/api/v1/sessions") throw new Error(`unexpected GET ${url}`);
+			const includeHidden = options?.params?.query?.includeHidden === true;
+			if (includeHidden !== (first === "hidden")) await secondSnapshot;
+			return { data: { sessions: includeHidden ? hiddenSessions : [currentWorker] } };
+		});
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const localWrapper = ({ children }: { children: ReactNode }) =>
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+		const { result } = renderHook(() => ({
+			worker: useWorkspaceScope("p", "worker"),
+			history: useWorkspaceScope("p", "hidden-archive"),
+		}), { wrapper: localWrapper });
+
+		await waitFor(() => expect(queryClient.getQueryState(first === "visible" ? workspaceQueryKey : hiddenWorkspaceQueryKey)?.status).toBe("success"));
+		await act(async () => { releaseSecond(); });
+		await waitFor(() => {
+			expect(queryClient.getQueryState(workspaceQueryKey)?.status).toBe("success");
+			expect(queryClient.getQueryState(hiddenWorkspaceQueryKey)?.status).toBe("success");
+		});
+		expect(result.current.worker.data?.session?.title).toBe("Current worker");
+		expect(result.current.worker.data?.session?.hiddenAt).toBeUndefined();
+		expect(result.current.worker.data?.session?.updatedAt).toBe(currentWorker.updatedAt);
+		expect(result.current.worker.data?.orchestrator?.id).toBe("hidden-orchestrator");
+		expect(result.current.history.data?.session).toMatchObject({ id: "hidden-archive", isTerminated: true });
+		queryClient.clear();
+	});
+
+	it("keeps worker presence truthful when a stale hidden duplicate is the only additional session", async () => {
+		getMock.mockImplementation(async (url: string, options?: { params?: { query?: { includeHidden?: boolean } } }) => {
+			if (url === "/api/v1/projects") return { data: { projects: [{ id: "p", name: "project", path: "/repo" }] } };
+			if (url !== "/api/v1/sessions") throw new Error(`unexpected GET ${url}`);
+			return { data: { sessions: [{
+				id: "worker", projectId: "p", kind: "worker", harness: "codex", status: "working", isTerminated: false,
+				hiddenAt: options?.params?.query?.includeHidden ? "2026-09-22T12:00:00Z" : undefined,
+			}] } };
+		});
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const localWrapper = ({ children }: { children: ReactNode }) =>
+			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+		const { result } = renderHook(() => useWorkspaceScope("p"), { wrapper: localWrapper });
+		await waitFor(() => {
+			expect(queryClient.getQueryState(workspaceQueryKey)?.status).toBe("success");
+			expect(queryClient.getQueryState(hiddenWorkspaceQueryKey)?.status).toBe("success");
+		});
+		expect(result.current.data?.hasWorkerSessions).toBe(true);
+		queryClient.clear();
+	});
+
+	it("keeps hidden live sessions available to routed shell action context", async () => {
+		respondWith({
+			projects: { data: { projects: [{ id: "p", name: "project", path: "/repo" }] } },
+			sessions: {
+				data: {
+					sessions: [
+						{ id: "hidden-worker", projectId: "p", kind: "worker", isTerminated: false, hiddenAt: "2026-09-22T12:00:00Z", status: "working" },
+						{ id: "hidden-orchestrator", projectId: "p", kind: "orchestrator", isTerminated: false, hiddenAt: "2026-09-22T12:00:00Z", status: "working" },
+					],
+				},
+			},
+		});
+		const { result } = renderHook(() => useWorkspaceScope("p", "hidden-worker"), { wrapper });
+		await waitFor(() => expect(result.current.data?.session?.id).toBe("hidden-worker"));
+		expect(result.current.data?.project?.id).toBe("p");
+		expect(result.current.data?.orchestrator?.id).toBe("hidden-orchestrator");
+		expect(result.current.data?.hasWorkerSessions).toBe(false);
+	});
+
 	it.each([
 		{ kind: "orchestrator", isTerminated: false, expected: false },
 		{ kind: "orchestrator", isTerminated: true, expected: false },
 		{ kind: "worker", isTerminated: false, expected: true },
 		{ kind: "worker", isTerminated: true, expected: true },
+		{ kind: "worker", isTerminated: false, hiddenAt: "2026-09-22T12:00:00Z", expected: false },
+		{ kind: "worker", isTerminated: true, hiddenAt: "2026-09-22T12:00:00Z", expected: true },
 		{ kind: undefined, isTerminated: false, expected: true },
-	])("projects worker presence for $kind, terminated=$isTerminated", async ({ kind, isTerminated, expected }) => {
+	])("projects worker presence for $kind, terminated=$isTerminated, hidden=$hiddenAt", async ({ kind, isTerminated, hiddenAt, expected }) => {
 		respondWith({
 			projects: { data: { projects: [{ id: "p", name: "project", path: "/repo" }] } },
-			sessions: { data: { sessions: [{ id: "s", projectId: "p", kind, isTerminated, status: "working" }] } },
+			sessions: { data: { sessions: [{ id: "s", projectId: "p", kind, isTerminated, hiddenAt, status: isTerminated ? "terminated" : "working" }] } },
 		});
 		const { result } = renderHook(() => useWorkspaceScope("p"), { wrapper });
 		await waitFor(() => expect(result.current.isSuccess).toBe(true));

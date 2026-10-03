@@ -25,6 +25,7 @@ type sessionListOptions struct {
 	sessionOptions
 	all               bool
 	includeTerminated bool
+	includeHidden     bool
 }
 
 type sessionCleanupOptions struct {
@@ -44,19 +45,48 @@ type sessionRenameRequest struct {
 }
 
 type sessionDTO struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"projectId"`
-	IssueID      string          `json:"issueId,omitempty"`
-	Kind         string          `json:"kind"`
-	Harness      string          `json:"harness,omitempty"`
-	DisplayName  string          `json:"displayName,omitempty"`
-	Activity     sessionActivity `json:"activity"`
-	IsTerminated bool            `json:"isTerminated"`
-	CreatedAt    time.Time       `json:"createdAt"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
-	Status       string          `json:"status"`
-	Branch       string          `json:"branch,omitempty"`
-	PRs          []sessionPRDTO  `json:"prs"`
+	ID                   string                       `json:"id"`
+	ProjectID            string                       `json:"projectId"`
+	IssueID              string                       `json:"issueId,omitempty"`
+	Kind                 string                       `json:"kind"`
+	Harness              string                       `json:"harness,omitempty"`
+	DisplayName          string                       `json:"displayName,omitempty"`
+	Activity             sessionActivity              `json:"activity"`
+	IsTerminated         bool                         `json:"isTerminated"`
+	HiddenAt             *time.Time                   `json:"hiddenAt,omitempty"`
+	CreatedAt            time.Time                    `json:"createdAt"`
+	UpdatedAt            time.Time                    `json:"updatedAt"`
+	Status               string                       `json:"status"`
+	Mode                 string                       `json:"mode,omitempty"`
+	ContinuationReadback *sessionContinuationReadback `json:"continuationReadback,omitempty"`
+	Branch               string                       `json:"branch,omitempty"`
+	PRs                  []sessionPRDTO               `json:"prs"`
+}
+
+type sessionContinuationReadback struct {
+	SessionID string                  `json:"sessionId"`
+	ProjectID string                  `json:"projectId"`
+	Harness   string                  `json:"harness"`
+	Mode      string                  `json:"mode"`
+	Available bool                    `json:"available"`
+	Reason    string                  `json:"reason"`
+	Chat      sessionContinuationChat `json:"chat"`
+	TUI       sessionContinuationTUI  `json:"tui"`
+}
+
+type sessionContinuationChat struct {
+	Available              bool   `json:"available"`
+	Reason                 string `json:"reason"`
+	ProviderConversationID string `json:"providerConversationId"`
+	ControllerGeneration   string `json:"controllerGeneration"`
+}
+
+type sessionContinuationTUI struct {
+	Available              bool   `json:"available"`
+	Reason                 string `json:"reason"`
+	AgentSessionID         string `json:"agentSessionId"`
+	RuntimeLaunchID        string `json:"runtimeLaunchId"`
+	AgentSessionIDLaunchID string `json:"agentSessionIdLaunchId"`
 }
 
 type sessionActivity struct {
@@ -166,6 +196,7 @@ type sessionListEntry struct {
 	Branch         string          `json:"branch,omitempty"`
 	PRs            []sessionListPR `json:"prs"`
 	IsTerminated   bool            `json:"isTerminated"`
+	HiddenAt       *time.Time      `json:"hiddenAt,omitempty"`
 	LastActivityAt *time.Time      `json:"lastActivityAt,omitempty"`
 	CreatedAt      time.Time       `json:"createdAt"`
 	UpdatedAt      time.Time       `json:"updatedAt"`
@@ -197,6 +228,8 @@ func newSessionCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newSessionRestoreCommand(ctx))
 	cmd.AddCommand(newSessionExitAgentCommand(ctx))
 	cmd.AddCommand(newSessionResumeAgentCommand(ctx))
+	cmd.AddCommand(newSessionHideCommand(ctx))
+	cmd.AddCommand(newSessionUnhideCommand(ctx))
 	cmd.AddCommand(newSessionRenameCommand(ctx))
 	cmd.AddCommand(newSessionCleanupCommand(ctx))
 	cmd.AddCommand(newSessionClaimPRCommand(ctx))
@@ -220,7 +253,64 @@ func newSessionListCommand(ctx *commandContext) *cobra.Command {
 	addSessionProjectFlag(f, &opts.project, "Filter by project ID")
 	f.BoolVarP(&opts.all, "all", "a", false, "Include orchestrator sessions")
 	f.BoolVar(&opts.includeTerminated, "include-terminated", false, "Include terminated sessions")
+	f.BoolVar(&opts.includeHidden, "include-hidden", false, "Include presentation-hidden sessions")
 	f.BoolVar(&opts.json, "json", false, "Output as JSON")
+	return cmd
+}
+
+func newSessionHideCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "hide <id>",
+		Short: "Hide a session from default lists without terminating it",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			if opts.project != "" {
+				if _, err := ctx.fetchScopedSession(cmd.Context(), id, opts.project); err != nil {
+					return err
+				}
+			}
+			var res sessionResponse
+			if err := ctx.postJSON(cmd.Context(), "sessions/"+url.PathEscape(id)+"/hide", struct{}{}, &res); err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "session %s hidden\n", res.Session.ID)
+			return err
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	return cmd
+}
+
+func newSessionUnhideCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "unhide <id>",
+		Short: "Restore a hidden session to default lists",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			if opts.project != "" {
+				if _, err := ctx.fetchScopedSession(cmd.Context(), id, opts.project); err != nil {
+					return err
+				}
+			}
+			var res sessionResponse
+			if err := ctx.deleteJSON(cmd.Context(), "sessions/"+url.PathEscape(id)+"/hide", &res); err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "session %s unhidden\n", res.Session.ID)
+			return err
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
 	return cmd
 }
 
@@ -495,6 +585,9 @@ func (c *commandContext) listSessions(ctx context.Context, cmd *cobra.Command, o
 	if !opts.includeTerminated {
 		params.Set("active", "true")
 	}
+	if opts.includeHidden {
+		params.Set("includeHidden", "true")
+	}
 	var res sessionListResponse
 	if err := c.getJSON(ctx, apiPath("sessions", params), &res); err != nil {
 		return err
@@ -577,6 +670,7 @@ func (c *commandContext) countHiddenTerminated(ctx context.Context, project stri
 		params.Set("project", project)
 	}
 	params.Set("active", "false")
+	params.Set("includeHidden", "true")
 	var res sessionListResponse
 	if err := c.getJSON(ctx, apiPath("sessions", params), &res); err != nil {
 		return 0, 0, err
@@ -794,6 +888,9 @@ func (c *commandContext) cleanupSessions(ctx context.Context, cmd *cobra.Command
 func (c *commandContext) previewCleanupSessions(ctx context.Context, project string) ([]sessionDTO, error) {
 	params := url.Values{}
 	params.Set("active", "false")
+	// Cleanup eligibility is lifecycle-owned and independent of presentation
+	// state, so the preview must include hidden terminated sessions too.
+	params.Set("includeHidden", "true")
 	if project != "" {
 		params.Set("project", project)
 	}
@@ -851,6 +948,7 @@ func sessionListEntries(sessions []sessionDTO, summaries map[string][]sessionPRS
 			Branch:         sess.Branch,
 			PRs:            listPRsForSession(sess, summaries[sess.ID]),
 			IsTerminated:   sess.IsTerminated,
+			HiddenAt:       sess.HiddenAt,
 			LastActivityAt: last,
 			CreatedAt:      sess.CreatedAt,
 			UpdatedAt:      sess.UpdatedAt,

@@ -20,12 +20,14 @@ INSERT INTO sessions (
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
     session_mode, provider_conversation_id, controller_generation, model, session_permissions,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
-    effort, effort_resolved, execution_base_sha
+    effort, effort_resolved, execution_base_sha, hidden_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 );
 
 -- name: UpdateSession :exec
+-- hidden_at is intentionally omitted; visibility has its own narrow write so a
+-- stale lifecycle read-modify-write cannot overwrite presentation state.
 UPDATE sessions SET
     issue_id = ?, kind = ?, harness = ?, reviewer_harness = ?, reviewer_agent_config = ?, auto_review_enabled = ?, display_name = ?,
     activity_state = ?, activity_last_at = ?, first_signal_at = ?, is_terminated = ?,
@@ -166,7 +168,7 @@ WHERE id = sqlc.arg(id) AND session_mode = sqlc.arg(source_mode) AND is_terminat
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -174,14 +176,14 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions WHERE id = ?;
 
 -- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -189,14 +191,14 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions WHERE project_id IS ? ORDER BY num;
 
 -- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -204,7 +206,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions ORDER BY project_id, num;
 
 
@@ -228,6 +230,17 @@ UPDATE sessions SET auto_inject_ci = ?, updated_at = ? WHERE id = ?;
 
 -- name: SetSessionPinned :execrows
 UPDATE sessions SET is_pinned = ?, pinned_at = ?, updated_at = ? WHERE id = ?;
+
+-- name: SetSessionHidden :execrows
+-- Presentation visibility is intentionally not session recency. The CDC trigger
+-- still emits an invalidation for this narrow fact without moving archive order.
+UPDATE sessions SET hidden_at = ? WHERE id = ?;
+
+-- name: ClearSessionHiddenIfUnchanged :execrows
+-- A successful activation may clear the state it observed, but must not erase a
+-- newer user hide that raced with activation.
+UPDATE sessions SET hidden_at = NULL
+WHERE id = sqlc.arg(id) AND hidden_at IS sqlc.arg(expected_hidden_at);
 
 -- name: SetSessionReviewerConfig :execrows
 UPDATE sessions SET reviewer_harness = ?, reviewer_agent_config = ?, updated_at = ? WHERE id = ?;

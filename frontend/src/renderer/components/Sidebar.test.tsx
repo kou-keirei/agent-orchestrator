@@ -270,6 +270,7 @@ function renderSidebar({
 	onRemoveProject = vi.fn().mockResolvedValue(undefined) as RemoveProjectHandler,
 	seedAgents = true,
 	workspaces = [workspace],
+	hiddenWorkspaces = [],
 	initialOpen = true,
 	topbarOffset = "toolbar",
 	expandedProjectIds,
@@ -280,6 +281,7 @@ function renderSidebar({
 	onRemoveProject?: RemoveProjectHandler;
 	seedAgents?: boolean;
 	workspaces?: WorkspaceSummary[];
+	hiddenWorkspaces?: WorkspaceSummary[];
 	initialOpen?: boolean;
 	topbarOffset?: "toolbar" | "titlebar" | "trafficLights" | "session";
 	expandedProjectIds?: string[];
@@ -309,6 +311,7 @@ function renderSidebar({
 						onInitializeProject={onInitializeProject}
 						onRemoveProject={onRemoveProject}
 						workspaces={workspaces}
+						hiddenWorkspaces={hiddenWorkspaces}
 					/>
 				</SidebarProvider>
 			</TooltipProvider>
@@ -455,6 +458,73 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+	it("reveals unpinned hidden terminated workers only while Show hidden sessions is enabled", async () => {
+		const user = userEvent.setup();
+		const hidden = {
+			...session,
+			id: "proj-1-hidden-terminated",
+			title: "hidden terminated history",
+			isTerminated: true,
+			isPinned: false,
+			hiddenAt: "2026-06-30T01:00:00Z",
+		};
+		const terminated = { ...session, id: "proj-1-terminated", title: "ordinary terminated history", isTerminated: true };
+		renderSidebar({
+			workspaces: [{ ...workspace, sessions: [session, terminated] }],
+			hiddenWorkspaces: [{ ...workspace, sessions: [session, terminated, hidden] }],
+		});
+
+		expect(screen.queryByRole("button", { name: "Open hidden terminated history" })).not.toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "Show hidden sessions" }));
+		const openHistory = await screen.findByRole("button", { name: "Open hidden terminated history" });
+		expect(screen.queryByTestId("pinned-session-list")).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Open ordinary terminated history" })).not.toBeInTheDocument();
+		await user.click(openHistory);
+		expect(navigateMock).toHaveBeenCalledWith({
+			to: "/projects/$projectId/sessions/$sessionId",
+			params: { projectId: hidden.workspaceId, sessionId: hidden.id },
+		});
+		expect(postMock).not.toHaveBeenCalled();
+		await user.click(screen.getByRole("button", { name: "Hide hidden sessions" }));
+		expect(screen.queryByRole("button", { name: "Open hidden terminated history" })).not.toBeInTheDocument();
+	});
+
+	it("keeps hidden pinned history out of the default sidebar and reveals it explicitly", async () => {
+		const user = userEvent.setup();
+		const hiddenAt = "2026-06-30T01:00:00Z";
+		const hidden = {
+			...session,
+			id: "proj-1-hidden",
+			title: "hidden history",
+			isTerminated: true,
+			isPinned: true,
+			hiddenAt,
+		};
+		renderSidebar({
+			workspaces: [{ ...workspace, sessions: [] }],
+			hiddenWorkspaces: [{ ...workspace, sessions: [hidden] }],
+		});
+
+		expect(screen.queryByRole("button", { name: "Open hidden history" })).not.toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "Show hidden sessions" }));
+		expect(await screen.findByRole("button", { name: "Open hidden history" })).toBeInTheDocument();
+		expect(screen.getByTestId("pinned-session-list")).toHaveTextContent("hidden history");
+	});
+	it("deduplicates a hidden session already present in the visible workspace", async () => {
+		const user = userEvent.setup();
+		const hiddenAt = "2026-06-30T01:00:00Z";
+		const visible = { ...session, id: "shared-session", title: "shared session" };
+		const hidden = { ...visible, hiddenAt, title: "stale hidden copy" };
+		renderSidebar({
+			workspaces: [{ ...workspace, sessions: [visible] }],
+			hiddenWorkspaces: [{ ...workspace, sessions: [hidden] }],
+		});
+
+		expect(screen.getAllByRole("button", { name: "Open shared session" })).toHaveLength(1);
+		await user.click(screen.getByRole("button", { name: "Show hidden sessions" }));
+		expect(screen.getAllByRole("button", { name: "Open shared session" })).toHaveLength(1);
+		expect(screen.queryByRole("button", { name: "Open stale hidden copy" })).not.toBeInTheDocument();
+	});
 	it("shows the cloud sign-in entry point while signed out", () => {
 		cloudSessionState.configured = true;
 		renderSidebar();
@@ -1739,7 +1809,7 @@ describe("Sidebar", () => {
 		const renameItem = await screen.findByRole("menuitem", { name: "Rename fix login" });
 		const menu = renameItem.closest('[role="menu"]');
 		if (!menu) throw new Error("Session context menu not found");
-		expect(within(menu as HTMLElement).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Rename"]);
+		expect(within(menu as HTMLElement).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Rename", "Hide session"]);
 		expect(renameItem).toHaveTextContent(/^Rename$/);
 		expect(renameItem.querySelector("svg")).toBeInTheDocument();
 		await user.click(renameItem);

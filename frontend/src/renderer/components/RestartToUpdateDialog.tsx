@@ -43,7 +43,9 @@ function RestartToUpdateDialogBody() {
 	const { t, i18n } = useTranslation();
 	const close = useUiStore((state) => state.closeUpdateInstallPrompt);
 	const status = useUpdateStatus(undefined, true);
-	const workspace = useWorkspaceQuery();
+	// Restart risk is operational state, so include active sessions hidden from
+	// ordinary presentation.
+	const workspace = useWorkspaceQuery({ includeHidden: true });
 
 	const [pending, setPending] = useState(false);
 	const [targetChanged, setTargetChanged] = useState(false);

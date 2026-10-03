@@ -114,6 +114,8 @@ export type WorkspaceSession = {
 	statusReadiness?: "checking" | "ready" | "unavailable";
 	/** Durable runtime fact from the daemon; independent of the derived SCM-aware status. */
 	isTerminated?: boolean;
+	/** Durable presentation-only visibility state. */
+	hiddenAt?: string;
 	/** Whether the cloud worker has a current control-plane connection. */
 	runtimeConnected?: boolean;
 	chatProviderPreserved?: boolean;

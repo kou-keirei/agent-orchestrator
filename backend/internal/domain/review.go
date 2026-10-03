@@ -52,9 +52,20 @@ type ReviewRun struct {
 	TriggerSource ReviewTriggerSource `json:"triggerSource" enum:"manual,auto"`
 	PRURL         string              `json:"prUrl"`
 	// TargetSHA is the PR head commit this pass reviewed.
-	TargetSHA string          `json:"targetSha"`
-	Status    ReviewRunStatus `json:"status"`
-	Verdict   ReviewVerdict   `json:"verdict"`
+	TargetSHA string `json:"targetSha"`
+	// TargetBinding is the immutable AO observation that authorizes this pass.
+	// A zero value means the row predates reviewer evidence closure and is
+	// therefore unknown/unproven, never an inferred clean binding.
+	TargetBinding ReviewTargetBinding `json:"targetBinding"`
+	// Provenance keeps requested/configured/AO-resolved settings distinct from
+	// provider-effective and provider-native facts. AO never fills the latter
+	// from request or launch configuration alone.
+	Provenance ReviewerProvenance `json:"provenance"`
+	// LaunchID fences hooks and native evidence to the exact AO reviewer launch
+	// generation that owned this pass. It is immutable once the run is created.
+	LaunchID string          `json:"launchId"`
+	Status   ReviewRunStatus `json:"status"`
+	Verdict  ReviewVerdict   `json:"verdict"`
 	// Body is the review text the reviewer submitted. It is recorded for AO's
 	// own tracking; the reviewer also posts the review to the PR itself.
 	Body string `json:"body"`
@@ -69,6 +80,96 @@ type ReviewRun struct {
 	// AutoInjectReview snapshots the session policy when this result is first
 	// recorded. Later toggle changes must not rewrite or deliver this run.
 	AutoInjectReview bool `json:"autoInjectReview"`
+}
+
+// ReviewerCleanupObligation is a durable, non-authoritative record of a
+// reviewer runtime that AO may have created but could not prove destroyed.
+// It deliberately lives outside Review and ReviewRun: an unresolved handle is
+// cleanup evidence, never live reviewer authority or provider-native evidence.
+type ReviewerCleanupObligation struct {
+	ID             string                          `json:"id"`
+	SessionID      SessionID                       `json:"sessionId"`
+	ReviewID       string                          `json:"reviewId,omitempty"`
+	RunID          string                          `json:"runId,omitempty"`
+	Harness        ReviewerHarness                 `json:"harness"`
+	HandleID       string                          `json:"handleId"`
+	LaunchID       string                          `json:"launchId,omitempty"`
+	AgentSessionID string                          `json:"agentSessionId,omitempty"`
+	Status         ReviewerCleanupObligationStatus `json:"status"`
+	CreatedAt      time.Time                       `json:"createdAt"`
+	UpdatedAt      time.Time                       `json:"updatedAt"`
+	ResolvedAt     *time.Time                      `json:"resolvedAt,omitempty"`
+}
+
+// ReviewerCleanupObligationStatus is the lifecycle of a cleanup-only record.
+type ReviewerCleanupObligationStatus string
+
+const (
+	ReviewerCleanupUnresolved ReviewerCleanupObligationStatus = "unresolved"
+	ReviewerCleanupCleared    ReviewerCleanupObligationStatus = "cleared"
+)
+
+// ReviewTargetBinding is the immutable launch-time binding for one review pass.
+// It deliberately records both the execution authority and the observed
+// checkout state: neither may be reconstructed later from mutable session or
+// workspace metadata.
+type ReviewTargetBinding struct {
+	TargetSHA           string    `json:"targetSha"`
+	ExecutionBaseSHA    string    `json:"executionBaseSha"`
+	DiffBaseSHA         string    `json:"diffBaseSha,omitempty"`
+	DiffBaseRef         string    `json:"diffBaseRef,omitempty"`
+	WorkspacePath       string    `json:"workspacePath"`
+	ObservedHeadSHA     string    `json:"observedHeadSha"`
+	ObservedBranch      string    `json:"observedBranch,omitempty"`
+	WorkspaceDirty      bool      `json:"workspaceDirty"`
+	WorkspaceDirtyKnown bool      `json:"workspaceDirtyKnown"`
+	IndexStaged         bool      `json:"indexStaged"`
+	IndexStagedKnown    bool      `json:"indexStagedKnown"`
+	ObservationPhase    string    `json:"observationPhase"`
+	ObservedAt          time.Time `json:"observedAt"`
+}
+
+// ReviewEvidenceLevel names the authority of a reviewer setting or identity.
+// The values intentionally mirror the control-plane reconciliation vocabulary.
+type ReviewEvidenceLevel string
+
+const (
+	ReviewEvidenceRequested         ReviewEvidenceLevel = "REQUESTED"
+	ReviewEvidenceConfigured        ReviewEvidenceLevel = "CONFIGURED"
+	ReviewEvidenceAOResolved        ReviewEvidenceLevel = "AO_RESOLVED"
+	ReviewEvidenceProviderEffective ReviewEvidenceLevel = "PROVIDER_EFFECTIVE"
+	ReviewEvidenceProviderNative    ReviewEvidenceLevel = "PROVIDER_NATIVE"
+)
+
+// ReviewerSettings is one truth-level snapshot of reviewer execution settings.
+// Observed is true only for a fact established at that level; it is not derived
+// from the presence of a requested/configured value.
+type ReviewerSettings struct {
+	Harness    ReviewerHarness `json:"harness,omitempty"`
+	Model      string          `json:"model,omitempty"`
+	Effort     string          `json:"effort,omitempty"`
+	Mode       string          `json:"mode,omitempty"`
+	Permission PermissionMode  `json:"permission,omitempty"`
+	Observed   bool            `json:"observed"`
+}
+
+// ReviewerNativeEvidence is append-only provider evidence correlated by AO.
+// Empty provider-effective/native fields remain explicitly unproven.
+type ReviewerNativeEvidence struct {
+	SessionID    string    `json:"sessionId,omitempty"`
+	FirstTurnID  string    `json:"firstTurnId,omitempty"`
+	CompletionID string    `json:"completionId,omitempty"`
+	ObservedAt   time.Time `json:"observedAt,omitempty"`
+}
+
+// ReviewerProvenance preserves every requested/configured/resolved boundary
+// without allowing a reviewer submission to assert provider-owned facts.
+type ReviewerProvenance struct {
+	Requested         ReviewerSettings       `json:"requested"`
+	Configured        ReviewerSettings       `json:"configured"`
+	AOResolved        ReviewerSettings       `json:"aoResolved"`
+	ProviderEffective ReviewerSettings       `json:"providerEffective"`
+	ProviderNative    ReviewerNativeEvidence `json:"providerNative"`
 }
 
 // ReviewTriggerSource identifies who initiated a review pass.

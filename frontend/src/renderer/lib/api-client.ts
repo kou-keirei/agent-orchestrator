@@ -114,6 +114,7 @@ const ROUTE_TEMPLATES = [
 	"/api/v1/sessions/{sessionId}/exit-agent",
 	"/api/v1/sessions/{sessionId}/interface-transition",
 	"/api/v1/sessions/{sessionId}/kill",
+	"/api/v1/sessions/{sessionId}/hide",
 	"/api/v1/sessions/{sessionId}/pr",
 	"/api/v1/sessions/{sessionId}/pr/claim",
 	"/api/v1/sessions/{sessionId}/preview",

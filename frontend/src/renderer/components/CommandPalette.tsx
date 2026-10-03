@@ -68,7 +68,9 @@ export function CommandPalette() {
 	// The palette stays mounted to preserve its close animation and global
 	// shortcut. While closed, commands are invisible, so retain the cached
 	// snapshot without subscribing this hidden surface to streamed updates.
-	const workspaces = useWorkspaceQuery({ subscribed: isOpen }).data ?? [];
+	// Palette actions resolve durable session context, including sessions hidden
+	// from ordinary board/sidebar presentation.
+	const workspaces = useWorkspaceQuery({ subscribed: isOpen, includeHidden: true }).data ?? [];
 
 	const [view, setView] = useState<PaletteView>({ mode: "root" });
 	const [query, setQuery] = useState("");

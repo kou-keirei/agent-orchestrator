@@ -371,6 +371,35 @@ type Notification struct {
 	ResolvedAt sql.NullTime
 }
 
+type OrchestrationEvent struct {
+	ID                   string
+	ProjectID            string
+	WorkerID             string
+	Kind                 string
+	SourceRevision       string
+	State                string
+	AttemptCount         int64
+	EnqueuedAt           time.Time
+	NextAttemptAt        time.Time
+	LeaseToken           sql.NullString
+	LeaseExpiresAt       sql.NullTime
+	DestinationSessionID sql.NullString
+	SubmittedAt          sql.NullTime
+	AcknowledgedAt       sql.NullTime
+	AttentionRequiredAt  sql.NullTime
+	LastError            string
+}
+
+type OrchestrationSourceState struct {
+	ProjectID  string
+	WorkerID   string
+	Kind       string
+	SourceID   string
+	Active     int64
+	Generation int64
+	UpdatedAt  time.Time
+}
+
 type PR struct {
 	URL                      string
 	SessionID                domain.SessionID
@@ -501,21 +530,43 @@ type Review struct {
 }
 
 type ReviewRun struct {
-	ID               string
-	ReviewID         string
-	SessionID        domain.SessionID
-	Harness          domain.ReviewerHarness
-	PRURL            string
-	TargetSha        string
-	Status           domain.ReviewRunStatus
-	Verdict          domain.ReviewVerdict
-	Body             string
-	CreatedAt        time.Time
-	GithubReviewID   string
-	DeliveredAt      sql.NullTime
-	BatchID          string
-	AutoInjectReview bool
-	TriggerSource    domain.ReviewTriggerSource
+	ID                         string
+	ReviewID                   string
+	SessionID                  domain.SessionID
+	Harness                    domain.ReviewerHarness
+	PRURL                      string
+	TargetSha                  string
+	Status                     domain.ReviewRunStatus
+	Verdict                    domain.ReviewVerdict
+	Body                       string
+	CreatedAt                  time.Time
+	GithubReviewID             string
+	DeliveredAt                sql.NullTime
+	BatchID                    string
+	AutoInjectReview           bool
+	TriggerSource              domain.ReviewTriggerSource
+	TargetBindingJson          string
+	ReviewerProvenanceJson     string
+	LaunchID                   string
+	ProviderNativeSessionID    string
+	ProviderNativeFirstTurnID  string
+	ProviderNativeCompletionID string
+	ProviderNativeObservedAt   sql.NullTime
+}
+
+type ReviewerCleanupObligation struct {
+	ID             string
+	SessionID      string
+	ReviewID       string
+	RunID          string
+	Harness        string
+	HandleID       string
+	LaunchID       string
+	AgentSessionID string
+	Status         string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	ResolvedAt     sql.NullTime
 }
 
 type Session struct {
@@ -575,6 +626,8 @@ type Session struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	HiddenAt                         sql.NullTime
+	TerminalRevision                 int64
 }
 
 type SessionCleanupFact struct {

@@ -122,6 +122,11 @@ type SessionService interface {
 	Unpin(ctx context.Context, id domain.SessionID) (domain.Session, error)
 }
 
+type sessionVisibilityService interface {
+	Hide(context.Context, domain.SessionID) (domain.Session, error)
+	Unhide(context.Context, domain.SessionID) (domain.Session, error)
+}
+
 // ActivityRecorder applies an agent activity-state signal to a session. It is
 // satisfied directly by *lifecycle.Manager: an activity signal is a pure
 // lifecycle reduction (no runtime/workspace teardown), so it bypasses
@@ -209,6 +214,8 @@ func (c *SessionsController) Register(r chi.Router) {
 	r.Post("/sessions/{sessionId}/activity", c.activity)
 	r.Post("/sessions/{sessionId}/pin", c.pin)
 	r.Delete("/sessions/{sessionId}/pin", c.unpin)
+	r.Post("/sessions/{sessionId}/hide", c.hide)
+	r.Delete("/sessions/{sessionId}/hide", c.unhide)
 	r.Get("/orchestrators", c.listOrchestrators)
 	r.Post("/orchestrators", c.spawnOrchestrator)
 	r.Post("/orchestrators/delegate", c.delegateTask)
@@ -410,6 +417,34 @@ func (c *SessionsController) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess, err := c.Svc.Get(r.Context(), sessionID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(sess)})
+}
+
+func (c *SessionsController) hide(w http.ResponseWriter, r *http.Request) {
+	visibility, ok := c.Svc.(sessionVisibilityService)
+	if !ok {
+		envelope.WriteAPIError(w, r, http.StatusNotImplemented, "not_implemented", "NOT_IMPLEMENTED", "Session visibility is unavailable", nil)
+		return
+	}
+	sess, err := visibility.Hide(r.Context(), sessionID(r))
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, SessionResponse{Session: sessionView(sess)})
+}
+
+func (c *SessionsController) unhide(w http.ResponseWriter, r *http.Request) {
+	visibility, ok := c.Svc.(sessionVisibilityService)
+	if !ok {
+		envelope.WriteAPIError(w, r, http.StatusNotImplemented, "not_implemented", "NOT_IMPLEMENTED", "Session visibility is unavailable", nil)
+		return
+	}
+	sess, err := visibility.Unhide(r.Context(), sessionID(r))
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -1747,7 +1782,20 @@ func (c *SessionsController) listOrchestrators(w http.ResponseWriter, r *http.Re
 		apispec.NotImplemented(w, r, "GET", "/api/v1/orchestrators")
 		return
 	}
-	sessions, err := c.Svc.List(r.Context(), sessionsvc.ListFilter{OrchestratorOnly: true})
+	filter, err := parseSessionListFilter(r)
+	if err != nil {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_QUERY", err.Error(), nil)
+		return
+	}
+	filter.OrchestratorOnly = true
+	// This route is the explicit orchestrator history surface. Include
+	// presentation-hidden orchestrators by default so lifecycle/action callers
+	// cannot mistake a hidden active coordinator for an absent one. Callers may
+	// still opt out with includeHidden=false when they need a visible-only list.
+	if _, specified := r.URL.Query()["includeHidden"]; !specified {
+		filter.IncludeHidden = true
+	}
+	sessions, err := c.Svc.List(r.Context(), filter)
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -1807,6 +1855,16 @@ func parseSessionListFilter(r *http.Request) (sessionsvc.ListFilter, error) {
 			return sessionsvc.ListFilter{}, errors.New("fresh must be a boolean")
 		}
 		filter.Fresh = fresh
+	}
+	if raw, specified := q["includeHidden"]; specified {
+		if raw[0] == "" {
+			return sessionsvc.ListFilter{}, errors.New("includeHidden must be a boolean")
+		}
+		includeHidden, err := strconv.ParseBool(raw[0])
+		if err != nil {
+			return sessionsvc.ListFilter{}, errors.New("includeHidden must be a boolean")
+		}
+		filter.IncludeHidden = includeHidden
 	}
 	return filter, nil
 }
@@ -2001,13 +2059,14 @@ func previewFileURL(r *http.Request, id domain.SessionID, entry string) (string,
 func sessionView(s domain.Session) SessionView {
 	terminalGeneration := s.Metadata.RuntimeLaunchID
 	view := SessionView{
-		Session:            s,
-		Branch:             s.Metadata.Branch,
-		TerminalGeneration: terminalGeneration,
-		PreviewURL:         s.Metadata.PreviewURL,
-		PreviewRevision:    s.Metadata.PreviewRevision,
-		Model:              s.Metadata.Model,
-		Permissions:        s.Metadata.Permissions,
+		Session:              s,
+		Branch:               s.Metadata.Branch,
+		ContinuationReadback: continuationReadback(s),
+		TerminalGeneration:   terminalGeneration,
+		PreviewURL:           s.Metadata.PreviewURL,
+		PreviewRevision:      s.Metadata.PreviewRevision,
+		Model:                s.Metadata.Model,
+		Permissions:          s.Metadata.Permissions,
 		LastUserMessageAt: func() *time.Time {
 			if s.Metadata.LatestUserPromptAt.IsZero() {
 				return nil
@@ -2022,6 +2081,79 @@ func sessionView(s domain.Session) SessionView {
 		view.ActiveAgentSwitch = &active
 	}
 	return view
+}
+
+func continuationReadback(s domain.Session) SessionContinuationReadback {
+	mode := s.Mode
+	readback := SessionContinuationReadback{
+		SessionID: s.ID,
+		ProjectID: s.ProjectID,
+		Harness:   s.Harness,
+		Mode:      mode,
+		Chat: SessionContinuationChat{
+			Reason:                 "mode_not_applicable",
+			ProviderConversationID: s.Metadata.ProviderConversationID,
+			ControllerGeneration:   s.Metadata.ControllerGeneration,
+		},
+		TUI: SessionContinuationTUI{
+			Reason:                 "mode_not_applicable",
+			AgentSessionID:         s.Metadata.AgentSessionID,
+			RuntimeLaunchID:        s.Metadata.RuntimeLaunchID,
+			AgentSessionIDLaunchID: s.Metadata.AgentSessionIDLaunchID,
+		},
+	}
+	failEnvelope := func(reason string) SessionContinuationReadback {
+		readback.Available = false
+		readback.Reason = reason
+		readback.Chat.Available = false
+		readback.Chat.Reason = reason
+		readback.TUI.Available = false
+		readback.TUI.Reason = reason
+		return readback
+	}
+
+	if strings.TrimSpace(string(s.ID)) == "" {
+		return failEnvelope("missing_session_id")
+	}
+	if strings.TrimSpace(string(s.ProjectID)) == "" {
+		return failEnvelope("missing_project_id")
+	}
+	if !s.Harness.IsKnown() {
+		return failEnvelope("missing_or_unknown_harness")
+	}
+	if !mode.Valid() {
+		return failEnvelope("missing_or_unknown_mode")
+	}
+
+	switch mode {
+	case domain.SessionModeChat:
+		readback.Chat.Reason = "missing_chat_identity"
+		if strings.TrimSpace(s.Metadata.ProviderConversationID) == "" || strings.TrimSpace(s.Metadata.ControllerGeneration) == "" {
+			readback.Reason = readback.Chat.Reason
+			return readback
+		}
+		readback.Chat.Available = true
+		readback.Chat.Reason = "available"
+	case domain.SessionModeTUI:
+		readback.TUI.Reason = "missing_tui_identity"
+		if strings.TrimSpace(s.Metadata.AgentSessionID) == "" ||
+			strings.TrimSpace(s.Metadata.RuntimeLaunchID) == "" ||
+			strings.TrimSpace(s.Metadata.AgentSessionIDLaunchID) == "" {
+			readback.Reason = readback.TUI.Reason
+			return readback
+		}
+		if s.Metadata.AgentSessionIDLaunchID != s.Metadata.RuntimeLaunchID {
+			readback.TUI.Reason = "generation_mismatch"
+			readback.Reason = readback.TUI.Reason
+			return readback
+		}
+		readback.TUI.Available = true
+		readback.TUI.Reason = "available"
+	}
+
+	readback.Available = true
+	readback.Reason = "available"
+	return readback
 }
 
 func agentSwitchView(s domain.AgentSwitch) AgentSwitchView {

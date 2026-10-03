@@ -10,6 +10,7 @@ import {
 import { AlertTriangle, LayoutDashboard, RotateCw } from "lucide-react";
 import {
 	type WorkspaceSession,
+	type WorkspaceSummary,
 	newestActiveOrchestrator,
 	orchestratorHealth,
 	workerSessions,
@@ -25,7 +26,7 @@ import {
 } from "../hooks/useSessionUsageSummaries";
 import { useRestoreSession } from "../hooks/useRestoreSession";
 import { useTerminateSession } from "../hooks/useTerminateSession";
-import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { hiddenWorkspaceQueryKey, useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { NotificationCenter } from "./NotificationCenter";
 import { BoardWelcome, ProjectBoardEmpty } from "./BoardEmptyStates";
 import { TopbarButton, topbarProjectLabelClass } from "./TopbarButton";
@@ -50,6 +51,18 @@ type SessionsBoardProps = {
 	/** When set, the board shows only this project's sessions. */
 	projectId?: string;
 };
+
+function mergeWorkspaceSessions(
+	primary: readonly WorkspaceSummary["sessions"][number][],
+	additional: readonly WorkspaceSummary["sessions"][number][],
+) {
+	const seen = new Set<string>();
+	return [...primary, ...additional].filter((session) => {
+		if (seen.has(session.id)) return false;
+		seen.add(session.id);
+		return true;
+	});
+}
 
 type UsageBySession = ReadonlyMap<string, SessionUsageSummary>;
 const emptyUsageBySession: UsageBySession = new Map();
@@ -77,18 +90,43 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 	// in review -> ready. The middle two are one review-feedback loop, split by
 	// whose turn it is.
 	const columns: KanbanColumnView[] = boardKanbanColumnOrder.map((column) => getKanbanColumnView(column, t));
+	// Keep the ordinary query as the Board's presentation source. History and
+	// action resolution use the hidden-inclusive snapshot separately so hidden
+	// rows cannot change visible empty-state or cache transition semantics.
 	const workspaceQuery = useWorkspaceQuery();
+	const hiddenWorkspaceQuery = useWorkspaceQuery({ includeHidden: true });
 	const liveUsageBySession = useSessionUsageSummaries(projectId).data ?? emptyUsageBySession;
 	// Evaluated at render so platform mocks in tests can flip the in-panel chrome.
 	const boardActionsInPanel = usesBoardActionsInPanel();
 	/** Bell lives in the board action row when the shell topbar does not host it. */
 	const boardOwnsNotificationCenter = isLinuxPlatform() || boardActionsInPanel;
 	const all = workspaceQuery.data ?? [];
+	const allWithHidden = hiddenWorkspaceQuery.data ?? all;
 	const workspaces = projectId ? all.filter((workspace) => workspace.id === projectId) : all;
+	const historyWorkspaces = projectId
+		? allWithHidden.filter((workspace) => workspace.id === projectId)
+		: allWithHidden;
 	const workspace = projectId ? workspaces[0] : undefined;
+	const historyWorkspace = projectId ? historyWorkspaces[0] : undefined;
+	const actionWorkspace = workspace
+		? {
+				...workspace,
+				sessions: mergeWorkspaceSessions(workspace.sessions, historyWorkspace?.sessions ?? []),
+			}
+		: undefined;
+	const presentationWorkspace = workspace
+		? { ...workspace, sessions: workspace.sessions.filter((session) => !session.hiddenAt) }
+		: undefined;
 	// Board chrome stays route-oriented; project context remains in the sidebar.
 	const boardLabel = t("shell.board");
-	const liveSessions = workspaces.flatMap((workspace) => workerSessions(workspace.sessions));
+	const liveSessions = mergeWorkspaceSessions(
+		workspaces.flatMap((workspace) => workerSessions(workspace.sessions)),
+		historyWorkspaces.flatMap((candidate) => workerSessions(candidate.sessions).filter((session) =>
+			(session.hiddenAt && isArchivedSession(session)) ||
+			!workspaces.some((workspace) => workspace.id === candidate.id),
+		)),
+	)
+		.filter((session) => !session.hiddenAt || isArchivedSession(session));
 	const demoWorkspaceId = projectId ?? workspaces[0]?.id;
 	const sessions = usesPreviewWorkspaceData && demoWorkspaceId && liveSessions.length === 0
 		? demoBoardSessions(demoWorkspaceId)
@@ -107,12 +145,15 @@ export function SessionsBoard({ projectId }: SessionsBoardProps) {
 				]),
 			)
 		: liveUsageBySession;
-	const orchestrator = projectId ? newestActiveOrchestrator(workspaces[0]?.sessions ?? []) : undefined;
-	const projectActions = useProjectOrchestratorAction({ projectId, project: workspace, orchestrator, source: "board" });
+	// Presentation filtering must not affect action resolution: a hidden active
+	// orchestrator is still the durable project coordinator and opening it must
+	// navigate to that session instead of issuing a duplicate spawn request.
+	const orchestrator = projectId ? newestActiveOrchestrator(actionWorkspace?.sessions ?? []) : undefined;
+	const projectActions = useProjectOrchestratorAction({ projectId, project: presentationWorkspace, orchestrator, source: "board" });
 	const { isProjectRestarting, isProvisioning } = projectActions;
 	const setProjectRestarting = useUiStore((state) => state.setProjectRestarting);
 	const setOrchestratorReplacementError = useUiStore((state) => state.setOrchestratorReplacementError);
-	const health = workspace ? orchestratorHealth(workspace, isProjectRestarting) : { state: "ok" as const };
+	const health = actionWorkspace ? orchestratorHealth(actionWorkspace, isProjectRestarting) : { state: "ok" as const };
 
 	const archived = sessions
 		.filter(isArchivedSession)
@@ -372,6 +413,7 @@ const BoardArchivePanel = memo(function BoardArchivePanel({
 					}}
 					onRecreated={async () => {
 						await queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
+						await queryClient.invalidateQueries({ queryKey: hiddenWorkspaceQueryKey });
 					}}
 				/>
 			) : null}

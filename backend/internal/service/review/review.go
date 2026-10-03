@@ -104,6 +104,13 @@ type Store interface {
 	MarkPRCommentResolved(ctx context.Context, prURL, commentID string) (bool, error)
 }
 
+// ReviewRunNativeEvidenceResolver finds the unique running pass whose native
+// turn produced a follow-up hook. It is optional so transport tests can keep a
+// small store fake; production SQLite implements it.
+type ReviewRunNativeEvidenceResolver interface {
+	FindReviewRunForNativeEvidence(ctx context.Context, reviewID string, sessionID domain.SessionID, launchID, nativeSessionID, turnID string) (domain.ReviewRun, bool, error)
+}
+
 // Reducer is the lifecycle reaction boundary used after a review result has
 // been persisted.
 type Reducer interface {
@@ -506,6 +513,13 @@ func (s *Service) RestoreReviewer(ctx context.Context, workerID domain.SessionID
 	return err
 }
 
+// ReconcileReviewerCleanup retries durable reviewer cleanup independently of
+// restoring the reviewer terminal, including when session startup adopts a
+// runtime that survived the daemon restart.
+func (s *Service) ReconcileReviewerCleanup(ctx context.Context, workerID domain.SessionID) error {
+	return s.engine.ReconcileReviewerCleanup(ctx, workerID)
+}
+
 // SwitchReviewer atomically persists a worker's reviewer preference and returns
 // the authoritative post-switch review state.
 func (s *Service) SwitchReviewer(ctx context.Context, workerID domain.SessionID, harness domain.ReviewerHarness, config domain.AgentConfig) (reviewcore.SessionReviews, error) {
@@ -541,6 +555,9 @@ type ActivitySignal struct {
 	State          domain.ActivityState
 	AgentSessionID string
 	LaunchID       string
+	RunID          string
+	FirstTurnID    string
+	CompletionID   string
 }
 
 // ApplyReviewActivitySignal records reviewer-owned hook facts without touching
@@ -554,6 +571,60 @@ func (s *Service) ApplyReviewActivitySignal(ctx context.Context, reviewSessionID
 		return err
 	} else if !ok {
 		return fmt.Errorf("%w: review session %q", ErrNotFound, reviewSessionID)
+	}
+	if signal.RunID == "" && signal.CompletionID != "" {
+		resolver, ok := s.store.(ReviewRunNativeEvidenceResolver)
+		if !ok {
+			return fmt.Errorf("%w: native completion cannot be correlated", ErrInvalid)
+		}
+		run, found, resolveErr := resolver.FindReviewRunForNativeEvidence(ctx, review.ID, review.SessionID, signal.LaunchID, signal.AgentSessionID, signal.CompletionID)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		if !found {
+			return fmt.Errorf("%w: native completion does not identify a running review pass", ErrInvalid)
+		}
+		signal.RunID = run.ID
+	}
+	hasNativeEvidence := signal.AgentSessionID != "" || signal.FirstTurnID != "" || signal.CompletionID != ""
+	if signal.RunID != "" && hasNativeEvidence {
+		appender, ok := s.store.(reviewcore.ReviewRunNativeEvidenceAppender)
+		if !ok || signal.LaunchID == "" {
+			return fmt.Errorf("%w: review run native evidence binding is unavailable", ErrInvalid)
+		}
+		run, found, err := s.store.GetReviewRun(ctx, signal.RunID)
+		if err != nil {
+			return err
+		}
+		if !found || run.ReviewID != review.ID || run.SessionID != review.SessionID || run.LaunchID != signal.LaunchID || run.Status != domain.ReviewRunRunning {
+			return fmt.Errorf("%w: native evidence does not match the current review generation", ErrInvalid)
+		}
+		if review.ReviewerLaunchID == "" || review.ReviewerLaunchID != signal.LaunchID {
+			return fmt.Errorf("%w: native evidence launch is stale", ErrInvalid)
+		}
+		native := run.Provenance.ProviderNative
+		if review.AgentSessionID != "" && signal.AgentSessionID != "" && review.AgentSessionID != signal.AgentSessionID {
+			return fmt.Errorf("%w: native reviewer session does not match the current generation", ErrInvalid)
+		}
+		if native.SessionID != "" && signal.AgentSessionID != "" && native.SessionID != signal.AgentSessionID {
+			return fmt.Errorf("%w: native reviewer session contradicts stored evidence", ErrInvalid)
+		}
+		if native.FirstTurnID != "" && signal.FirstTurnID != "" && native.FirstTurnID != signal.FirstTurnID {
+			return fmt.Errorf("%w: native first-turn evidence contradicts stored evidence", ErrInvalid)
+		}
+		if native.CompletionID != "" && signal.CompletionID != "" && native.CompletionID != signal.CompletionID {
+			return fmt.Errorf("%w: native completion evidence contradicts stored evidence", ErrInvalid)
+		}
+		if signal.CompletionID != "" && (native.FirstTurnID == "" || signal.CompletionID != native.FirstTurnID) {
+			return fmt.Errorf("%w: native completion does not match the recorded review turn", ErrInvalid)
+		}
+		updated, err := appender.AppendReviewRunNativeEvidence(ctx, run.ID, signal.LaunchID, string(run.SessionID), signal.AgentSessionID, signal.FirstTurnID, signal.CompletionID, s.clock())
+		if err != nil {
+			return err
+		}
+		if !updated && (signal.AgentSessionID != "" || signal.FirstTurnID != "" || signal.CompletionID != "") {
+			return fmt.Errorf("%w: native evidence append was rejected", ErrInvalid)
+		}
 	}
 	if signal.AgentSessionID == "" && signal.State == "" {
 		return nil

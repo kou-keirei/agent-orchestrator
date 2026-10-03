@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -181,16 +182,29 @@ func TestActivateChatAgentSwitchTargetMovesSourceGenerationToTarget(t *testing.T
 		t.Fatalf("persist target Chat verifier: %v", err)
 	}
 	activatedAt := now.Add(5 * time.Second)
-	if ok, err := s.ActivateChatAgentSwitchTarget(ctx, domain.AgentSwitchChatTargetActivation{
+	firstHiddenAt := now.Add(4 * time.Second)
+	newerHiddenAt := firstHiddenAt.Add(time.Millisecond)
+	if ok, err := s.SetSessionHidden(ctx, session.ID, &firstHiddenAt); err != nil || !ok {
+		t.Fatalf("set initial Chat hidden state: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.SetSessionHidden(ctx, session.ID, &newerHiddenAt); err != nil || !ok {
+		t.Fatalf("set newer Chat hidden state: ok=%v err=%v", ok, err)
+	}
+	chatActivation := domain.AgentSwitchChatTargetActivation{
 		SwitchID: sw.ID, SessionID: session.ID,
 		SourceHarness: domain.HarnessClaudeCode, SourceGenerationID: "source-chat-generation",
 		ExpectedSourceControllerGeneration: "source-chat-generation",
 		TargetHarness:                      domain.HarnessCodex, TargetNativeSessionRef: target.ID,
 		TargetGenerationID:     "target-chat-generation",
 		ProviderConversationID: "target-chat-native", ControllerGeneration: "target-chat-generation",
-		ActivatedAt: activatedAt,
-	}); err != nil || !ok {
-		t.Fatalf("activate Chat target: ok=%v err=%v", ok, err)
+		PresentationHiddenAt: &firstHiddenAt, ActivatedAt: activatedAt,
+	}
+	if ok, err := s.ActivateChatAgentSwitchTarget(ctx, chatActivation); err != nil || !ok {
+		t.Fatalf("Chat activation must ignore presentation CAS state: ok=%v err=%v", ok, err)
+	}
+	unchanged, ok, err := s.GetSession(ctx, session.ID)
+	if err != nil || !ok || unchanged.HiddenAt == nil || !unchanged.HiddenAt.Equal(newerHiddenAt) {
+		t.Fatalf("Chat activation changed presentation state: session=%+v ok=%v err=%v", unchanged, ok, err)
 	}
 	got, ok, err := s.GetSession(ctx, session.ID)
 	if err != nil || !ok {
@@ -202,6 +216,9 @@ func TestActivateChatAgentSwitchTargetMovesSourceGenerationToTarget(t *testing.T
 		got.Metadata.ControllerGeneration != "target-chat-generation" ||
 		got.Metadata.BrowserCapabilityVerifier != "target-chat-verifier" {
 		t.Fatalf("activated Chat session = %+v", got)
+	}
+	if got.HiddenAt == nil || !got.HiddenAt.Equal(newerHiddenAt) {
+		t.Fatalf("Chat activation changed newer presentation state: %v", got.HiddenAt)
 	}
 	if got.Metadata.LatestUserPrompt != "" || got.Metadata.LatestAssistantUpdate != "" ||
 		got.Metadata.ConversationCheckpointState != domain.ConversationCheckpointEmpty ||
@@ -1540,11 +1557,21 @@ func TestAgentSwitchSourceStopAndTargetActivationAreAtomicAndNarrow(t *testing.T
 		TargetGenerationID: "target-generation", RuntimeHandleID: "target-handle",
 		ActivatedAt: now.Add(4 * time.Second),
 	}
+	firstHiddenAt := now.Add(3500 * time.Millisecond)
+	newerHiddenAt := firstHiddenAt.Add(time.Millisecond)
+	if ok, err := s.SetSessionHidden(ctx, session.ID, &firstHiddenAt); err != nil || !ok {
+		t.Fatalf("set initial TUI hidden state: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.SetSessionHidden(ctx, session.ID, &newerHiddenAt); err != nil || !ok {
+		t.Fatalf("set newer TUI hidden state: ok=%v err=%v", ok, err)
+	}
+	activation.PresentationHiddenAt = &firstHiddenAt
 	if ok, err := s.ActivateAgentSwitchTarget(ctx, activation); err != nil || ok {
-		t.Fatalf("stale target activation: ok=%v err=%v", ok, err)
+		t.Fatalf("stale source generation activation: ok=%v err=%v", ok, err)
 	}
 	unchanged, ok, err = s.GetSession(ctx, session.ID)
-	if err != nil || !ok || unchanged.Harness != domain.HarnessClaudeCode || unchanged.Activity.State != domain.ActivityExited {
+	if err != nil || !ok || unchanged.Harness != domain.HarnessClaudeCode || unchanged.Activity.State != domain.ActivityExited ||
+		unchanged.HiddenAt == nil || !unchanged.HiddenAt.Equal(newerHiddenAt) {
 		t.Fatalf("stale activation partially mutated session: session=%+v ok=%v err=%v", unchanged, ok, err)
 	}
 	activation.SourceGenerationID = "source-switch-generation"
@@ -1571,7 +1598,7 @@ func TestAgentSwitchSourceStopAndTargetActivationAreAtomicAndNarrow(t *testing.T
 	if activated.Harness != domain.HarnessCodex || activated.Activity.State != domain.ActivityIdle ||
 		activated.Metadata.RuntimeHandleID != "target-handle" || activated.Metadata.RuntimeLaunchID != "target-generation" ||
 		activated.Metadata.AgentSessionID != target.NativeSessionID || activated.Metadata.AgentSessionIDLaunchID != "target-generation" ||
-		activated.Metadata.NativeTranscriptPath != target.TranscriptPath {
+		activated.Metadata.NativeTranscriptPath != target.TranscriptPath || activated.HiddenAt == nil || !activated.HiddenAt.Equal(newerHiddenAt) {
 		t.Fatalf("target owner projection = %+v", activated)
 	}
 	if !activated.FirstSignalAt.IsZero() {
@@ -1610,7 +1637,7 @@ func TestAgentSwitchSourceStopAndTargetActivationAreAtomicAndNarrow(t *testing.T
 		t.Fatalf("late source activity after target activation: applied=%v err=%v", applied, err)
 	}
 	stillActivated, ok, err := s.GetSession(ctx, session.ID)
-	if err != nil || !ok || stillActivated != activated {
+	if err != nil || !ok || !reflect.DeepEqual(stillActivated, activated) {
 		t.Fatalf("late source activity overwrote target owner: session=%+v ok=%v err=%v", stillActivated, ok, err)
 	}
 	finalSwitch, ok, err := s.GetAgentSwitch(ctx, sw.ID)

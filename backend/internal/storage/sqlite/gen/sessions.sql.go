@@ -79,6 +79,26 @@ func (q *Queries) ClaimChatControllerGeneration(ctx context.Context, arg ClaimCh
 	return result.RowsAffected()
 }
 
+const clearSessionHiddenIfUnchanged = `-- name: ClearSessionHiddenIfUnchanged :execrows
+UPDATE sessions SET hidden_at = NULL
+WHERE id = ?1 AND hidden_at IS ?2
+`
+
+type ClearSessionHiddenIfUnchangedParams struct {
+	ID               domain.SessionID
+	ExpectedHiddenAt sql.NullTime
+}
+
+// A successful activation may clear the state it observed, but must not erase a
+// newer user hide that raced with activation.
+func (q *Queries) ClearSessionHiddenIfUnchanged(ctx context.Context, arg ClearSessionHiddenIfUnchangedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, clearSessionHiddenIfUnchanged, arg.ID, arg.ExpectedHiddenAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const commitSessionControllerEpoch = `-- name: CommitSessionControllerEpoch :execrows
 UPDATE sessions
 SET session_mode = ?1,
@@ -136,7 +156,7 @@ const getSession = `-- name: GetSession :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -144,7 +164,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions WHERE id = ?
 `
 
@@ -168,6 +188,7 @@ type GetSessionRow struct {
 	CreatedAt                        time.Time
 	UpdatedAt                        time.Time
 	Revision                         int64
+	TerminalRevision                 int64
 	DisplayName                      string
 	FirstSignalAt                    sql.NullTime
 	PreviewURL                       string
@@ -205,6 +226,7 @@ type GetSessionRow struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	HiddenAt                         sql.NullTime
 }
 
 func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessionRow, error) {
@@ -230,6 +252,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.Revision,
+		&i.TerminalRevision,
 		&i.DisplayName,
 		&i.FirstSignalAt,
 		&i.PreviewURL,
@@ -267,6 +290,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.Effort,
 		&i.EffortResolved,
 		&i.ExecutionBaseSha,
+		&i.HiddenAt,
 	)
 	return i, err
 }
@@ -284,9 +308,9 @@ INSERT INTO sessions (
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
     session_mode, provider_conversation_id, controller_generation, model, session_permissions,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
-    effort, effort_resolved, execution_base_sha
+    effort, effort_resolved, execution_base_sha, hidden_at
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -346,6 +370,7 @@ type InsertSessionParams struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	HiddenAt                         sql.NullTime
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
@@ -405,6 +430,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.Effort,
 		arg.EffortResolved,
 		arg.ExecutionBaseSha,
+		arg.HiddenAt,
 	)
 	return err
 }
@@ -413,7 +439,7 @@ const listAllSessions = `-- name: ListAllSessions :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -421,7 +447,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions ORDER BY project_id, num
 `
 
@@ -445,6 +471,7 @@ type ListAllSessionsRow struct {
 	CreatedAt                        time.Time
 	UpdatedAt                        time.Time
 	Revision                         int64
+	TerminalRevision                 int64
 	DisplayName                      string
 	FirstSignalAt                    sql.NullTime
 	PreviewURL                       string
@@ -482,6 +509,7 @@ type ListAllSessionsRow struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	HiddenAt                         sql.NullTime
 }
 
 func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, error) {
@@ -513,6 +541,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.Revision,
+			&i.TerminalRevision,
 			&i.DisplayName,
 			&i.FirstSignalAt,
 			&i.PreviewURL,
@@ -550,6 +579,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.Effort,
 			&i.EffortResolved,
 			&i.ExecutionBaseSha,
+			&i.HiddenAt,
 		); err != nil {
 			return nil, err
 		}
@@ -568,7 +598,7 @@ const listSessionsByProject = `-- name: ListSessionsByProject :many
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
-    created_at, updated_at, revision, display_name, first_signal_at, preview_url,
+    created_at, updated_at, revision, terminal_revision, display_name, first_signal_at, preview_url,
     preview_revision, cleanup_generation, runtime_launch_id,
     workspace_repo_path, terminate_on_pr_merge, diff_base_sha, diff_base_ref,
     reviewer_harness, reviewer_agent_config, is_pinned, pinned_at,
@@ -576,7 +606,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -600,6 +630,7 @@ type ListSessionsByProjectRow struct {
 	CreatedAt                        time.Time
 	UpdatedAt                        time.Time
 	Revision                         int64
+	TerminalRevision                 int64
 	DisplayName                      string
 	FirstSignalAt                    sql.NullTime
 	PreviewURL                       string
@@ -637,6 +668,7 @@ type ListSessionsByProjectRow struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	HiddenAt                         sql.NullTime
 }
 
 func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.ProjectID) ([]ListSessionsByProjectRow, error) {
@@ -668,6 +700,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.Revision,
+			&i.TerminalRevision,
 			&i.DisplayName,
 			&i.FirstSignalAt,
 			&i.PreviewURL,
@@ -705,6 +738,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.Effort,
 			&i.EffortResolved,
 			&i.ExecutionBaseSha,
+			&i.HiddenAt,
 		); err != nil {
 			return nil, err
 		}
@@ -957,6 +991,25 @@ func (q *Queries) SetSessionAutoReview(ctx context.Context, arg SetSessionAutoRe
 	return result.RowsAffected()
 }
 
+const setSessionHidden = `-- name: SetSessionHidden :execrows
+UPDATE sessions SET hidden_at = ? WHERE id = ?
+`
+
+type SetSessionHiddenParams struct {
+	HiddenAt sql.NullTime
+	ID       domain.SessionID
+}
+
+// Presentation visibility is intentionally not session recency. The CDC trigger
+// still emits an invalidation for this narrow fact without moving archive order.
+func (q *Queries) SetSessionHidden(ctx context.Context, arg SetSessionHiddenParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setSessionHidden, arg.HiddenAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setSessionPinned = `-- name: SetSessionPinned :execrows
 UPDATE sessions SET is_pinned = ?, pinned_at = ?, updated_at = ? WHERE id = ?
 `
@@ -1163,6 +1216,8 @@ type UpdateSessionParams struct {
 	ID                               domain.SessionID
 }
 
+// hidden_at is intentionally omitted; visibility has its own narrow write so a
+// stale lifecycle read-modify-write cannot overwrite presentation state.
 func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) error {
 	_, err := q.db.ExecContext(ctx, updateSession,
 		arg.IssueID,

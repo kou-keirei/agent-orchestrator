@@ -19,7 +19,7 @@ export function ProjectBoardActions({ actions, placement, quiet = false, style }
 		openNewTask, openOrchestrator } = actions;
 	const header = placement === "header";
 	const busy = isSpawning || isProjectRestarting || isProvisioning;
-	const activity = orchestrator ? getAgentActivityView(orchestrator.activity, t).label : undefined;
+	const activity = orchestrator?.activity ? getAgentActivityView(orchestrator.activity, t).label : undefined;
 	const actionLabel = orchestrator ? t("shell.openOrchestrator") : t("shell.spawnOrchestrator");
 	const busyLabel = isProjectRestarting ? t("shell.restartingDots") : isProvisioning
 		? t("shell.provisioningDots", { defaultValue: "Setting up…" }) : isSpawning ? t("shell.spawningDots") : undefined;

@@ -912,6 +912,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{id}/orchestration-events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List daemon orchestration delivery state */
+        get: operations["listOrchestrationEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/projects/{id}/orchestration-events/{eventId}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Explicitly retry a dead-letter orchestration event */
+        post: operations["retryOrchestrationEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/projects/{id}/permissions": {
         parameters: {
             query?: never;
@@ -1674,6 +1708,24 @@ export interface paths {
         /** Exit the agent while preserving its AO session */
         post: operations["exitAgent"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sessions/{sessionId}/hide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Hide a session from default presentation lists */
+        post: operations["hideSession"];
+        /** Restore a session to default presentation lists */
+        delete: operations["unhideSession"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2668,6 +2720,34 @@ export interface components {
             ok: boolean;
             sessionId: string;
         };
+        ChatDispatchConformance: {
+            childResultValid: boolean;
+            configured: components["schemas"]["ChatDispatchEvidence"];
+            dispatched: components["schemas"]["ChatDispatchEvidence"];
+            effortOverride: boolean;
+            observedFirstTurn: components["schemas"]["ChatDispatchEvidence"];
+            providerSelected: components["schemas"]["ChatDispatchEvidence"];
+            reason?: string;
+            requested: components["schemas"]["ChatDispatchEvidence"];
+            status: string;
+            variant: components["schemas"]["ChatDispatchVariant"];
+        };
+        ChatDispatchEvidence: {
+            correlated: boolean;
+            effort?: string;
+            fresh: boolean;
+            model?: string;
+            provenance?: string;
+            providerConversationId?: string;
+            providerRejected: boolean;
+            providerTurnId?: string;
+            sessionId?: string;
+        };
+        ChatDispatchVariant: {
+            availability?: string;
+            provenance?: string;
+            value?: string;
+        };
         ClaimPRRequest: {
             allowTakeover?: null | boolean;
             pr: string;
@@ -2921,12 +3001,15 @@ export interface components {
             autoReviewEnabled: boolean;
             branch?: string;
             chatProviderPreserved: boolean;
+            continuationReadback: components["schemas"]["SessionContinuationReadback"];
             /** Format: date-time */
             createdAt: string;
             displayName?: string;
             /** @enum {string} */
             displayStatus: "Working" | "Blocked" | "Exited" | "No signal" | "Awaiting PR" | "Fixing CI failures" | "Addressing comments" | "Needs review" | "Review scheduled" | "Reviewing" | "Review pending" | "Draft" | "CI failing" | "Commented" | "Changes requested" | "Needs human review" | "Mergeable" | "Approved" | "Merged" | "Closed without merge" | "Terminated";
             harness?: string;
+            /** Format: date-time */
+            hiddenAt?: null | string;
             id: string;
             isPinned: boolean;
             isTerminated: boolean;
@@ -2971,34 +3054,6 @@ export interface components {
         };
         ControllersUpdateCloudOfferingRequest: {
             enabled: null | boolean;
-        };
-        ChatDispatchConformance: {
-            childResultValid: boolean;
-            configured: components["schemas"]["ChatDispatchEvidence"];
-            dispatched: components["schemas"]["ChatDispatchEvidence"];
-            effortOverride: boolean;
-            observedFirstTurn: components["schemas"]["ChatDispatchEvidence"];
-            providerSelected: components["schemas"]["ChatDispatchEvidence"];
-            reason?: string;
-            requested: components["schemas"]["ChatDispatchEvidence"];
-            status: string;
-            variant: components["schemas"]["ChatDispatchVariant"];
-        };
-        ChatDispatchEvidence: {
-            correlated: boolean;
-            effort?: string;
-            fresh: boolean;
-            model?: string;
-            providerConversationId?: string;
-            providerRejected: boolean;
-            providerTurnId?: string;
-            provenance?: string;
-            sessionId?: string;
-        };
-        ChatDispatchVariant: {
-            availability?: string;
-            provenance?: string;
-            value?: string;
         };
         ConversationAccountPayload: {
             authMode?: string;
@@ -3507,6 +3562,9 @@ export interface components {
             unreadCount: number;
             unresolvedCount: number;
         };
+        ListOrchestrationEventsResponse: {
+            events: components["schemas"]["OrchestrationEventResponse"][];
+        };
         ListProjectsResponse: {
             projects: components["schemas"]["ProjectSummary"][];
         };
@@ -3663,7 +3721,7 @@ export interface components {
             target: components["schemas"]["NotificationTarget"];
             title: string;
             /** @enum {string} */
-            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged";
+            type: "needs_input" | "ready_to_merge" | "pr_merged" | "pr_closed_unmerged" | "orchestration_attention";
         };
         NotificationTarget: {
             /** @enum {string} */
@@ -3682,6 +3740,29 @@ export interface components {
             sessionId?: string;
             /** @description Windows shell selector: auto, git-bash, pwsh, powershell, cmd, or a custom executable path. Ignored on macOS and Linux. */
             shell?: string;
+        };
+        OrchestrationEventResponse: {
+            /** Format: date-time */
+            acknowledgedAt?: null | string;
+            attemptCount: number;
+            /** Format: date-time */
+            attentionRequiredAt?: null | string;
+            destinationSessionId?: string;
+            /** Format: date-time */
+            enqueuedAt: string;
+            id: string;
+            kind: string;
+            lastError?: string;
+            /** Format: date-time */
+            leaseExpiresAt?: null | string;
+            /** Format: date-time */
+            nextAttemptAt: string;
+            projectId: string;
+            sourceRevision: string;
+            state: string;
+            /** Format: date-time */
+            submittedAt?: null | string;
+            workerId: string;
         };
         OrchestratorResponse: {
             id: string;
@@ -3866,6 +3947,9 @@ export interface components {
             session: components["schemas"]["ControllersSessionView"];
             sessionId: string;
         };
+        RetryOrchestrationEventResponse: {
+            retried: boolean;
+        };
         RetryTurnResponse: {
             providerTurnId?: string;
             /** @enum {string} */
@@ -3883,10 +3967,13 @@ export interface components {
             githubReviewId: string;
             harness: string;
             id: string;
+            launchId: string;
             prUrl: string;
+            provenance: components["schemas"]["ReviewerProvenance"];
             reviewId: string;
             sessionId: string;
             status: string;
+            targetBinding: components["schemas"]["ReviewTargetBinding"];
             targetSha: string;
             /** @enum {string} */
             triggerSource: "manual" | "auto";
@@ -3896,6 +3983,44 @@ export interface components {
             review: components["schemas"]["ReviewRun"];
             reviewerHandleId: string;
             reviews: components["schemas"]["ReviewRun"][];
+        };
+        ReviewTargetBinding: {
+            diffBaseRef?: string;
+            diffBaseSha?: string;
+            executionBaseSha: string;
+            indexStaged: boolean;
+            indexStagedKnown: boolean;
+            observationPhase: string;
+            /** Format: date-time */
+            observedAt: string;
+            observedBranch?: string;
+            observedHeadSha: string;
+            targetSha: string;
+            workspaceDirty: boolean;
+            workspaceDirtyKnown: boolean;
+            workspacePath: string;
+        };
+        ReviewerNativeEvidence: {
+            completionId?: string;
+            firstTurnId?: string;
+            /** Format: date-time */
+            observedAt?: string;
+            sessionId?: string;
+        };
+        ReviewerProvenance: {
+            aoResolved: components["schemas"]["ReviewerSettings"];
+            configured: components["schemas"]["ReviewerSettings"];
+            providerEffective: components["schemas"]["ReviewerSettings"];
+            providerNative: components["schemas"]["ReviewerNativeEvidence"];
+            requested: components["schemas"]["ReviewerSettings"];
+        };
+        ReviewerSettings: {
+            effort?: string;
+            harness?: string;
+            mode?: string;
+            model?: string;
+            observed: boolean;
+            permission?: string;
         };
         RoleOverride: {
             agent?: string;
@@ -3931,6 +4056,29 @@ export interface components {
             message: string;
             ok: boolean;
             sessionId: string;
+        };
+        SessionContinuationChat: {
+            available: boolean;
+            controllerGeneration: string;
+            providerConversationId: string;
+            reason: string;
+        };
+        SessionContinuationReadback: {
+            available: boolean;
+            chat: components["schemas"]["SessionContinuationChat"];
+            harness: string;
+            mode: string;
+            projectId: string;
+            reason: string;
+            sessionId: string;
+            tui: components["schemas"]["SessionContinuationTUI"];
+        };
+        SessionContinuationTUI: {
+            agentSessionId: string;
+            agentSessionIdLaunchId: string;
+            available: boolean;
+            reason: string;
+            runtimeLaunchId: string;
         };
         SessionInterfaceTransition: {
             /** Format: date-time */
@@ -4157,10 +4305,16 @@ export interface components {
         SetReviewActivityRequest: {
             /** @description Native reviewer session identifier used to resume its transcript. */
             agentSessionId?: string;
+            /** @description Provider-native completion identifier observed by AO. */
+            completionId?: string;
             /** @description AO hook sub-command that produced this signal. */
             event?: string;
+            /** @description Provider-native first-turn identifier observed by AO. */
+            firstTurnId?: string;
             /** @description AO process generation that produced the signal. */
             launchId?: string;
+            /** @description Exact review pass that produced the native evidence. */
+            runId?: string;
             /**
              * @description Reviewer activity state reported by a hook. Used for reviewer-pane live status, not worker session state.
              * @enum {string}
@@ -6983,7 +7137,18 @@ export interface operations {
     };
     listOrchestrators: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Project id filter. */
+                project?: string;
+                /** @description When true, return non-terminated sessions; when false, return terminated sessions. */
+                active?: null | boolean;
+                /** @description When true, return only orchestrator sessions. */
+                orchestratorOnly?: null | boolean;
+                /** @description When true, return only fresh non-terminated sessions. */
+                fresh?: null | boolean;
+                /** @description When true, include presentation-hidden sessions. */
+                includeHidden?: null | boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6997,6 +7162,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ListSessionsResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
                 };
             };
             /** @description Internal Server Error */
@@ -7468,6 +7642,109 @@ export interface operations {
             };
             /** @description Internal Server Error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    listOrchestrationEvents: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Project identifier (registry key). */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListOrchestrationEventsResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    retryOrchestrationEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project identifier (registry key). */
+                id: string;
+                eventId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryOrchestrationEventResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8051,6 +8328,8 @@ export interface operations {
                 orchestratorOnly?: null | boolean;
                 /** @description When true, return only fresh non-terminated sessions. */
                 fresh?: null | boolean;
+                /** @description When true, include presentation-hidden sessions. */
+                includeHidden?: null | boolean;
             };
             header?: never;
             path?: never;
@@ -10296,6 +10575,106 @@ export interface operations {
             };
             /** @description Conflict */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    hideSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    unhideSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

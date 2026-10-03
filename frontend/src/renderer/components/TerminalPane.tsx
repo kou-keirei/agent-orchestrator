@@ -292,7 +292,9 @@ export function TerminalCacheProvider({
 	daemonReady: boolean;
 	theme: Theme;
 }) {
-	const workspaceQuery = useWorkspaceQuery();
+	// Terminal ownership follows durable lifecycle state, not the visible board.
+	// A hidden active session must remain available for retained-terminal cleanup.
+	const workspaceQuery = useWorkspaceQuery({ includeHidden: true });
 	const shellTerminalsQuery = useShellTerminals();
 	const entriesRef = useRef(new Map<string, CachedTerminalEntry>());
 	const activeRef = useRef<ActiveTerminalEntry | null>(null);

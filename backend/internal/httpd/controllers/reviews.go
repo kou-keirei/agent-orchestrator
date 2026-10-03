@@ -135,7 +135,10 @@ func (c *ReviewsController) activity(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	agentSessionID := capActivityMeta(domain.SanitizeControlChars(strings.TrimSpace(in.AgentSessionID)))
-	if state == "" && agentSessionID == "" {
+	runID := capActivityMeta(domain.SanitizeControlChars(strings.TrimSpace(in.RunID)))
+	firstTurnID := capActivityMeta(domain.SanitizeControlChars(strings.TrimSpace(in.FirstTurnID)))
+	completionID := capActivityMeta(domain.SanitizeControlChars(strings.TrimSpace(in.CompletionID)))
+	if state == "" && agentSessionID == "" && runID == "" && firstTurnID == "" && completionID == "" {
 		envelope.WriteJSON(w, http.StatusOK, SetReviewActivityResponse{OK: true, ReviewSessionID: reviewSessionID})
 		return
 	}
@@ -144,6 +147,9 @@ func (c *ReviewsController) activity(w http.ResponseWriter, r *http.Request) {
 		State:          state,
 		AgentSessionID: agentSessionID,
 		LaunchID:       capActivityMeta(domain.SanitizeControlChars(strings.TrimSpace(in.LaunchID))),
+		RunID:          runID,
+		FirstTurnID:    firstTurnID,
+		CompletionID:   completionID,
 	}); err != nil {
 		if errors.Is(err, reviewsvc.ErrNotFound) {
 			envelope.WriteAPIError(w, r, http.StatusNotFound, "not_found", "REVIEW_NOT_FOUND", "Unknown review session", nil)

@@ -252,6 +252,47 @@ func (f *fakeStore) SetSessionPinned(_ context.Context, id domain.SessionID, isP
 	return true, nil
 }
 
+func (f *fakeStore) SetSessionHidden(_ context.Context, id domain.SessionID, hiddenAt *time.Time) (bool, error) {
+	r, ok := f.sessions[id]
+	if !ok {
+		return false, nil
+	}
+	r.HiddenAt = hiddenAt
+	f.sessions[id] = r
+	return true, nil
+}
+
+func TestSessionVisibilityIsPresentationOnly(t *testing.T) {
+	st := newFakeStore()
+	record := domain.SessionRecord{
+		ID: "mer-1", ProjectID: "mer", IsTerminated: false,
+		Activity: domain.Activity{State: domain.ActivityActive},
+		Metadata: domain.SessionMetadata{Branch: "feature/keep-me", WorkspacePath: "C:/worktree"},
+	}
+	st.sessions[record.ID] = record
+	svc := &Service{store: st, clock: func() time.Time { return time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC) }}
+
+	if _, err := svc.Hide(context.Background(), record.ID); err != nil {
+		t.Fatalf("Hide: %v", err)
+	}
+	got := st.sessions[record.ID]
+	if got.HiddenAt == nil || got.IsTerminated || got.Activity.State != domain.ActivityActive || got.Metadata.Branch != record.Metadata.Branch || got.Metadata.WorkspacePath != record.Metadata.WorkspacePath {
+		t.Fatalf("hide changed lifecycle/resource facts: %+v", got)
+	}
+	if list, err := svc.List(context.Background(), ListFilter{ProjectID: record.ProjectID}); err != nil || len(list) != 0 {
+		t.Fatalf("default list = %d, err=%v; want hidden session excluded", len(list), err)
+	}
+	if list, err := svc.List(context.Background(), ListFilter{ProjectID: record.ProjectID, IncludeHidden: true}); err != nil || len(list) != 1 || list[0].HiddenAt == nil {
+		t.Fatalf("include-hidden list = %+v, err=%v; want hidden session", list, err)
+	}
+	if _, err := svc.Unhide(context.Background(), record.ID); err != nil {
+		t.Fatalf("Unhide: %v", err)
+	}
+	if got := st.sessions[record.ID]; got.HiddenAt != nil || got.IsTerminated || got.Activity.State != domain.ActivityActive || got.Metadata.Branch != record.Metadata.Branch || got.Metadata.WorkspacePath != record.Metadata.WorkspacePath {
+		t.Fatalf("unhide changed lifecycle/resource facts: %+v", got)
+	}
+}
+
 func (f *fakeStore) SetSessionPreviewURL(_ context.Context, id domain.SessionID, previewURL string, updatedAt time.Time) (bool, error) {
 	r, ok := f.sessions[id]
 	if !ok {

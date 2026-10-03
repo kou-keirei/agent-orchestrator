@@ -99,6 +99,30 @@ export function reviewSessionRunAction(reviewStates: PRReviewState[], isTriggeri
 const MOCK_RUNNING_PR = 322;
 const MOCK_STALE_PR = 324;
 
+// Preview records carry no observed reviewer or checkout evidence.
+const MOCK_REVIEW_EVIDENCE: Pick<ReviewRunFacts, "launchId" | "provenance" | "targetBinding"> = {
+	launchId: "",
+	provenance: {
+		requested: { observed: false },
+		configured: { observed: false },
+		aoResolved: { observed: false },
+		providerEffective: { observed: false },
+		providerNative: {},
+	},
+	targetBinding: {
+		targetSha: "",
+		executionBaseSha: "",
+		workspacePath: "",
+		observedHeadSha: "",
+		workspaceDirty: false,
+		workspaceDirtyKnown: false,
+		indexStaged: false,
+		indexStagedKnown: false,
+		observationPhase: "",
+		observedAt: "0001-01-01T00:00:00Z",
+	},
+};
+
 function mockReviewsResponse(session: WorkspaceSession): ReviewsResponse {
 	const states: PRReviewState[] = sortedPRs(session).map((pr, index) => {
 		const targetSha = `demo${pr.number}${index}`;
@@ -106,6 +130,7 @@ function mockReviewsResponse(session: WorkspaceSession): ReviewsResponse {
 		const latestRun =
 			pr.review === "approved" || pr.review === "changes_requested"
 				? {
+						...MOCK_REVIEW_EVIDENCE,
 						autoInjectReview: session.autoInjectReview ?? true,
 						batchId: `demo-batch-${session.id}`,
 						body:
@@ -126,6 +151,7 @@ function mockReviewsResponse(session: WorkspaceSession): ReviewsResponse {
 					}
 				: undefined;
 	const run = (over: Record<string, unknown>) => ({
+		...MOCK_REVIEW_EVIDENCE,
 		autoInjectReview: session.autoInjectReview ?? true,
 		batchId: `demo-batch-${session.id}`,
 		body: "",
@@ -192,6 +218,7 @@ function mockReviewsResponse(session: WorkspaceSession): ReviewsResponse {
 	// on the same PR is the case the control exists for.
 	const runs: ReviewRunFacts[] = states.flatMap((state) => {
 		const base = {
+			...MOCK_REVIEW_EVIDENCE,
 			autoInjectReview: session.autoInjectReview ?? true,
 			batchId: `demo-batch-${session.id}`,
 			githubReviewId: "",

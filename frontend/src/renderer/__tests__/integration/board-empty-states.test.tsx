@@ -465,6 +465,20 @@ describe("project board with no sessions", () => {
 		expect(columnCount()).toBe(0);
 	});
 
+	it("opens a hidden active orchestrator instead of requesting a duplicate spawn", async () => {
+		respondWith([project], [{ ...orchestratorSession, hiddenAt: "2026-07-04T09:00:00Z" }]);
+		renderBoard(<SessionsBoard projectId="proj-1" />);
+
+		await screen.findByText("No worker sessions yet");
+		expect(screen.queryByText("No orchestrator is running for this project.")).not.toBeInTheDocument();
+		await userEvent.click(screen.getByRole("button", { name: "Open orchestrator" }));
+
+		expect(spawnOrchestratorMock).not.toHaveBeenCalled();
+		expect(navigateMock).toHaveBeenCalledWith(expect.objectContaining({
+			params: { projectId: "proj-1", sessionId: "proj-1-orchestrator" },
+		}));
+	});
+
 	it("surfaces the daemon error when spawning the orchestrator fails", async () => {
 		respondWith([project], []);
 		spawnOrchestratorMock.mockRejectedValue(new Error("branch is already checked out in another worktree"));

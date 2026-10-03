@@ -2,11 +2,17 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 func TestInsertReviewRunDuplicatePRSHAMapsToSentinel(t *testing.T) {
@@ -67,6 +73,392 @@ func TestInsertReviewRunDuplicatePRSHAMapsToSentinel(t *testing.T) {
 	}
 }
 
+func TestReviewRunEvidenceRoundTripsAndLegacyShapeRemainsUnknown(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-1", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("upsert review: %v", err)
+	}
+	want := domain.ReviewRun{
+		ID: "run-evidence", ReviewID: "rev-1", SessionID: rec.ID, Harness: domain.ReviewerClaudeCode,
+		PRURL: "https://example/pr/evidence", TargetSHA: "sha-evidence", LaunchID: "launch-evidence",
+		TargetBinding: domain.ReviewTargetBinding{TargetSHA: "sha-evidence", ExecutionBaseSHA: "base-evidence", WorkspacePath: "/ws/evidence", ObservedHeadSHA: "sha-evidence", WorkspaceDirtyKnown: true, IndexStagedKnown: true, ObservationPhase: "review_run_creation", ObservedAt: now},
+		Provenance:    domain.ReviewerProvenance{Requested: domain.ReviewerSettings{Harness: domain.ReviewerCodex, Observed: true}, ProviderEffective: domain.ReviewerSettings{Observed: false}},
+		Status:        domain.ReviewRunRunning, Verdict: domain.VerdictNone, CreatedAt: now,
+	}
+	if err := s.InsertReviewRun(ctx, want); err != nil {
+		t.Fatalf("insert evidence run: %v", err)
+	}
+	got, ok, err := s.GetReviewRun(ctx, want.ID)
+	if err != nil || !ok {
+		t.Fatalf("get evidence run: ok=%v err=%v", ok, err)
+	}
+	if got.TargetBinding != want.TargetBinding || got.Provenance.Requested != want.Provenance.Requested || got.LaunchID != want.LaunchID || got.Provenance.ProviderEffective.Observed {
+		t.Fatalf("round-tripped evidence = %+v", got)
+	}
+}
+
+func TestReviewerCleanupObligationRoundTripsAcrossReopenAndResolvesIdempotently(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx := context.Background()
+	s, err := sqlitetest.Open(dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Unix(123, 0).UTC()
+	want := domain.ReviewerCleanupObligation{
+		ID:             "cleanup-1",
+		SessionID:      "session-1",
+		ReviewID:       "review-1",
+		Harness:        domain.ReviewerClaudeCode,
+		HandleID:       "runtime-1",
+		LaunchID:       "launch-1",
+		AgentSessionID: "native-1",
+		Status:         domain.ReviewerCleanupUnresolved,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := s.InsertReviewerCleanupObligation(ctx, want); err != nil {
+		t.Fatalf("insert cleanup obligation: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close before restart: %v", err)
+	}
+	s, err = sqlite.OpenPreMigrated(dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	got, err := s.ListUnresolvedReviewerCleanupObligations(ctx, want.SessionID)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("list after reopen = %v, %v; want one obligation", got, err)
+	}
+	if got[0].ID != want.ID || got[0].HandleID != want.HandleID || got[0].LaunchID != want.LaunchID || got[0].Harness != want.Harness || got[0].Status != domain.ReviewerCleanupUnresolved {
+		t.Fatalf("reopened obligation = %+v, want exact unresolved identity", got[0])
+	}
+	if cleared, err := s.ResolveReviewerCleanupObligation(ctx, want.ID, now.Add(time.Second)); err != nil || !cleared {
+		t.Fatalf("resolve obligation = %v, %v; want true", cleared, err)
+	}
+	if cleared, err := s.ResolveReviewerCleanupObligation(ctx, want.ID, now.Add(2*time.Second)); err != nil || cleared {
+		t.Fatalf("repeat resolve = %v, %v; want idempotent false", cleared, err)
+	}
+	remaining, err := s.ListUnresolvedReviewerCleanupObligations(ctx, want.SessionID)
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("unresolved obligations after resolve = %v, %v; want none", remaining, err)
+	}
+}
+
+func TestResolveReviewRunCleanupMarkerTerminalizesAndIsIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-marker", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "runtime-marker", ReviewerLaunchID: "launch-marker", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("upsert review: %v", err)
+	}
+	marker := "[ao reviewer cleanup pending handle: runtime-marker generation: launch-marker]"
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-marker", ReviewID: "rev-marker", SessionID: rec.ID, Harness: domain.ReviewerClaudeCode, PRURL: "https://example/pr/marker", TargetSHA: "sha-marker", LaunchID: "launch-marker", Status: domain.ReviewRunFailed, Body: "cleanup uncertain\n" + marker, CreatedAt: now}); err != nil {
+		t.Fatalf("insert marker run: %v", err)
+	}
+	if cleared, err := s.ResolveReviewRunCleanupMarker(ctx, "run-marker", marker, "cleanup complete"); err != nil || !cleared {
+		t.Fatalf("resolve marker = %v, %v; want true", cleared, err)
+	}
+	got, ok, err := s.GetReviewRun(ctx, "run-marker")
+	if err != nil || !ok {
+		t.Fatalf("get marker run: ok=%v err=%v", ok, err)
+	}
+	if got.Status != domain.ReviewRunFailed || got.Body != "cleanup complete" {
+		t.Fatalf("resolved marker run = %+v", got)
+	}
+	if cleared, err := s.ResolveReviewRunCleanupMarker(ctx, "run-marker", marker, "should not rewrite"); err != nil || cleared {
+		t.Fatalf("repeat marker resolve = %v, %v; want idempotent false", cleared, err)
+	}
+}
+
+func TestAppendReviewRunNativeEvidenceAllowsOmittedIdsAndRejectsContradictions(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-append", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerCodex, ReviewerLaunchID: "launch-append", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("upsert review: %v", err)
+	}
+	if err := s.InsertReviewRun(ctx, domain.ReviewRun{ID: "run-append", ReviewID: "rev-append", SessionID: rec.ID, Harness: domain.ReviewerCodex, PRURL: "https://example/pr/append", TargetSHA: "sha-append", LaunchID: "launch-append", Status: domain.ReviewRunRunning, CreatedAt: now}); err != nil {
+		t.Fatalf("insert review run: %v", err)
+	}
+	if updated, err := s.AppendReviewRunNativeEvidence(ctx, "run-append", "launch-append", string(rec.ID), "native-append", "turn-append", "", now); err != nil || !updated {
+		t.Fatalf("first native append: updated=%v err=%v", updated, err)
+	}
+	if updated, err := s.AppendReviewRunNativeEvidence(ctx, "run-append", "launch-append", string(rec.ID), "native-append", "turn-append", "", now.Add(time.Second)); err != nil || !updated {
+		t.Fatalf("equal repeated native append: updated=%v err=%v", updated, err)
+	}
+	if updated, err := s.AppendReviewRunNativeEvidence(ctx, "run-append", "launch-append", string(rec.ID), "", "", "", now.Add(2*time.Second)); err != nil || updated {
+		t.Fatalf("omitted native ids: updated=%v err=%v, want no-claim", updated, err)
+	}
+	if updated, err := s.AppendReviewRunNativeEvidence(ctx, "run-append", "launch-append", string(rec.ID), "native-append", "", "turn-append", now.Add(3*time.Second)); err != nil || !updated {
+		t.Fatalf("equal repeated completion append: updated=%v err=%v", updated, err)
+	}
+	if updated, err := s.AppendReviewRunNativeEvidence(ctx, "run-append", "launch-append", string(rec.ID), "native-other", "different-turn", "", now.Add(4*time.Second)); err == nil {
+		t.Fatalf("contradictory append updated=%v err=%v, want fail-closed error", updated, err)
+	} else if updated {
+		t.Fatal("contradictory native evidence was appended")
+	}
+	got, ok, err := s.GetReviewRun(ctx, "run-append")
+	if err != nil || !ok {
+		t.Fatalf("get appended run: ok=%v err=%v", ok, err)
+	}
+	if got.Provenance.ProviderNative.SessionID != "native-append" || got.Provenance.ProviderNative.FirstTurnID != "turn-append" || got.Provenance.ProviderNative.CompletionID != "turn-append" {
+		t.Fatalf("native evidence = %+v", got.Provenance.ProviderNative)
+	}
+	review, ok, err := s.GetReviewByID(ctx, "rev-append")
+	if err != nil || !ok {
+		t.Fatalf("get appended review: ok=%v err=%v", ok, err)
+	}
+	if review.AgentSessionID != "native-append" {
+		t.Fatalf("parent review native session = %q, want unchanged native-append", review.AgentSessionID)
+	}
+}
+
+func TestAcceptReviewerReplacementCommitsAuthorityAndPredecessorAtomically(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	incumbent := domain.Review{
+		ID: "rev-replace", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode,
+		ReviewerHandleID: "review-old", AgentSessionID: "native-old", ReviewerLaunchID: "launch-old", ReviewerActivityState: domain.ActivityActive,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.UpsertReview(ctx, incumbent); err != nil {
+		t.Fatalf("upsert incumbent: %v", err)
+	}
+	predecessor := domain.ReviewRun{
+		ID: "run-old", ReviewID: incumbent.ID, SessionID: rec.ID, Harness: domain.ReviewerClaudeCode,
+		TriggerSource: domain.ReviewTriggerManual,
+		PRURL:         "https://example/pr/replacement", TargetSHA: "sha-replacement", LaunchID: incumbent.ReviewerLaunchID,
+		TargetBinding: domain.ReviewTargetBinding{TargetSHA: "sha-replacement", ExecutionBaseSHA: "base", WorkspacePath: "/ws/mer", ObservedHeadSHA: "sha-replacement", ObservationPhase: "trigger", ObservedAt: now},
+		Provenance:    domain.ReviewerProvenance{AOResolved: domain.ReviewerSettings{Harness: domain.ReviewerClaudeCode, Model: "old", Observed: true}},
+		Status:        domain.ReviewRunRunning, Verdict: domain.VerdictNone, CreatedAt: now, AutoInjectReview: true,
+	}
+	if err := s.InsertReviewRun(ctx, predecessor); err != nil {
+		t.Fatalf("insert predecessor: %v", err)
+	}
+	replacement := incumbent
+	replacement.ReviewerHandleID = "review-new"
+	replacement.AgentSessionID = ""
+	replacement.ReviewerLaunchID = "launch-new"
+	replacement.UpdatedAt = now.Add(time.Second)
+	cleanup := domain.ReviewerCleanupObligation{
+		ID: "cleanup-retired", SessionID: rec.ID, ReviewID: incumbent.ID,
+		Harness: incumbent.Harness, HandleID: incumbent.ReviewerHandleID,
+		LaunchID: incumbent.ReviewerLaunchID, AgentSessionID: incumbent.AgentSessionID,
+		Status: domain.ReviewerCleanupUnresolved, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.AcceptReviewerReplacement(ctx, incumbent, replacement, []domain.ReviewRun{predecessor}, true, cleanup); err != nil {
+		t.Fatalf("accept replacement: %v", err)
+	}
+	gotReview, ok, err := s.GetReviewByID(ctx, incumbent.ID)
+	if err != nil || !ok {
+		t.Fatalf("get replacement review: ok=%v err=%v", ok, err)
+	}
+	if gotReview.ReviewerHandleID != "review-new" || gotReview.AgentSessionID != "" || gotReview.ReviewerLaunchID != "launch-new" || gotReview.ReviewerActivityState != domain.ActivityActive {
+		t.Fatalf("replacement review = %+v", gotReview)
+	}
+	gotRun, ok, err := s.GetReviewRun(ctx, predecessor.ID)
+	if err != nil || !ok {
+		t.Fatalf("get predecessor: ok=%v err=%v", ok, err)
+	}
+	if gotRun.Status != domain.ReviewRunCancelled || gotRun.LaunchID != predecessor.LaunchID || gotRun.TargetBinding != predecessor.TargetBinding || gotRun.Provenance != predecessor.Provenance {
+		t.Fatalf("predecessor after replacement = %+v", gotRun)
+	}
+	pending, err := s.ListUnresolvedReviewerCleanupObligations(ctx, rec.ID)
+	if err != nil || len(pending) != 1 || pending[0] != cleanup {
+		t.Fatalf("retired identity after acceptance = %+v, %v", pending, err)
+	}
+}
+
+func TestAcceptReviewerReplacementRejectsStalePredecessorWithoutPartialAuthority(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	incumbent := domain.Review{ID: "rev-stale", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "review-old", AgentSessionID: "native-old", ReviewerLaunchID: "launch-old", ReviewerActivityState: domain.ActivityActive, CreatedAt: now, UpdatedAt: now}
+	if err := s.UpsertReview(ctx, incumbent); err != nil {
+		t.Fatalf("upsert incumbent: %v", err)
+	}
+	predecessor := domain.ReviewRun{ID: "run-stale", ReviewID: incumbent.ID, SessionID: rec.ID, Harness: domain.ReviewerClaudeCode, PRURL: "https://example/pr/stale", TargetSHA: "sha-stale", LaunchID: "launch-old", Status: domain.ReviewRunRunning, Verdict: domain.VerdictNone, CreatedAt: now}
+	if err := s.InsertReviewRun(ctx, predecessor); err != nil {
+		t.Fatalf("insert predecessor: %v", err)
+	}
+	stale := predecessor
+	stale.LaunchID = "different-launch"
+	replacement := incumbent
+	replacement.ReviewerHandleID = "review-new"
+	replacement.ReviewerLaunchID = "launch-new"
+	cleanup := domain.ReviewerCleanupObligation{
+		ID: "cleanup-retired", SessionID: rec.ID, ReviewID: incumbent.ID,
+		Harness: incumbent.Harness, HandleID: incumbent.ReviewerHandleID,
+		LaunchID: incumbent.ReviewerLaunchID, AgentSessionID: incumbent.AgentSessionID,
+		Status: domain.ReviewerCleanupUnresolved, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.AcceptReviewerReplacement(ctx, incumbent, replacement, []domain.ReviewRun{stale}, false, cleanup); err == nil {
+		t.Fatal("stale predecessor was accepted")
+	}
+	gotReview, ok, err := s.GetReviewByID(ctx, incumbent.ID)
+	if err != nil || !ok {
+		t.Fatalf("get incumbent: ok=%v err=%v", ok, err)
+	}
+	if gotReview.ReviewerHandleID != incumbent.ReviewerHandleID || gotReview.AgentSessionID != incumbent.AgentSessionID || gotReview.ReviewerLaunchID != incumbent.ReviewerLaunchID || gotReview.ReviewerActivityState != incumbent.ReviewerActivityState {
+		t.Fatalf("incumbent after rejected replacement = %+v", gotReview)
+	}
+	gotRun, ok, err := s.GetReviewRun(ctx, predecessor.ID)
+	if err != nil || !ok {
+		t.Fatalf("get predecessor after rejection: ok=%v err=%v", ok, err)
+	}
+	if gotRun.Status != domain.ReviewRunRunning {
+		t.Fatalf("predecessor after rejected replacement = %+v, want running", gotRun)
+	}
+	pending, err := s.ListUnresolvedReviewerCleanupObligations(ctx, rec.ID)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("rejected acceptance left cleanup = %+v, %v", pending, err)
+	}
+}
+
+func TestAcceptReviewerReplacementRetiredCleanupRefusalPreservesIncumbentSQLite(t *testing.T) {
+	for _, fault := range []string{"missing", "foreign generation", "foreign handle", "foreign session", "foreign review", "foreign harness", "foreign native session", "conflicting id", "resolved id", "insert refusal", "post-insert refusal", "exact duplicate"} {
+		t.Run(fault, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s, err := sqlitetest.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			seedProject(t, s, "mer")
+			rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Unix(123, 0).UTC()
+			incumbent := domain.Review{ID: "review-old", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode, ReviewerHandleID: "ptyhost-v1:review-old", ReviewerLaunchID: "old-generation", AgentSessionID: "native-old", CreatedAt: now, UpdatedAt: now}
+			if err := s.UpsertReview(ctx, incumbent); err != nil {
+				t.Fatal(err)
+			}
+			predecessor := domain.ReviewRun{ID: "run-old", ReviewID: incumbent.ID, SessionID: rec.ID, Harness: incumbent.Harness, TriggerSource: domain.ReviewTriggerManual, PRURL: "https://example/pr/cleanup", TargetSHA: "sha", LaunchID: incumbent.ReviewerLaunchID, Status: domain.ReviewRunRunning, CreatedAt: now}
+			if err := s.InsertReviewRun(ctx, predecessor); err != nil {
+				t.Fatal(err)
+			}
+			replacement := incumbent
+			replacement.ReviewerHandleID, replacement.ReviewerLaunchID = "ptyhost-v1:review-new", "new-generation"
+			cleanup := domain.ReviewerCleanupObligation{ID: "cleanup-old", SessionID: rec.ID, ReviewID: incumbent.ID, Harness: incumbent.Harness, HandleID: incumbent.ReviewerHandleID, LaunchID: incumbent.ReviewerLaunchID, AgentSessionID: incumbent.AgentSessionID, Status: domain.ReviewerCleanupUnresolved, CreatedAt: now, UpdatedAt: now}
+			existingCount := 0
+			switch fault {
+			case "missing":
+				cleanup = domain.ReviewerCleanupObligation{}
+			case "foreign generation":
+				cleanup.LaunchID = "foreign"
+			case "foreign handle":
+				cleanup.HandleID = "foreign"
+			case "foreign session":
+				cleanup.SessionID = "foreign"
+			case "foreign review":
+				cleanup.ReviewID = "foreign"
+			case "foreign harness":
+				cleanup.Harness = domain.ReviewerCodex
+			case "foreign native session":
+				cleanup.AgentSessionID = "foreign"
+			case "conflicting id", "resolved id", "exact duplicate":
+				existing := cleanup
+				if fault == "conflicting id" {
+					existing.HandleID = "foreign"
+				}
+				if err := s.InsertReviewerCleanupObligation(ctx, existing); err != nil {
+					t.Fatal(err)
+				}
+				existingCount = 1
+				if fault == "resolved id" {
+					if ok, err := s.ResolveReviewerCleanupObligation(ctx, cleanup.ID, now); err != nil || !ok {
+						t.Fatalf("resolve seed: %t, %v", ok, err)
+					}
+					existingCount = 0
+				}
+			case "insert refusal", "post-insert refusal":
+				file := url.URL{Path: filepath.Join(dataDir, "ao.db")}
+				db, err := sql.Open("sqlite", "file:"+file.EscapedPath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				statement := "CREATE TRIGGER refuse_cleanup BEFORE INSERT ON reviewer_cleanup_obligation BEGIN SELECT RAISE(ABORT, 'injected atomic cleanup refusal'); END"
+				if fault == "post-insert refusal" {
+					statement = "CREATE TRIGGER refuse_replacement BEFORE UPDATE ON review BEGIN SELECT RAISE(ABORT, 'injected atomic authority refusal'); END"
+				}
+				if _, err := db.ExecContext(ctx, statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			acceptErr := s.AcceptReviewerReplacement(ctx, incumbent, replacement, []domain.ReviewRun{predecessor}, false, cleanup)
+			if fault == "exact duplicate" {
+				if acceptErr != nil {
+					t.Fatalf("exact duplicate rejected: %v", acceptErr)
+				}
+			} else if acceptErr == nil {
+				t.Fatal("replacement accepted without durable exact unresolved cleanup")
+			} else if strings.Contains(fault, "refusal") && !strings.Contains(acceptErr.Error(), "injected atomic") {
+				t.Fatalf("did not exercise SQLite refusal: %v", acceptErr)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = sqlite.OpenPreMigrated(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, found, err := s.GetReviewByID(ctx, incumbent.ID)
+			want := incumbent
+			wantStatus := domain.ReviewRunRunning
+			if fault == "exact duplicate" {
+				want, wantStatus = replacement, domain.ReviewRunCancelled
+			}
+			if err != nil || !found || current.ReviewerHandleID != want.ReviewerHandleID || current.ReviewerLaunchID != want.ReviewerLaunchID || current.AgentSessionID != want.AgentSessionID {
+				t.Fatalf("authority after reopen = %+v, %t, %v", current, found, err)
+			}
+			fresh, found, err := s.GetReviewRun(ctx, predecessor.ID)
+			if err != nil || !found || fresh.Status != wantStatus {
+				t.Fatalf("predecessor after reopen = %+v, %t, %v", fresh, found, err)
+			}
+			pending, err := s.ListUnresolvedReviewerCleanupObligations(ctx, rec.ID)
+			if err != nil || len(pending) != existingCount {
+				t.Fatalf("cleanup after acceptance/reopen = %+v, %v", pending, err)
+			}
+			t.Logf("fault=%s acceptance=%v authority=%s/%s predecessor=%s pending=%d", fault, acceptErr, current.ReviewerHandleID, current.ReviewerLaunchID, fresh.Status, len(pending))
+		})
+	}
+}
+
 // Harness is part of the idempotency key, so a different reviewer on the same
 // commit is a second opinion rather than a duplicate. Without this the reviewer
 // picker is inert on an already-reviewed commit.
@@ -105,6 +497,32 @@ func TestInsertReviewRunAllowsADifferentHarnessForTheSameCommit(t *testing.T) {
 	same.ID = "run-same-harness"
 	if err := s.InsertReviewRun(ctx, same); !errors.Is(err, domain.ErrDuplicateReviewRun) {
 		t.Fatalf("same harness duplicate err = %v, want ErrDuplicateReviewRun", err)
+	}
+}
+
+func TestInsertReviewRunAllowsConfigOnlySecondOpinionForSameHarness(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	rec, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.UpsertReview(ctx, domain.Review{ID: "rev-config", SessionID: rec.ID, ProjectID: rec.ProjectID, Harness: domain.ReviewerClaudeCode, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("upsert review: %v", err)
+	}
+	base := domain.ReviewRun{ID: "run-config-1", ReviewID: "rev-config", SessionID: rec.ID, Harness: domain.ReviewerClaudeCode, PRURL: "https://example/pr/config", TargetSHA: "sha-config", LaunchID: "launch-config-1", Status: domain.ReviewRunComplete, Verdict: domain.VerdictApproved, CreatedAt: now, Provenance: domain.ReviewerProvenance{AOResolved: domain.ReviewerSettings{Harness: domain.ReviewerClaudeCode, Model: "claude", Mode: "balanced", Observed: true}}}
+	if err := s.InsertReviewRun(ctx, base); err != nil {
+		t.Fatalf("insert first config opinion: %v", err)
+	}
+	second := base
+	second.ID = "run-config-2"
+	second.LaunchID = "launch-config-2"
+	second.CreatedAt = now.Add(time.Second)
+	second.Provenance.AOResolved.Mode = "thorough"
+	if err := s.InsertReviewRun(ctx, second); err != nil {
+		t.Fatalf("insert distinct config opinion: %v", err)
 	}
 }
 

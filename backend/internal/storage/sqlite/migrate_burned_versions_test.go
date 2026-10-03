@@ -154,6 +154,13 @@ var shippedMigrations = map[int64]string{
 	147: "0147_native_history_provenance.sql",
 	148: "0148_session_effort.sql",
 	149: "0149_session_execution_base.sql",
+	150: "0150_session_hidden.sql",
+	151: "0151_orchestration_event_outbox.sql",
+	152: "0152_orchestration_attention_notifications.sql",
+	153: "0153_session_terminal_revision.sql",
+	154: "0154_review_run_evidence.sql",
+	155: "0155_review_run_second_opinion_uniqueness.sql",
+	156: "0156_reviewer_cleanup_obligation.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

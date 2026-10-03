@@ -29,6 +29,11 @@ import (
 // before it reaches the loopback URL keeps it from steering the request.
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// reviewTaskRunPattern extracts the immutable run id from an AO task prompt
+// reference. Each queued task gets its own prompt file, so this is exact to the
+// prompt that caused the native hook rather than a mutable session-wide file.
+var reviewTaskRunPattern = regexp.MustCompile(`(?i)[\\/]requests[\\/][A-Za-z0-9_-]+[\\/]([A-Za-z0-9_-]+)[\\/]task\.md`)
+
 const (
 	// hooksLogName is the file under AO_DATA_DIR where hook delivery failures
 	// are appended. Agent hook runners swallow stderr, so without a durable
@@ -73,13 +78,17 @@ type usageHookMetadata struct {
 }
 
 // setReviewActivityAPIRequest mirrors POST /api/v1/reviews/{id}/activity.
-// Reviewer hooks only persist reviewer-owned restore metadata for now; they do
-// not feed worker lifecycle/tool-flight state.
+// Reviewer hooks persist reviewer-owned restore metadata and provider-native
+// evidence for one launch-fenced review pass; they do not feed worker
+// lifecycle/tool-flight state.
 type setReviewActivityAPIRequest struct {
 	State          string `json:"state,omitempty"`
 	Event          string `json:"event,omitempty"`
 	AgentSessionID string `json:"agentSessionId,omitempty"`
 	LaunchID       string `json:"launchId,omitempty"`
+	RunID          string `json:"runId,omitempty"`
+	FirstTurnID    string `json:"firstTurnId,omitempty"`
+	CompletionID   string `json:"completionId,omitempty"`
 }
 
 // maxActivityMetaLen caps the correlation fields lifted from a native hook
@@ -158,6 +167,24 @@ func hookLaunchID(payload []byte) string {
 		return ""
 	}
 	return id
+}
+
+func hookReviewRunID(payload []byte) string {
+	var p struct {
+		Prompt      string `json:"prompt"`
+		PromptCamel string `json:"userPrompt"`
+		UserPrompt  string `json:"user_prompt"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	for _, prompt := range []string{p.Prompt, p.PromptCamel, p.UserPrompt} {
+		match := reviewTaskRunPattern.FindStringSubmatch(prompt)
+		if len(match) == 2 && sessionIDPattern.MatchString(match[1]) {
+			return match[1]
+		}
+	}
+	return ""
 }
 
 // hookUsageMetadata extracts provider-native usage metadata. It deliberately
@@ -445,7 +472,7 @@ func (c *commandContext) runHook(ctx context.Context, agent, event string) error
 	}
 	conversation := hookConversationSnapshot{}
 	switch domain.AgentHarness(agent) {
-	case domain.HarnessClaudeCode, domain.HarnessCodex, domain.HarnessContinue:
+	case domain.HarnessClaudeCode, domain.HarnessCodex, domain.HarnessContinue, domain.HarnessPi:
 		conversation = hookConversationFacts(domain.AgentHarness(agent), event, payload)
 	}
 	path := "sessions/" + url.PathEscape(sessionID) + "/activity"
@@ -580,11 +607,22 @@ func (c *commandContext) runReviewHook(ctx context.Context, agent, event, review
 	if launchID == "" {
 		launchID = validLaunchID(hookLaunchID(payload))
 	}
+	runID := hookReviewRunID(payload)
+	conversation := hookConversationFacts(domain.AgentHarness(agent), event, payload)
 	path := "reviews/" + url.PathEscape(reviewSessionID) + "/activity"
 	req := setReviewActivityAPIRequest{
 		Event:          event,
 		AgentSessionID: agentSessionID,
 		LaunchID:       launchID,
+		RunID:          runID,
+	}
+	if domain.AgentHarness(agent) == domain.HarnessCodex {
+		switch event {
+		case "user-prompt-submit":
+			req.FirstTurnID = conversation.ProviderTurnID
+		case "stop":
+			req.CompletionID = conversation.ProviderTurnID
+		}
 	}
 	if hasActivity {
 		req.State = string(state)

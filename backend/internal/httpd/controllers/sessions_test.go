@@ -210,6 +210,9 @@ func (f *fakeSessionService) List(_ context.Context, filter sessionsvc.ListFilte
 		if filter.OrchestratorOnly && s.Kind != domain.KindOrchestrator {
 			continue
 		}
+		if s.HiddenAt != nil && !filter.IncludeHidden {
+			continue
+		}
 		out = append(out, s)
 	}
 	return out, nil
@@ -316,6 +319,27 @@ func (f *fakeSessionService) Unpin(_ context.Context, id domain.SessionID) (doma
 	}
 	s.IsPinned = false
 	s.PinnedAt = nil
+	f.sessions[id] = s
+	return s, nil
+}
+
+func (f *fakeSessionService) Hide(_ context.Context, id domain.SessionID) (domain.Session, error) {
+	s, ok := f.sessions[id]
+	if !ok {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	now := time.Now().UTC()
+	s.HiddenAt = &now
+	f.sessions[id] = s
+	return s, nil
+}
+
+func (f *fakeSessionService) Unhide(_ context.Context, id domain.SessionID) (domain.Session, error) {
+	s, ok := f.sessions[id]
+	if !ok {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	s.HiddenAt = nil
 	f.sessions[id] = s
 	return s, nil
 }
@@ -1386,6 +1410,30 @@ func TestSessionsAPI_ListSpawnGetAndActions(t *testing.T) {
 	body, status, _ = doRequest(t, srv, "POST", "/api/v1/orchestrators", `{"projectId":"ao"}`)
 	if status != http.StatusCreated {
 		t.Fatalf("orchestrator = %d, want 201; body=%s", status, body)
+	}
+}
+
+func TestSessionsAPI_HideAndUnhideArePresentationOnly(t *testing.T) {
+	svc := newFakeSessionService()
+	srv := newSessionTestServer(t, svc)
+
+	body, status, _ := doRequest(t, srv, http.MethodPost, "/api/v1/sessions/ao-1/hide", "")
+	if status != http.StatusOK {
+		t.Fatalf("hide = %d, want 200; body=%s", status, body)
+	}
+	if svc.sessions["ao-1"].HiddenAt == nil || svc.sessions["ao-1"].IsTerminated {
+		t.Fatalf("hide changed unexpected session facts: %+v", svc.sessions["ao-1"])
+	}
+	if !strings.Contains(string(body), `"hiddenAt"`) {
+		t.Fatalf("hide response omitted hiddenAt: %s", body)
+	}
+
+	body, status, _ = doRequest(t, srv, http.MethodDelete, "/api/v1/sessions/ao-1/hide", "")
+	if status != http.StatusOK {
+		t.Fatalf("unhide = %d, want 200; body=%s", status, body)
+	}
+	if svc.sessions["ao-1"].HiddenAt != nil || svc.sessions["ao-1"].IsTerminated {
+		t.Fatalf("unhide changed unexpected session facts: %+v", svc.sessions["ao-1"])
 	}
 }
 
@@ -2890,6 +2938,15 @@ func TestSessionsAPI_ListOrchestratorsOnly(t *testing.T) {
 		},
 		Status: domain.StatusIdle,
 	}
+	hiddenAt := now.Add(-time.Hour)
+	svc.sessions["hidden-orch"] = domain.Session{
+		SessionRecord: domain.SessionRecord{
+			ID: "hidden-orch", ProjectID: "ao", Kind: domain.KindOrchestrator,
+			HiddenAt: &hiddenAt, Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		Status: domain.StatusIdle,
+	}
 	srv := newSessionTestServer(t, svc)
 
 	body, status, _ := doRequest(t, srv, "GET", "/api/v1/orchestrators", "")
@@ -2900,8 +2957,8 @@ func TestSessionsAPI_ListOrchestratorsOnly(t *testing.T) {
 		Sessions []sessionBody `json:"sessions"`
 	}
 	mustJSON(t, body, &list)
-	if len(list.Sessions) != 2 {
-		t.Fatalf("len(orchestrators) = %d, want 2; body=%s", len(list.Sessions), body)
+	if len(list.Sessions) != 3 {
+		t.Fatalf("len(orchestrators) = %d, want 3 including hidden history; body=%s", len(list.Sessions), body)
 	}
 	got := map[string]string{}
 	for _, sess := range list.Sessions {
@@ -2910,9 +2967,17 @@ func TestSessionsAPI_ListOrchestratorsOnly(t *testing.T) {
 	if got["ao-orch"] != string(domain.KindOrchestrator) || got["other-orch"] != string(domain.KindOrchestrator) {
 		t.Fatalf("missing orchestrators: %#v", got)
 	}
+	if got["hidden-orch"] != string(domain.KindOrchestrator) {
+		t.Fatalf("hidden orchestrator missing from explicit history list: %#v", got)
+	}
 	if _, ok := got["ao-1"]; ok {
 		t.Fatalf("worker session leaked into orchestrator list: %#v", got)
 	}
+
+	body, status, _ = doRequest(t, srv, "GET", "/api/v1/orchestrators?includeHidden=not-a-boolean", "")
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_QUERY")
+	body, status, _ = doRequest(t, srv, "GET", "/api/v1/orchestrators?includeHidden=", "")
+	assertErrorCode(t, body, status, http.StatusBadRequest, "INVALID_QUERY")
 }
 
 func TestSessionsAPI_SendValidation(t *testing.T) {
@@ -3206,6 +3271,246 @@ type sessionBody struct {
 	KanbanColumn     string `json:"kanbanColumn"`
 	DisplayStatus    string `json:"displayStatus"`
 	TerminalHandleID string `json:"terminalHandleId"`
+}
+
+func TestSessionsAPI_ContinuationReadbackUsesAuthoritativeFactsAndFailsClosed(t *testing.T) {
+	svc := newFakeSessionService()
+	session := svc.sessions["ao-1"]
+	session.Harness = domain.HarnessCodex
+	session.Mode = domain.SessionModeChat
+	session.Metadata.ProviderConversationID = "provider-thread-1"
+	session.Metadata.ControllerGeneration = "controller-generation-1"
+	svc.sessions[session.ID] = session
+	srv := newSessionTestServer(t, svc)
+
+	var body struct {
+		Session struct {
+			Continuation struct {
+				SessionID string `json:"sessionId"`
+				ProjectID string `json:"projectId"`
+				Harness   string `json:"harness"`
+				Mode      string `json:"mode"`
+				Available bool   `json:"available"`
+				Reason    string `json:"reason"`
+				Chat      struct {
+					Available              bool   `json:"available"`
+					Reason                 string `json:"reason"`
+					ProviderConversationID string `json:"providerConversationId"`
+					ControllerGeneration   string `json:"controllerGeneration"`
+				} `json:"chat"`
+				TUI struct {
+					Available              bool   `json:"available"`
+					Reason                 string `json:"reason"`
+					AgentSessionID         string `json:"agentSessionId"`
+					RuntimeLaunchID        string `json:"runtimeLaunchId"`
+					AgentSessionIDLaunchID string `json:"agentSessionIdLaunchId"`
+				} `json:"tui"`
+			} `json:"continuationReadback"`
+		} `json:"session"`
+	}
+
+	read := func(t *testing.T) {
+		t.Helper()
+		raw, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1", "")
+		if status != http.StatusOK {
+			t.Fatalf("GET session = %d, want 200; body=%s", status, raw)
+		}
+		mustJSON(t, raw, &body)
+	}
+
+	read(t)
+	got := body.Session.Continuation
+	if got.SessionID != "ao-1" || got.ProjectID != "ao" || got.Harness != "codex" || got.Mode != "chat" ||
+		!got.Available || got.Reason != "available" || !got.Chat.Available || got.Chat.Reason != "available" ||
+		got.Chat.ProviderConversationID != "provider-thread-1" || got.Chat.ControllerGeneration != "controller-generation-1" {
+		t.Fatalf("Chat continuation readback = %+v", got)
+	}
+	if got.TUI.Available || got.TUI.Reason != "mode_not_applicable" {
+		t.Fatalf("inactive TUI continuation readback = %+v", got.TUI)
+	}
+	for _, state := range []struct {
+		activity domain.ActivityState
+		status   domain.SessionStatus
+	}{
+		{activity: domain.ActivityActive, status: domain.StatusWorking},
+		{activity: domain.ActivityIdle, status: domain.StatusIdle},
+		{activity: domain.ActivityExited, status: domain.StatusExited},
+	} {
+		session.Activity.State = state.activity
+		session.Status = state.status
+		svc.sessions[session.ID] = session
+		read(t)
+		got = body.Session.Continuation
+		if !got.Available || got.Chat.ProviderConversationID != "provider-thread-1" || got.Chat.ControllerGeneration != "controller-generation-1" {
+			t.Fatalf("continuation readback for %s = %+v", state.activity, got)
+		}
+	}
+
+	session.Mode = domain.SessionModeTUI
+	session.Metadata.ProviderConversationID = ""
+	session.Metadata.ControllerGeneration = ""
+	session.Metadata.AgentSessionID = "agent-session-1"
+	session.Metadata.RuntimeLaunchID = "runtime-launch-1"
+	session.Metadata.AgentSessionIDLaunchID = "runtime-launch-1"
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Mode != "tui" || !got.Available || !got.TUI.Available || got.TUI.Reason != "available" ||
+		got.TUI.AgentSessionID != "agent-session-1" || got.TUI.RuntimeLaunchID != "runtime-launch-1" ||
+		got.TUI.AgentSessionIDLaunchID != "runtime-launch-1" {
+		t.Fatalf("TUI continuation readback = %+v", got)
+	}
+	if got.Chat.Available || got.Chat.Reason != "mode_not_applicable" {
+		t.Fatalf("inactive Chat continuation readback = %+v", got.Chat)
+	}
+
+	session.Metadata.AgentSessionIDLaunchID = "stale-launch-1"
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Available || got.Reason != "generation_mismatch" || got.TUI.Available || got.TUI.Reason != "generation_mismatch" {
+		t.Fatalf("mismatched TUI continuation readback = %+v", got)
+	}
+
+	session.Mode = domain.SessionModeChat
+	session.Metadata.ProviderConversationID = ""
+	session.Metadata.ControllerGeneration = "controller-generation-2"
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Available || got.Reason != "missing_chat_identity" || got.Chat.Available || got.Chat.Reason != "missing_chat_identity" {
+		t.Fatalf("missing Chat continuation readback = %+v", got)
+	}
+
+	session.Metadata.ProviderConversationID = "provider-thread-1"
+	session.ProjectID = ""
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Available || got.Reason != "missing_project_id" || got.Chat.Reason != "missing_project_id" || got.TUI.Reason != "missing_project_id" {
+		t.Fatalf("missing project continuation readback = %+v", got)
+	}
+
+	session.ProjectID = "ao"
+	session.Mode = domain.SessionMode("future")
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Available || got.Mode != "future" || got.Reason != "missing_or_unknown_mode" ||
+		got.Chat.Reason != "missing_or_unknown_mode" || got.TUI.Reason != "missing_or_unknown_mode" {
+		t.Fatalf("unknown mode continuation readback = %+v", got)
+	}
+
+	session.Mode = domain.SessionModeChat
+	session.Harness = domain.AgentHarness("future")
+	svc.sessions[session.ID] = session
+	read(t)
+	got = body.Session.Continuation
+	if got.Available || got.Reason != "missing_or_unknown_harness" ||
+		got.Chat.Reason != "missing_or_unknown_harness" || got.TUI.Reason != "missing_or_unknown_harness" {
+		t.Fatalf("unknown harness continuation readback = %+v", got)
+	}
+}
+
+func TestSessionsAPI_ContinuationReadbackIdentityBoundaries(t *testing.T) {
+	type readbackCase struct {
+		name   string
+		mutate func(*domain.Session)
+		reason string
+	}
+	for _, mode := range []domain.SessionMode{domain.SessionModeChat, domain.SessionModeTUI} {
+		t.Run(string(mode), func(t *testing.T) {
+			cases := []readbackCase{
+				{name: "authoritative identity", reason: "available"},
+				{name: "empty session", mutate: func(s *domain.Session) { s.ID = "" }, reason: "missing_session_id"},
+				{name: "blank session", mutate: func(s *domain.Session) { s.ID = " \t\n" }, reason: "missing_session_id"},
+				{name: "empty project", mutate: func(s *domain.Session) { s.ProjectID = "" }, reason: "missing_project_id"},
+				{name: "blank project", mutate: func(s *domain.Session) { s.ProjectID = " \t\n" }, reason: "missing_project_id"},
+				{name: "empty harness", mutate: func(s *domain.Session) { s.Harness = "" }, reason: "missing_or_unknown_harness"},
+				{name: "blank harness", mutate: func(s *domain.Session) { s.Harness = " \t\n" }, reason: "missing_or_unknown_harness"},
+				{name: "unknown harness", mutate: func(s *domain.Session) { s.Harness = "future" }, reason: "missing_or_unknown_harness"},
+				{name: "empty mode", mutate: func(s *domain.Session) { s.Mode = "" }, reason: "missing_or_unknown_mode"},
+				{name: "blank mode", mutate: func(s *domain.Session) { s.Mode = " \t\n" }, reason: "missing_or_unknown_mode"},
+				{name: "unknown mode", mutate: func(s *domain.Session) { s.Mode = "future" }, reason: "missing_or_unknown_mode"},
+				{name: "padded mode", mutate: func(s *domain.Session) { s.Mode = domain.SessionMode(" " + string(mode)) }, reason: "missing_or_unknown_mode"},
+				{name: "invalid envelope precedence", mutate: func(s *domain.Session) {
+					s.ID, s.ProjectID, s.Harness, s.Mode = "", "", "future", "future"
+				}, reason: "missing_session_id"},
+				{name: "project before harness and mode", mutate: func(s *domain.Session) {
+					s.ProjectID, s.Harness, s.Mode = "", "future", "future"
+				}, reason: "missing_project_id"},
+				{name: "harness before mode", mutate: func(s *domain.Session) {
+					s.Harness, s.Mode = "future", "future"
+				}, reason: "missing_or_unknown_harness"},
+			}
+			if mode == domain.SessionModeChat {
+				for _, missing := range []string{"", " \t\n"} {
+					cases = append(cases,
+						readbackCase{name: "provider conversation " + missing, mutate: func(s *domain.Session) { s.Metadata.ProviderConversationID = missing }, reason: "missing_chat_identity"},
+						readbackCase{name: "controller generation " + missing, mutate: func(s *domain.Session) { s.Metadata.ControllerGeneration = missing }, reason: "missing_chat_identity"},
+					)
+				}
+			} else {
+				cases = append(cases,
+					readbackCase{name: "stale launch", mutate: func(s *domain.Session) { s.Metadata.AgentSessionIDLaunchID = "stale" }, reason: "generation_mismatch"},
+				)
+				for _, missing := range []string{"", " \t\n"} {
+					cases = append(cases,
+						readbackCase{name: "agent session " + missing, mutate: func(s *domain.Session) { s.Metadata.AgentSessionID = missing }, reason: "missing_tui_identity"},
+						readbackCase{name: "runtime launch " + missing, mutate: func(s *domain.Session) { s.Metadata.RuntimeLaunchID = missing }, reason: "missing_tui_identity"},
+						readbackCase{name: "agent launch " + missing, mutate: func(s *domain.Session) { s.Metadata.AgentSessionIDLaunchID = missing }, reason: "missing_tui_identity"},
+					)
+				}
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					svc := newFakeSessionService()
+					session := svc.sessions["ao-1"]
+					session.Mode, session.Harness = mode, domain.HarnessCodex
+					// Both modes have valid facts: invalid active identity must never
+					// borrow the inactive mode's facts to become available.
+					session.Metadata.ProviderConversationID = "provider-thread-1"
+					session.Metadata.ControllerGeneration = "controller-generation-1"
+					session.Metadata.AgentSessionID = "agent-session-1"
+					session.Metadata.RuntimeLaunchID = "runtime-launch-1"
+					session.Metadata.AgentSessionIDLaunchID = "runtime-launch-1"
+					if tc.mutate != nil {
+						tc.mutate(&session)
+					}
+					svc.sessions["ao-1"] = session
+					srv := newSessionTestServer(t, svc)
+					raw, status, _ := doRequest(t, srv, http.MethodGet, "/api/v1/sessions/ao-1", "")
+					if status != http.StatusOK {
+						t.Fatalf("GET session = %d, want 200; body=%s", status, raw)
+					}
+					var body controllers.SessionResponse
+					mustJSON(t, raw, &body)
+					got := body.Session.ContinuationReadback
+					if got.SessionID != session.ID || got.ProjectID != session.ProjectID || got.Harness != session.Harness || got.Mode != session.Mode ||
+						got.Chat.ProviderConversationID != session.Metadata.ProviderConversationID || got.Chat.ControllerGeneration != session.Metadata.ControllerGeneration ||
+						got.TUI.AgentSessionID != session.Metadata.AgentSessionID || got.TUI.RuntimeLaunchID != session.Metadata.RuntimeLaunchID || got.TUI.AgentSessionIDLaunchID != session.Metadata.AgentSessionIDLaunchID {
+						t.Fatalf("readback changed authoritative identity: %+v", got)
+					}
+					available := tc.reason == "available"
+					chatReason, tuiReason := tc.reason, tc.reason
+					chatAvailable, tuiAvailable := false, false
+					switch tc.reason {
+					case "available", "missing_chat_identity", "missing_tui_identity", "generation_mismatch":
+						if mode == domain.SessionModeChat {
+							tuiReason, chatAvailable = "mode_not_applicable", available
+						} else {
+							chatReason, tuiAvailable = "mode_not_applicable", available
+						}
+					}
+					if got.Available != available || got.Reason != tc.reason ||
+						got.Chat.Available != chatAvailable || got.Chat.Reason != chatReason ||
+						got.TUI.Available != tuiAvailable || got.TUI.Reason != tuiReason {
+						t.Fatalf("readback = %+v, want available=%v reason=%s chat=%v/%s tui=%v/%s", got, available, tc.reason, chatAvailable, chatReason, tuiAvailable, tuiReason)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestSessionsAPI_PRRoutes(t *testing.T) {

@@ -19,6 +19,7 @@ import {
 	Download,
 	Folder,
 	FolderOpen,
+	History,
 	LogIn,
 	LogOut,
 	MoreVertical,
@@ -33,6 +34,8 @@ import {
 	Smartphone,
 	Trash2,
 	User,
+	Eye,
+	EyeOff,
 	X,
 } from "lucide-react";
 import {
@@ -73,6 +76,7 @@ import { aoBridge } from "../lib/bridge";
 import { useCommandPaletteEnabled } from "../hooks/useCommandPaletteEnabled";
 import { cloudSessionsQueryKey, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { usePinSession, useUnpinSession } from "../hooks/usePinSession";
+import { useHideSession, useUnhideSession } from "../hooks/useSessionVisibility";
 import { spawnCloudOrchestrator } from "../lib/cloud-orchestrator";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { formatTimeCompact, formatTimeTerse } from "../lib/format-time";
@@ -286,6 +290,18 @@ function applyOrder<T>(items: readonly T[], idOf: (item: T) => string, order: re
 	return unplaced === "start" ? [...rest, ...placed] : [...placed, ...rest];
 }
 
+function mergeSessionsById(
+	primary: readonly WorkspaceSession[],
+	additional: readonly WorkspaceSession[],
+): WorkspaceSession[] {
+	const seen = new Set<string>();
+	return [...primary, ...additional].filter((session) => {
+		if (seen.has(session.id)) return false;
+		seen.add(session.id);
+		return true;
+	});
+}
+
 function useGrabbingCursor(active: boolean) {
 	useEffect(() => {
 		if (!active) return;
@@ -322,6 +338,7 @@ type SidebarProps = {
 	topbarOffset?: "toolbar" | "titlebar" | "trafficLights" | "session";
 	workspaceError?: string;
 	workspaces: WorkspaceSummary[];
+	hiddenWorkspaces?: WorkspaceSummary[];
 	onCloneProject: (input: CloneProjectInput) => Promise<void>;
 	onCreateProject: (input: CreateProjectInput) => Promise<void>;
 	onInitializeProject: (path: string) => Promise<void>;
@@ -409,6 +426,7 @@ export function Sidebar({
 	topbarOffset = "toolbar",
 	workspaceError,
 	workspaces,
+	hiddenWorkspaces = [],
 	onCloneProject,
 	onCreateProject,
 	onInitializeProject,
@@ -430,6 +448,29 @@ export function Sidebar({
 	const daemonStatus = useShellMaybe()?.daemonStatus ?? null;
 	const commandPaletteEnabled = useCommandPaletteEnabled();
 	const setCommandPaletteOpen = useUiStore((s) => s.setCommandPaletteOpen);
+	const [showHidden, setShowHidden] = useState(false);
+	const sidebarWorkspaces = useMemo(() => {
+		if (!showHidden) return workspaces;
+		const hiddenByWorkspace = new Map(
+			hiddenWorkspaces.map((workspace) => [
+				workspace.id,
+				workspace.sessions.filter((session) => session.hiddenAt),
+			]),
+		);
+		const merged = workspaces.map((workspace) => {
+			const hiddenSessions = hiddenByWorkspace.get(workspace.id) ?? [];
+			return hiddenSessions.length === 0
+				? workspace
+				: { ...workspace, sessions: mergeSessionsById(workspace.sessions, hiddenSessions) };
+		});
+		const existingWorkspaceIds = new Set(merged.map((workspace) => workspace.id));
+		for (const workspace of hiddenWorkspaces) {
+			if (existingWorkspaceIds.has(workspace.id)) continue;
+			const hiddenSessions = workspace.sessions.filter((session) => session.hiddenAt);
+			if (hiddenSessions.length > 0) merged.push({ ...workspace, sessions: hiddenSessions });
+		}
+		return merged;
+	}, [hiddenWorkspaces, showHidden, workspaces]);
 	const existingProjectPaths = useMemo(
 		() => workspaces
 			.filter((workspace) => workspace.kind !== STANDALONE_PROJECT_KIND)
@@ -541,8 +582,8 @@ export function Sidebar({
 
 	const [projectOrder, setProjectOrder] = useState<string[]>([]);
 	const orderedWorkspaces = useMemo(
-		() => applyOrder(workspaces, (workspace) => workspace.id, projectOrder, "end"),
-		[projectOrder, workspaces],
+		() => applyOrder(sidebarWorkspaces, (workspace) => workspace.id, projectOrder, "end"),
+		[projectOrder, sidebarWorkspaces],
 	);
 	const [showAllProjects, setShowAllProjects] = useState(false);
 	const activeProjectBeyondLimit = useMemo(() => {
@@ -651,15 +692,15 @@ export function Sidebar({
 	}, [handleProjectDragEnd, projectIds]);
 
 	const pinnedSessions = useMemo(
-		() => workspaces
+		() => sidebarWorkspaces
 			.flatMap((w) => workerSessions(w.sessions))
-			.filter((s) => s.isPinned && s.isTerminated !== true)
+			.filter((s) => s.isPinned && (s.isTerminated !== true || (showHidden && Boolean(s.hiddenAt))))
 			.sort((a, b) => {
 				const aTime = a.pinnedAt ? new Date(a.pinnedAt).getTime() : 0;
 				const bTime = b.pinnedAt ? new Date(b.pinnedAt).getTime() : 0;
 				return bTime - aTime;
 			}),
-		[workspaces],
+		[showHidden, sidebarWorkspaces],
 	);
 
 	return (
@@ -783,6 +824,27 @@ export function Sidebar({
 					</div>
 				)}
 
+				<div className="sidebar-expanded-chrome mb-1 group-data-[collapsible=icon]:hidden">
+					<SidebarMenu>
+						<SidebarMenuItem>
+							<SidebarMenuButton
+								aria-pressed={showHidden}
+								className={cn(SECTION_ROW_CLASS, NAV_ROW_HIGHLIGHT_HOST_CLASS, "text-left")}
+								onClick={() => setShowHidden((value) => !value)}
+								type="button"
+							>
+								<NavRowHighlight />
+								{showHidden ? <EyeOff aria-hidden="true" /> : <History aria-hidden="true" />}
+								<span className="relative z-[1] truncate">
+									{showHidden
+										? t("shell.hideHiddenSessions", { defaultValue: "Hide hidden sessions" })
+										: t("shell.showHiddenSessions", { defaultValue: "Show hidden sessions" })}
+								</span>
+							</SidebarMenuButton>
+						</SidebarMenuItem>
+					</SidebarMenu>
+				</div>
+
 				{/* Projects — always open; only the trailing "+" is interactive. */}
 				<div className="sidebar-expanded-chrome flex shrink-0 pb-0.5 group-data-[collapsible=icon]:hidden">
 					<SectionDisclosure
@@ -811,15 +873,17 @@ export function Sidebar({
 								<p className="text-sm text-foreground">{t("shell.couldNotLoadProjects")}</p>
 								<p className="mt-1 text-caption text-passive">{workspaceError}</p>
 							</div>
-						) : workspaces.length === 0 ? null : (
+						) : visibleWorkspaces.length === 0 ? null : (
 							<SidebarMenu className="relative min-h-full gap-0.5 rounded-lg group-data-[collapsible=icon]:gap-1 group-data-[collapsible=icon]:rounded-none">
 								{visibleWorkspaces.map((workspace) => (
 									<ProjectItem
 										key={workspace.id}
 										workspace={workspace}
+										hiddenWorkspace={hiddenWorkspaces.find((candidate) => candidate.id === workspace.id)}
 										expanded={expandedIds.has(workspace.id) || (initialActiveSessionProjectId === workspace.id && !dismissedInitialActiveProjectIds.has(workspace.id))}
 										suppressInitialExpandAnimation={expandedIds.has(workspace.id)}
 										selection={selection}
+										showHidden={showHidden}
 										isDragged={draggingProjectId === workspace.id}
 										projectDragInProgress={draggingProjectId !== null}
 										layoutSettled={layoutSettled}
@@ -993,6 +1057,8 @@ type Selection = ReturnType<typeof useSelection>;
 
 type ProjectItemProps = {
 	workspace: WorkspaceSummary;
+	hiddenWorkspace?: WorkspaceSummary;
+	showHidden: boolean;
 	expanded: boolean;
 	selection: Selection;
 	isDragged: boolean;
@@ -1010,6 +1076,8 @@ type ProjectItemProps = {
 
 const ProjectItem = memo(function ProjectItem({
 	workspace,
+	hiddenWorkspace,
+	showHidden,
 	expanded,
 	selection,
 	isDragged,
@@ -1054,11 +1122,14 @@ const ProjectItem = memo(function ProjectItem({
 	const projectIsDragging = isDragged;
 	const isStandaloneWorkspace = workspace.kind === STANDALONE_PROJECT_KIND;
 	// Keep completed PR sessions reachable while their runtime still exists.
-	// Only termination removes a worker from the sidebar; archived sessions stay
-	// reachable through SessionsBoard.
+	// Terminated workers stay in the board archive unless hidden history is
+	// explicitly requested. Pinned hidden history already has its own section.
 	const visibleSessions = useMemo(
-		() => sortedWorkerSessions(workspace.sessions).filter((session) => session.isTerminated !== true),
-		[workspace.sessions],
+		() => sortedWorkerSessions(workspace.sessions).filter((session) =>
+			(session.isTerminated !== true || (showHidden && Boolean(session.hiddenAt) && !session.isPinned)) &&
+			(showHidden || !session.hiddenAt),
+		),
+		[showHidden, workspace.sessions],
 	);
 	const [sessionOrder, setSessionOrder] = useState<string[]>([]);
 	const sessions = useMemo(
@@ -1113,7 +1184,16 @@ const ProjectItem = memo(function ProjectItem({
 	}, [selection, workspace.id]);
 	// The project's live orchestrator (if any) backs the hover Orchestrator
 	// button: navigate to it when present, otherwise spawn one first.
-	const orchestrator = newestActiveOrchestrator(workspace.sessions);
+	// The visible project tree may omit hidden rows, but action resolution must
+	// still see a hidden active coordinator so this button opens it instead of
+	// requesting a duplicate spawn.
+	const actionSessions = showHidden
+		? workspace.sessions
+		: mergeSessionsById(
+			workspace.sessions,
+			(hiddenWorkspace?.sessions ?? []).filter((session) => session.hiddenAt),
+		);
+	const orchestrator = newestActiveOrchestrator(actionSessions);
 	const toggleDisclosure = () => {
 		hasInteractedWithDisclosure.current = true;
 		onToggle(workspace.id);
@@ -1671,6 +1751,8 @@ function SessionRow({
 		[queryClient],
 	);
 	const rename = useSessionRename(session, refreshWorkspaces);
+	const hideSession = useHideSession();
+	const unhideSession = useUnhideSession();
 	const lastTouchAtRef = useRef(0);
 	const suppressTouchOpenRef = useRef(false);
 	const beginRename = useCallback(() => {
@@ -1820,6 +1902,14 @@ function SessionRow({
 				<ContextMenuItem aria-label={t("shell.renameSession", { title: session.title })} onSelect={beginRename}>
 					<Pencil aria-hidden="true" />
 					{t("shell.rename")}
+				</ContextMenuItem>
+				<ContextMenuItem
+					onSelect={() => (session.hiddenAt ? unhideSession.mutate(session) : hideSession.mutate(session))}
+				>
+					{session.hiddenAt ? <Eye aria-hidden="true" /> : <EyeOff aria-hidden="true" />}
+					{session.hiddenAt
+						? t("shell.unhideSession", { defaultValue: "Unhide session" })
+						: t("shell.hideSession", { defaultValue: "Hide session" })}
 				</ContextMenuItem>
 			</ContextMenuContent>
 		</ContextMenu>

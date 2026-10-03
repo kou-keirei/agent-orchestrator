@@ -109,9 +109,34 @@ vi.mock("../hooks/useCommandPaletteEnabled", () => ({
 }));
 
 vi.mock("../hooks/useWorkspaceQuery", () => ({
-	useWorkspaceQuery: (options: { subscribed?: boolean }) => {
+	useWorkspaceQuery: (options: { subscribed?: boolean; includeHidden?: boolean }) => {
 		workspaceSubscriptionMock(options);
-		return { data: ctx.workspaces };
+		const data = options.includeHidden
+			? ctx.workspaces.map((workspace) =>
+					workspace.id === "proj-1"
+						? {
+								...workspace,
+								sessions: [
+										...workspace.sessions,
+										{
+												id: "w-hidden",
+												workspaceId: "proj-1",
+												workspaceName: "app",
+												title: "hidden live worker",
+												provider: "codex",
+												kind: "worker",
+												branch: "feature/hidden",
+												status: "working",
+												hiddenAt: "2026-09-22T12:00:00Z",
+												updatedAt: "2026-09-22T12:00:00Z",
+												prs: [],
+											},
+								],
+							}
+						: workspace,
+				)
+			: ctx.workspaces;
+		return { data };
 	},
 	workspaceQueryKey: ["workspaces"],
 }));
@@ -285,10 +310,22 @@ describe("CommandPalette gating", () => {
 
 	it("subscribes to workspace updates only while open", () => {
 		renderPalette();
-		expect(workspaceSubscriptionMock).toHaveBeenLastCalledWith({ subscribed: false });
+		expect(workspaceSubscriptionMock).toHaveBeenLastCalledWith({ subscribed: false, includeHidden: true });
 
 		act(() => useUiStore.getState().setCommandPaletteOpen(true));
-		expect(workspaceSubscriptionMock).toHaveBeenLastCalledWith({ subscribed: true });
+		expect(workspaceSubscriptionMock).toHaveBeenLastCalledWith({ subscribed: true, includeHidden: true });
+	});
+
+	it("keeps a hidden active session in command context while visible data excludes it", async () => {
+		ctx.params = { projectId: "proj-1", sessionId: "w-hidden" };
+		renderPalette();
+		act(() => useUiStore.getState().setCommandPaletteOpen(true));
+
+		await screen.findByPlaceholderText(/search projects/i);
+		expect(ctx.workspaces.flatMap((workspace) => workspace.sessions).some((session) => session.id === "w-hidden")).toBe(false);
+		// The current session is intentionally omitted from the root list; its
+		// hidden-inclusive context still exposes operational actions.
+		expect(screen.getByText("Copy branch name")).toBeInTheDocument();
 	});
 
 	it("renders nothing and binds no shortcut on a disabled (stable) build", () => {

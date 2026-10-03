@@ -267,6 +267,62 @@ WHERE type = 'trigger' AND name IN ('review_run_cdc_insert', 'review_run_cdc_upd
 	}
 }
 
+func TestMigration0155DownReconcilesConfigDistinctReviewRuns(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	upTo(t, db, 155)
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatalf("disable foreign keys for review-only fixture: %v", err)
+	}
+	const insert = `
+INSERT INTO review_run (
+    id, review_id, session_id, harness, pr_url, target_sha, status, verdict,
+    body, created_at, reviewer_provenance_json
+) VALUES (?, 'review-1', 'session-1', 'codex', 'pr-1', 'sha-1', ?, 'approved', '', ?, ?)`
+	if _, err := db.Exec(insert, "run-old-config", "complete", "2026-09-01T00:00:00Z", `{"aoResolved":{"model":"old"}}`); err != nil {
+		t.Fatalf("seed old config opinion: %v", err)
+	}
+	if _, err := db.Exec(insert, "run-new-config", "complete", "2026-09-02T00:00:00Z", `{"aoResolved":{"model":"new"}}`); err != nil {
+		t.Fatalf("seed new config opinion: %v", err)
+	}
+	if _, err := db.Exec(insert, "run-failed", "failed", "2026-09-03T00:00:00Z", `{"aoResolved":{"model":"failed"}}`); err != nil {
+		t.Fatalf("seed failed opinion: %v", err)
+	}
+
+	var before int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM review_run WHERE target_sha = 'sha-1'`).Scan(&before); err != nil {
+		t.Fatalf("count config-distinct rows before down: %v", err)
+	}
+	if before != 3 {
+		t.Fatalf("rows before down = %d, want 3", before)
+	}
+
+	downTo(t, db, 154)
+
+	var survivor string
+	if err := db.QueryRow(`SELECT id FROM review_run WHERE target_sha = 'sha-1' AND status = 'complete'`).Scan(&survivor); err != nil {
+		t.Fatalf("query deterministic survivor: %v", err)
+	}
+	if survivor != "run-new-config" {
+		t.Fatalf("complete survivor = %q, want newest complete config opinion", survivor)
+	}
+	var failed int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM review_run WHERE id = 'run-failed'`).Scan(&failed); err != nil {
+		t.Fatalf("query failed rollback row: %v", err)
+	}
+	if failed != 1 {
+		t.Fatal("rollback removed a failed diagnostic row excluded from the old index")
+	}
+
+	if _, err := db.Exec(insert, "run-conflict", "complete", "2026-09-04T00:00:00Z", `{"aoResolved":{"model":"conflict"}}`); err == nil {
+		t.Fatal("old narrower index accepted a duplicate eligible review run after rollback")
+	}
+}
+
 func TestPrepareReviewPerHarnessMigrationRepairsApplied0080StaleReviewShape(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+"?_pragma=busy_timeout(5000)")
 	if err != nil {

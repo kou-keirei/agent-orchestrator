@@ -348,8 +348,9 @@ type fakeReviewerForPreflight struct {
 }
 
 type fakeReviewerWithLaunchSpec struct {
-	spec  ports.ReviewCommandSpec
-	hints ports.PromptReadinessHints
+	spec     ports.ReviewCommandSpec
+	hints    ports.PromptReadinessHints
+	hintsErr error
 }
 
 func (f *fakeReviewerWithLaunchSpec) ReviewCommand(context.Context, ports.ReviewInvocation) (ports.ReviewCommandSpec, error) {
@@ -359,6 +360,9 @@ func (f *fakeReviewerWithLaunchSpec) ReviewMessage(_ context.Context, inv ports.
 	return inv.Prompt, nil
 }
 func (f *fakeReviewerWithLaunchSpec) ReviewPromptReadinessHints(context.Context) (ports.PromptReadinessHints, error) {
+	if f.hintsErr != nil {
+		return ports.PromptReadinessHints{}, f.hintsErr
+	}
 	return f.hints, nil
 }
 
@@ -400,31 +404,45 @@ func (f fakeAgentAuthResolver) AuthStatus(context.Context, domain.ReviewerHarnes
 }
 
 type fakeRuntime struct {
-	createCfg     ports.RuntimeConfig
-	sentMsg       string
-	sentMsgs      []string
-	sentInput     string
-	sentInputs    []string
-	sentTo        string
-	alive         bool
-	interrupt     string
-	interrupts    int
-	destroyed     string
-	destroyBefore bool
-	created       bool
-	output        string
-	outputReads   int
+	createCfg        ports.RuntimeConfig
+	createErr        error
+	sentMsg          string
+	sentMsgs         []string
+	sentInput        string
+	sentInputs       []string
+	sentTo           string
+	sendMessageErr   error
+	alive            bool
+	interrupt        string
+	interrupts       int
+	destroyed        string
+	destroyBefore    bool
+	destroyErr       error
+	destroyErrCall   int
+	destroyCalls     int
+	created          bool
+	output           string
+	outputReads      int
+	generationProbes map[string]ports.FencedProbeResult
+	fencedRefs       []ports.FencedRuntimeRef
 }
 
 func (f *fakeRuntime) Create(_ context.Context, cfg ports.RuntimeConfig) (ports.RuntimeHandle, error) {
 	f.createCfg = cfg
+	if f.createErr != nil {
+		return ports.RuntimeHandle{}, f.createErr
+	}
 	f.created = true
 	return ports.RuntimeHandle{ID: string(cfg.SessionID)}, nil
 }
 func (f *fakeRuntime) Destroy(_ context.Context, handle ports.RuntimeHandle) error {
 	f.destroyed = handle.ID
+	f.destroyCalls++
 	if !f.created {
 		f.destroyBefore = true
+	}
+	if f.destroyErr != nil && (f.destroyErrCall == 0 || f.destroyErrCall == f.destroyCalls) {
+		return f.destroyErr
 	}
 	return nil
 }
@@ -450,12 +468,54 @@ func (f *fakeRuntime) SendMessage(_ context.Context, handle ports.RuntimeHandle,
 	f.sentTo = handle.ID
 	f.sentMsg = msg
 	f.sentMsgs = append(f.sentMsgs, msg)
+	if f.sendMessageErr != nil {
+		return f.sendMessageErr
+	}
 	return nil
+}
+
+func (f *fakeRuntime) ProbeFencedRuntime(_ context.Context, ref ports.FencedRuntimeRef) ports.FencedProbeResult {
+	f.fencedRefs = append(f.fencedRefs, ref)
+	if probe, ok := f.generationProbes[ref.Generation]; ok {
+		return probe
+	}
+	return ports.FencedProbeResult{Liveness: ports.FencedDead, Reason: ports.FencedReasonExactAbsent}
+}
+
+func TestLauncherGenerationProbeSeparatesRoutedHandleAndSessionIdentity(t *testing.T) {
+	for _, sessionID := range []string{"review-mer-1", "review-mer-1-replacement-abc"} {
+		for _, prefix := range []string{"", "ptyhost-v1:"} {
+			t.Run(prefix+sessionID, func(t *testing.T) {
+				rt := &fakeRuntime{}
+				launcher := NewLauncher(fakeReviewerResolver{}, rt, t.TempDir())
+				handleID := prefix + sessionID
+				launcher.(ReviewerGenerationProber).ProbeReviewerGeneration(context.Background(), handleID, "launch-1")
+				if len(rt.fencedRefs) != 1 {
+					t.Fatalf("generation probes = %+v", rt.fencedRefs)
+				}
+				ref := rt.fencedRefs[0]
+				if ref.Handle.ID != handleID || ref.SessionID != domain.SessionID(sessionID) || ref.Generation != "launch-1" {
+					t.Fatalf("generation identity = %+v, want handle %q and session %q", ref, handleID, sessionID)
+				}
+			})
+		}
+	}
+}
+
+func TestLauncherGenerationProbeRejectsMissingNativeIdentity(t *testing.T) {
+	for _, handleID := range []string{"", " ", "ptyhost-v1:"} {
+		rt := &fakeRuntime{}
+		launcher := NewLauncher(fakeReviewerResolver{}, rt, t.TempDir())
+		probe := launcher.(ReviewerGenerationProber).ProbeReviewerGeneration(context.Background(), handleID, "launch-1")
+		if probe.Liveness != ports.FencedUnknown || probe.Reason != ports.FencedReasonIdentityMissing || len(rt.fencedRefs) != 0 {
+			t.Fatalf("missing native identity %q: probe=%+v refs=%+v", handleID, probe, rt.fencedRefs)
+		}
+	}
 }
 
 func launchSpec() LaunchSpec {
 	return LaunchSpec{
-		RunID: "run-1", BatchID: "batch-1", ReviewSessionID: "review-1", WorkerID: "mer-1", ProjectID: "mer", Harness: domain.ReviewerClaudeCode,
+		RunID: "run-1", BatchID: "batch-1", ReviewSessionID: "review-1", LaunchID: "launch-new", PreviousLaunchID: "launch-old", WorkerID: "mer-1", ProjectID: "mer", Harness: domain.ReviewerClaudeCode,
 		WorkspacePath: "/ws/mer-1", PRURL: "https://github.com/o/r/pull/1", TargetSHA: "sha1",
 	}
 }
@@ -553,6 +613,158 @@ func TestLauncherSpawnReplacesStalePane(t *testing.T) {
 	}
 	if !rt.destroyBefore {
 		t.Fatal("stale pane must be destroyed before the fresh pane is created")
+	}
+}
+
+func TestLauncherUnboundStableHandleDoesNotDestroyNewerGeneration(t *testing.T) {
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{generationProbes: map[string]ports.FencedProbeResult{
+		"launch-old": {Liveness: ports.FencedUnknown, Reason: ports.FencedReasonGenerationMismatch},
+	}}
+	l := newTestLauncher(t, reviewer, rt)
+
+	_, err := l.Spawn(context.Background(), launchSpec())
+	if err == nil || !strings.Contains(err.Error(), "launch-old") {
+		t.Fatalf("Spawn error = %v, want generation-fenced cleanup uncertainty", err)
+	}
+	if rt.destroyCalls != 0 || rt.created {
+		t.Fatalf("newer stable generation was destroyed or replaced: destroys=%d created=%v", rt.destroyCalls, rt.created)
+	}
+	if !strings.Contains(err.Error(), reviewerCleanupPendingMarkerForGeneration("review-mer-1", "launch-old")) {
+		t.Fatalf("Spawn error = %v, want exact retry marker", err)
+	}
+}
+
+func TestLauncherUnboundStableHandleDestroysExactOldGeneration(t *testing.T) {
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{generationProbes: map[string]ports.FencedProbeResult{
+		"launch-old": {Liveness: ports.FencedAlive, Reason: ports.FencedReasonExactMatch},
+	}}
+	l := newTestLauncher(t, reviewer, rt)
+
+	if _, err := l.Spawn(context.Background(), launchSpec()); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if rt.destroyed != "review-mer-1" || rt.destroyCalls != 1 || !rt.created {
+		t.Fatalf("exact old-generation cleanup = destroyed=%q calls=%d created=%v", rt.destroyed, rt.destroyCalls, rt.created)
+	}
+}
+
+func TestLauncherUnboundStableHandleFailsClosedWithoutGeneration(t *testing.T) {
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{alive: true}
+	l := newTestLauncher(t, reviewer, rt)
+	spec := launchSpec()
+	spec.PreviousLaunchID = ""
+
+	_, err := l.Spawn(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("Spawn error = %v, want missing-generation failure", err)
+	}
+	var effectErr ports.RuntimeEffectError
+	if !errors.As(err, &effectErr) || effectErr.PossibleHandle().ID != "review-mer-1" {
+		t.Fatalf("Spawn error = %v, want durable possible-handle evidence", err)
+	}
+	if rt.destroyCalls != 0 || rt.created {
+		t.Fatalf("unknown stable generation was destroyed or replaced: destroys=%d created=%v", rt.destroyCalls, rt.created)
+	}
+}
+
+func TestLauncherSpawnReplacementPreservesLiveIncumbentOnCreateFailure(t *testing.T) {
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{alive: true, createErr: errors.New("replacement create failed")}
+	l := newTestLauncher(t, reviewer, rt)
+	spec := launchSpec()
+	spec.PreviousHandleID = "review-mer-1"
+
+	if _, err := l.Spawn(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "replacement create failed") {
+		t.Fatalf("Spawn error = %v, want replacement create failure", err)
+	}
+	if rt.destroyed != "" || rt.destroyBefore {
+		t.Fatalf("live incumbent was destroyed before replacement failure: %+v", rt)
+	}
+	if rt.createCfg.SessionID == "review-mer-1" {
+		t.Fatalf("replacement must not create over the incumbent handle: %+v", rt.createCfg)
+	}
+	if reviewer.gotInv.ReviewerID != "review-mer-1" {
+		t.Fatalf("reviewer identity = %q, want stable production identity", reviewer.gotInv.ReviewerID)
+	}
+}
+
+func TestLauncherSpawnReplacementStagesProvisionalHandle(t *testing.T) {
+	reviewer := &fakeReviewer{}
+	rt := &fakeRuntime{alive: true}
+	l := newTestLauncher(t, reviewer, rt)
+	spec := launchSpec()
+	spec.PreviousHandleID = "review-mer-1"
+
+	launch, err := l.Spawn(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if rt.destroyed != "" || rt.destroyBefore {
+		t.Fatalf("incumbent was torn down before engine promotion: %+v", rt)
+	}
+	if rt.createCfg.SessionID == "review-mer-1" || !strings.HasPrefix(string(rt.createCfg.SessionID), "review-mer-1-replacement-") {
+		t.Fatalf("runtime session = %q, want provisional replacement handle", rt.createCfg.SessionID)
+	}
+	if launch.HandleID != string(rt.createCfg.SessionID) {
+		t.Fatalf("launch handle = %q, want created provisional handle %q", launch.HandleID, rt.createCfg.SessionID)
+	}
+	if reviewer.gotInv.ReviewerID != "review-mer-1" {
+		t.Fatalf("reviewer identity = %q, want stable production identity", reviewer.gotInv.ReviewerID)
+	}
+}
+
+func TestLauncherReplacementReadinessFailureCleansProvisionalAndKeepsIncumbent(t *testing.T) {
+	reviewer := &fakeReviewerWithLaunchSpec{
+		spec:     ports.ReviewCommandSpec{Argv: []string{"agent"}, InitialMessage: "task"},
+		hintsErr: errors.New("readiness probe failed"),
+	}
+	rt := &fakeRuntime{alive: true}
+	l := newTestLauncher(t, reviewer, rt)
+	spec := launchSpec()
+	spec.PreviousHandleID = "review-mer-1"
+
+	if _, err := l.Spawn(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "prompt readiness") {
+		t.Fatalf("Spawn error = %v, want readiness failure", err)
+	}
+	if rt.destroyed == "review-mer-1" || rt.createCfg.SessionID == "review-mer-1" {
+		t.Fatalf("incumbent was used or destroyed during readiness failure: %+v", rt)
+	}
+	if !strings.HasPrefix(string(rt.createCfg.SessionID), "review-mer-1-replacement-") {
+		t.Fatalf("created handle = %q, want provisional replacement", rt.createCfg.SessionID)
+	}
+	if rt.destroyed != string(rt.createCfg.SessionID) {
+		t.Fatalf("failed provisional handle %q was not cleaned up: destroyed=%q", rt.createCfg.SessionID, rt.destroyed)
+	}
+}
+
+func TestLauncherReplacementInitialMessageCleanupFailureRetainsExactHandleEvidence(t *testing.T) {
+	reviewer := &fakeReviewerWithLaunchSpec{
+		spec: ports.ReviewCommandSpec{Argv: []string{"agent"}, InitialMessage: "task"},
+	}
+	rt := &fakeRuntime{alive: true, sendMessageErr: errors.New("initial message failed"), destroyErr: errors.New("cleanup failed"), destroyErrCall: 1}
+	l := newTestLauncher(t, reviewer, rt)
+	spec := launchSpec()
+	spec.PreviousHandleID = "review-mer-1"
+
+	_, err := l.Spawn(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "initial message failed") || !strings.Contains(err.Error(), "cleanup reviewer runtime") {
+		t.Fatalf("Spawn error = %v, want initial-message and cleanup failures", err)
+	}
+	var effectErr ports.RuntimeEffectError
+	if !errors.As(err, &effectErr) {
+		t.Fatalf("Spawn error = %v, want runtime effect evidence", err)
+	}
+	if got, want := effectErr.PossibleHandle().ID, string(rt.createCfg.SessionID); got != want {
+		t.Fatalf("possible cleanup handle = %q, want exact provisional %q", got, want)
+	}
+	if effectErr.EffectOutcome() != ports.RuntimeEffectPossible || effectErr.CleanupOutcome() != ports.RuntimeCleanupFailed {
+		t.Fatalf("runtime effect evidence = outcome=%q cleanup=%q", effectErr.EffectOutcome(), effectErr.CleanupOutcome())
+	}
+	if rt.destroyed != string(rt.createCfg.SessionID) {
+		t.Fatalf("cleanup destroyed %q, want exact provisional %q", rt.destroyed, rt.createCfg.SessionID)
 	}
 }
 
