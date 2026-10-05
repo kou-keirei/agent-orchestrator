@@ -1,0 +1,267 @@
+{
+  "schema": "ao.autonomy-readiness.v1",
+  "project": "agent-orchestrator-fork",
+  "updatedAt": "2026-10-05T15:57:00-04:00",
+  "baselineWave": "AO-WAVE62-20261005",
+  "scoring": {
+    "formula": "sum(weightPercent * stagePercent) / 100",
+    "qualifiedReach": 35,
+    "buildReach": 53.9,
+    "buildReachDisplay": 54,
+    "projectedQualifiedAfterW62PlusFreshReviews": 42.4,
+    "currentMilestone": "M2",
+    "currentMilestoneName": "Recoverable Lifecycle",
+    "nextMilestone": "M3",
+    "nextMilestoneName": "Durable Work Lifecycle",
+    "nextMilestoneThreshold": 45,
+    "pointsToNextMilestone": 10
+  },
+  "stageRuler": {
+    "UNMAPPED": 0,
+    "CONTRACT_FROZEN": 15,
+    "IMPLEMENTATION_PACKET_READY": 25,
+    "CURRENT_BASE_CANDIDATE_GREEN": 45,
+    "FRESH_REVIEW_PASS": 60,
+    "CANONICAL_INTEGRATION_GREEN": 75,
+    "REAL_E2E_RUNTIME_DOGFOOD_PASS": 90,
+    "CHAOS_PRODUCTION_CLASS_QUALIFIED": 100
+  },
+  "milestones": [
+    {
+      "id": "M0",
+      "min": 0,
+      "maxExclusive": 15,
+      "name": "Executor"
+    },
+    {
+      "id": "M1",
+      "min": 15,
+      "maxExclusive": 30,
+      "name": "Truthful Lifecycle"
+    },
+    {
+      "id": "M2",
+      "min": 30,
+      "maxExclusive": 45,
+      "name": "Recoverable Lifecycle"
+    },
+    {
+      "id": "M3",
+      "min": 45,
+      "maxExclusive": 65,
+      "name": "Durable Work Lifecycle"
+    },
+    {
+      "id": "M4",
+      "min": 65,
+      "maxExclusive": 85,
+      "name": "Autonomous Orchestration"
+    },
+    {
+      "id": "M5",
+      "min": 85,
+      "maxInclusive": 100,
+      "name": "Overnight AO"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "proof-admission-foundation",
+      "weightPercent": 10,
+      "qualifiedStage": 75,
+      "buildStage": 75,
+      "issues": [
+        "AO#13",
+        "AO#14",
+        "AO#2",
+        "AO#22"
+      ],
+      "state": "substantial foundation; effective runtime attestation remains separate",
+      "nextGate": "maintain canonical integration/evidence truth"
+    },
+    {
+      "id": "spawn-recovery-lifecycle-continuity",
+      "weightPercent": 12,
+      "qualifiedStage": 60,
+      "buildStage": 75,
+      "issues": [
+        "AO#3",
+        "AO#4"
+      ],
+      "state": "RECOVERY fresh review passed; W62 current-base composition in flight",
+      "nextGate": "current-base candidate plus fresh composition review"
+    },
+    {
+      "id": "session-resume",
+      "weightPercent": 12,
+      "qualifiedStage": 25,
+      "buildStage": 45,
+      "issues": [
+        "AO#21",
+        "ECP#16"
+      ],
+      "state": "architecture frozen; W62 AO Chat v1 plus ECP compiler/staging in flight; TUI unsupported v1",
+      "nextGate": "current-base candidates green then fresh review and isolated E2E"
+    },
+    {
+      "id": "lawnmower-reap-finalize",
+      "weightPercent": 14,
+      "qualifiedStage": 25,
+      "buildStage": 60,
+      "issues": [
+        "AO#20",
+        "AO#15",
+        "ECP#28"
+      ],
+      "state": "donor/reconciliation and REAP candidate exist; current-base qualification pending",
+      "nextGate": "current-base REAP candidate then FINALIZE"
+    },
+    {
+      "id": "durable-work-identity-execution-lease",
+      "weightPercent": 16,
+      "qualifiedStage": 25,
+      "buildStage": 60,
+      "issues": [
+        "AO#5",
+        "AO#6"
+      ],
+      "state": "#5 W62 current-base port in flight; #6 waits on accepted #5",
+      "nextGate": "#5 current-base candidate and fresh review"
+    },
+    {
+      "id": "worker-reports-event-outbox",
+      "weightPercent": 12,
+      "qualifiedStage": 45,
+      "buildStage": 60,
+      "issues": [
+        "AO#8",
+        "AO#7"
+      ],
+      "state": "significant native/donor behavior exists; governed work-level binding and final coexistence incomplete",
+      "nextGate": "port/reconcile after work identity and lease gates"
+    },
+    {
+      "id": "parent-reengagement",
+      "weightPercent": 8,
+      "qualifiedStage": 25,
+      "buildStage": 45,
+      "issues": [
+        "AO#9"
+      ],
+      "state": "contract/prior art exists; exact work-bound wake depends on reports/outbox and Session Resume",
+      "nextGate": "consume #7/#8 plus Session Resume"
+    },
+    {
+      "id": "dag-admission-backpressure",
+      "weightPercent": 8,
+      "qualifiedStage": 15,
+      "buildStage": 25,
+      "issues": [
+        "AO#10"
+      ],
+      "state": "contract frozen; implementation downstream",
+      "nextGate": "accepted durable work/lease/re-engagement"
+    },
+    {
+      "id": "overnight-chaos",
+      "weightPercent": 8,
+      "qualifiedStage": 15,
+      "buildStage": 15,
+      "issues": [
+        "AO#11"
+      ],
+      "state": "chaos acceptance scenarios frozen; composed qualification not started",
+      "nextGate": "M4 capabilities ready for composed overnight run"
+    }
+  ],
+  "supportingCapabilities": [
+    {
+      "issues": [
+        "AO#12"
+      ],
+      "name": "Hide/Unhide lifecycle separation",
+      "countsToward": "lifecycle correctness"
+    },
+    {
+      "issues": [
+        "AO#16"
+      ],
+      "name": "Provider-event retention",
+      "countsToward": "storage sustainability / overnight viability"
+    },
+    {
+      "issues": [
+        "AO#17"
+      ],
+      "name": "Storage status and cleanup planning",
+      "countsToward": "storage sustainability / overnight viability"
+    },
+    {
+      "issues": [
+        "AO#18"
+      ],
+      "name": "Work Units and capability-grouped roles",
+      "countsToward": "product layer above durable work identity and Session Resume"
+    }
+  ],
+  "milestoneHardGates": {
+    "M3": [
+      "Spawn Recovery >= FRESH_REVIEW_PASS on current/canonical path",
+      "Session Resume >= CURRENT_BASE_CANDIDATE_GREEN",
+      "Lawnmower REAP/FINALIZE >= CURRENT_BASE_CANDIDATE_GREEN",
+      "Durable Work Identity >= CURRENT_BASE_CANDIDATE_GREEN",
+      "No unresolved hard authority/evidence conflict invalidates those capabilities"
+    ],
+    "M4": [
+      "Execution Lease >= FRESH_REVIEW_PASS",
+      "Reports + Outbox >= FRESH_REVIEW_PASS",
+      "Parent Re-engagement >= FRESH_REVIEW_PASS",
+      "Session Resume and Lawnmower have sufficient real E2E/runtime proof",
+      "No duplicate-wake or stale-owner authority gap remains open"
+    ],
+    "M5": [
+      "DAG/admission/backpressure >= FRESH_REVIEW_PASS",
+      "Overnight chaos scenarios >= REAL_E2E_RUNTIME_DOGFOOD_PASS",
+      "Final composed chaos run passes with ECP-disconnected AO-native acceptance"
+    ]
+  },
+  "currentWave": {
+    "id": "AO-WAVE62-20261005",
+    "status": "LAUNCHED",
+    "lanes": [
+      {
+        "session": "agent-orchestrator-653",
+        "capability": "spawn-recovery-lifecycle-continuity"
+      },
+      {
+        "session": "agent-orchestrator-654",
+        "capability": "durable-work-identity-execution-lease"
+      },
+      {
+        "session": "agent-orchestrator-655",
+        "capability": "session-resume"
+      },
+      {
+        "session": "execution-control-plane-64",
+        "capability": "session-resume"
+      }
+    ]
+  },
+  "waveReportingContract": {
+    "required": true,
+    "fields": [
+      "qualifiedReachBefore",
+      "qualifiedReachAfter",
+      "buildReachBefore",
+      "buildReachAfter",
+      "milestoneBefore",
+      "milestoneAfter",
+      "pointsToNextMilestone",
+      "capabilityDeltas",
+      "noMovement",
+      "newlyUnlocked",
+      "criticalPath"
+    ],
+    "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
+  }
+}
