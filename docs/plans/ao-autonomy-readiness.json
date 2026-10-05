@@ -1,11 +1,11 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-05T16:53:35.490611-04:00",
+  "updatedAt": "2026-10-05T17:20:34.225407-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
-    "qualifiedReach": 38.2,
+    "qualifiedReach": 40.6,
     "buildReach": 53.9,
     "buildReachDisplay": 54,
     "currentMilestone": "M2",
@@ -13,8 +13,8 @@
     "nextMilestone": "M3",
     "nextMilestoneName": "Durable Work Lifecycle",
     "nextMilestoneThreshold": 45,
-    "pointsToNextMilestone": 6.8,
-    "projectedQualifiedAfterCurrentWave": 43.0
+    "pointsToNextMilestone": 4.4,
+    "projectedQualifiedAfterCurrentWave": null
   },
   "stageRuler": {
     "UNMAPPED": 0,
@@ -88,8 +88,8 @@
         "AO#3",
         "AO#4"
       ],
-      "state": "W63 independent reviewer passed all safe RECOVERY checks but stopped on authority conflict around unrelated provider-sensitive tests; W64 review completion uses authority-safe contract",
-      "nextGate": "W64 independent review PASS, then current-tip Tier1 composition"
+      "state": "W64 FRESH_INDEPENDENT_REVIEW_PASS for RECOVERY candidate 5c285143; W65 current-tip Tier1 composition prep in flight",
+      "nextGate": "Tier1 current-tip composition review then isolated runtime smoke"
     },
     {
       "id": "session-resume",
@@ -100,8 +100,8 @@
         "AO#21",
         "ECP#16"
       ],
-      "state": "W63 blocker review PASS_TO_AMEND; Codex-only AO strict v1 implementation W64, ACP/TUI unsupported; ECP compiler candidate 62765977 under fresh review",
-      "nextGate": "AO current-base candidate green plus ECP fresh review PASS"
+      "state": "W64 AO R1 stopped before mutation only on missing H1/H2/H3 definitions; W65 R2 includes canonical definitions. ECP compiler review continuation in flight",
+      "nextGate": "AO current-base candidate green and ECP compiler fresh review PASS"
     },
     {
       "id": "lawnmower-reap-finalize",
@@ -113,20 +113,20 @@
         "AO#15",
         "ECP#28"
       ],
-      "state": "W63 partial REAP patch preserved; focused/safe tests green but two native lifecycle paths were outside allowlist; W64 same-owner amended repair in flight",
-      "nextGate": "REAP current-base committed candidate and fresh review, then FINALIZE"
+      "state": "W64 Lawnmower REAP R1 still running and explicitly carried forward untouched into W65",
+      "nextGate": "Harvest 658 when complete; do not duplicate active owner"
     },
     {
       "id": "durable-work-identity-execution-lease",
       "weightPercent": 16,
-      "qualifiedStage": 45,
+      "qualifiedStage": 60,
       "buildStage": 60,
       "issues": [
         "AO#5",
         "AO#6"
       ],
-      "state": "W63 committed current-base #5 candidate 277a79e6 green; W64 fresh independent review in flight; latest upstream delta has zero candidate-path overlap",
-      "nextGate": "#5 fresh review PASS, then latest-tip qualification and #6 Execution Lease"
+      "state": "W64 fresh independent #5 review PASS for 277a79e6; W65 current-tip port in flight; #6 Execution Lease reconciliation unlocked and launched",
+      "nextGate": "#5 current-tip candidate/review plus #6 implementation packet"
     },
     {
       "id": "worker-reports-event-outbox",
@@ -226,33 +226,39 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE64-20261005",
+    "id": "AO-WAVE65-20261005",
     "status": "LAUNCHED",
     "lanes": [
       {
-        "session": "agent-orchestrator-659",
+        "session": "agent-orchestrator-654",
         "capability": "durable-work-identity-execution-lease",
-        "role": "fresh-review"
+        "role": "current-tip-port"
       },
       {
-        "session": "execution-control-plane-67",
-        "capability": "session-resume",
-        "role": "ecp-fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-656",
+        "session": "agent-orchestrator-653",
         "capability": "spawn-recovery-lifecycle-continuity",
-        "role": "review-completion"
+        "role": "tier1-current-tip-prep"
       },
       {
         "session": "agent-orchestrator-655",
         "capability": "session-resume",
-        "role": "ao-implementation-r1"
+        "role": "ao-implementation-r2"
+      },
+      {
+        "session": "execution-control-plane-67",
+        "capability": "session-resume",
+        "role": "ecp-review-completion"
+      },
+      {
+        "session": "agent-orchestrator-660",
+        "capability": "durable-work-identity-execution-lease",
+        "role": "execution-lease-reconciliation"
       },
       {
         "session": "agent-orchestrator-658",
         "capability": "lawnmower-reap-finalize",
-        "role": "same-owner-reap-r1"
+        "role": "carry-forward-running",
+        "untouched": true
       }
     ]
   },
@@ -274,21 +280,25 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE63-20261005",
-    "qualifiedReachBefore": 35.0,
-    "qualifiedReachAfter": 38.2,
+    "wave": "AO-WAVE64-20261005",
+    "partial": true,
+    "carriedForward": [
+      "agent-orchestrator-658"
+    ],
+    "qualifiedReachBefore": 38.2,
+    "qualifiedReachAfter": 40.6,
     "buildReachBefore": 53.9,
     "buildReachAfter": 53.9,
     "milestoneBefore": "M2",
     "milestoneAfter": "M2",
-    "pointsToNextMilestone": 6.8,
-    "deltaReason": "Durable Work Identity advanced from IMPLEMENTATION_PACKET_READY (25) to CURRENT_BASE_CANDIDATE_GREEN (45) with committed candidate 277a79e6 and zero candidate-added differential regressions. Other macro capabilities did not cross stages.",
+    "pointsToNextMilestone": 4.4,
+    "deltaReason": "Durable Work Identity advanced from CURRENT_BASE_CANDIDATE_GREEN (45) to FRESH_REVIEW_PASS (60) after W64 independent review PASS. Recovery fresh review PASS validated its already-recorded 60 stage. AO Session Resume produced no candidate. Lawnmower lane remained running and was intentionally not harvested.",
     "capabilityDeltas": [
       {
         "capability": "durable-work-identity-execution-lease",
-        "before": 25,
-        "after": 45,
-        "evidence": "W63 candidate 277a79e6d2e8549004c13305505aa9b90ceaf7db"
+        "before": 45,
+        "after": 60,
+        "evidence": "W64 fresh review PASS for 277a79e6d2e8549004c13305505aa9b90ceaf7db"
       }
     ],
     "noMovement": [
@@ -297,17 +307,17 @@
       "lawnmower-reap-finalize"
     ],
     "newlyUnlocked": [
-      "#5 fresh independent review",
-      "AO Session Resume Codex-only amended implementation",
-      "ECP Session Resume fresh compiler review",
-      "Lawnmower amended REAP repair"
+      "#6 Execution Lease reconciliation",
+      "current-tip #5 port",
+      "current-tip RECOVERY Tier1 preparation",
+      "Session Resume R2 with bound H1/H2/H3"
     ],
     "criticalPath": [
-      "#5 fresh review",
-      "#6 Execution Lease after #5 acceptance",
       "AO Session Resume candidate",
       "Lawnmower REAP",
-      "RECOVERY review/Tier1"
+      "Tier1 lifecycle composition/review",
+      "Execution Lease",
+      "current-tip #5 qualification"
     ]
   }
 }
