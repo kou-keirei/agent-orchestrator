@@ -1,20 +1,20 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-05T15:57:00-04:00",
+  "updatedAt": "2026-10-05T16:21:04.359369-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
     "qualifiedReach": 35,
     "buildReach": 53.9,
     "buildReachDisplay": 54,
-    "projectedQualifiedAfterW62PlusFreshReviews": 42.4,
     "currentMilestone": "M2",
     "currentMilestoneName": "Recoverable Lifecycle",
     "nextMilestone": "M3",
     "nextMilestoneName": "Durable Work Lifecycle",
     "nextMilestoneThreshold": 45,
-    "pointsToNextMilestone": 10
+    "pointsToNextMilestone": 10,
+    "projectedQualifiedAfterCurrentWave": null
   },
   "stageRuler": {
     "UNMAPPED": 0,
@@ -88,8 +88,8 @@
         "AO#3",
         "AO#4"
       ],
-      "state": "RECOVERY fresh review passed; W62 current-base composition in flight",
-      "nextGate": "current-base candidate plus fresh composition review"
+      "state": "W62 current-base candidate 5c285143 green; W63 fresh review in flight; latest upstream delta has zero RECOVERY-path overlap",
+      "nextGate": "W63 fresh review PASS then latest-tip port/reconcile as needed"
     },
     {
       "id": "session-resume",
@@ -100,8 +100,8 @@
         "AO#21",
         "ECP#16"
       ],
-      "state": "architecture frozen; W62 AO Chat v1 plus ECP compiler/staging in flight; TUI unsupported v1",
-      "nextGate": "current-base candidates green then fresh review and isolated E2E"
+      "state": "W62 AO implementation scope-stopped on B1/B2; W63 blocker review in flight; ECP compiler same-owner R1 in flight; TUI unsupported v1",
+      "nextGate": "B1/B2 amended AO packet plus reviewed ECP compiler candidate"
     },
     {
       "id": "lawnmower-reap-finalize",
@@ -113,8 +113,8 @@
         "AO#15",
         "ECP#28"
       ],
-      "state": "donor/reconciliation and REAP candidate exist; current-base qualification pending",
-      "nextGate": "current-base REAP candidate then FINALIZE"
+      "state": "W63 native REAP current-base port in flight; FINALIZE remains dependent",
+      "nextGate": "REAP current-base candidate and fresh review, then FINALIZE"
     },
     {
       "id": "durable-work-identity-execution-lease",
@@ -125,8 +125,8 @@
         "AO#5",
         "AO#6"
       ],
-      "state": "#5 W62 current-base port in flight; #6 waits on accepted #5",
-      "nextGate": "#5 current-base candidate and fresh review"
+      "state": "W62 #5 kernel candidate preserved uncommitted; W63 same-owner gate cleanup/commit in flight; #6 waits on accepted #5",
+      "nextGate": "#5 exact 20-path local commit and fresh review"
     },
     {
       "id": "worker-reports-event-outbox",
@@ -226,24 +226,33 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE62-20261005",
+    "id": "AO-WAVE63-20261005",
     "status": "LAUNCHED",
     "lanes": [
       {
-        "session": "agent-orchestrator-653",
-        "capability": "spawn-recovery-lifecycle-continuity"
+        "session": "agent-orchestrator-656",
+        "capability": "spawn-recovery-lifecycle-continuity",
+        "role": "fresh-review"
       },
       {
         "session": "agent-orchestrator-654",
-        "capability": "durable-work-identity-execution-lease"
+        "capability": "durable-work-identity-execution-lease",
+        "role": "same-owner-repair"
       },
       {
-        "session": "agent-orchestrator-655",
-        "capability": "session-resume"
+        "session": "agent-orchestrator-657",
+        "capability": "session-resume",
+        "role": "blocker-review"
       },
       {
         "session": "execution-control-plane-64",
-        "capability": "session-resume"
+        "capability": "session-resume",
+        "role": "compiler-r1"
+      },
+      {
+        "session": "agent-orchestrator-658",
+        "capability": "lawnmower-reap-finalize",
+        "role": "reap-current-base-port"
       }
     ]
   },
@@ -263,5 +272,36 @@
       "criticalPath"
     ],
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
+  },
+  "lastHarvest": {
+    "wave": "AO-WAVE62-20261005",
+    "qualifiedReachBefore": 35.0,
+    "qualifiedReachAfter": 35.0,
+    "buildReachBefore": 53.9,
+    "buildReachAfter": 53.9,
+    "milestoneBefore": "M2",
+    "milestoneAfter": "M2",
+    "pointsToNextMilestone": 10,
+    "deltaReason": "No W62 lane crossed a new tracker maturity stage. RECOVERY produced a current-base candidate pending fresh review; #5 remained uncommitted; AO and ECP Session Resume stopped before candidates.",
+    "capabilityDeltas": [],
+    "noMovement": [
+      "spawn-recovery-lifecycle-continuity",
+      "session-resume",
+      "lawnmower-reap-finalize",
+      "durable-work-identity-execution-lease"
+    ],
+    "newlyUnlocked": [
+      "RECOVERY fresh current-base review",
+      "Session Resume B1/B2 blocker review",
+      "ECP compiler five-file amendment",
+      "Lawnmower REAP current-base port"
+    ],
+    "criticalPath": [
+      "RECOVERY fresh review",
+      "Session Resume AO blocker closure",
+      "Lawnmower REAP",
+      "Durable Work Identity commit/review",
+      "Execution Lease"
+    ]
   }
 }
