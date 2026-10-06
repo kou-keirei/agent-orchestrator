@@ -39,23 +39,29 @@ A worker launch does not increase either score. A score changes only when durabl
 
 ## Current baseline
 
-Snapshot: **2026-10-05, W62 launched**
+Snapshot: **2026-10-06, W76 launched**
 
-- **Qualified Reach: 35%**
-- **Build Reach: 54%**
+- **Qualified Reach: 44.8%**
+- **Build Reach: 53.9%**
 - **Current milestone: M2, Recoverable Lifecycle**
 - **Next milestone: M3, Durable Work Lifecycle**
 - **M3 score threshold: 45%**
-- **Distance to M3 by score: 10 percentage points**
-- **Projected Qualified Reach after W62 plus immediate required fresh reviews: about 42%**
-- M3 is still blocked by milestone hard gates even if the weighted score rises early.
+- **Distance to M3 by score: 0.2 percentage points**
+- **Session Resume qualified stage: 60% (fresh-review source qualified; current-tip semantic port active)**
+- **Lawnmower qualified stage: 25% (W76 reviewer-lifecycle F3 repair active; immediate M3 hard gate)**
+- **Runtime permission attestation: source Slice A fresh-review qualified; W76 current-tip port active**
+- **Tier1 RECOVERY composition: fresh-review PASS; isolated runtime smoke remains a separate explicit authority gate**
 
-W62 in flight:
+W76 critical lanes:
 
-- AO #3 current-base Spawn Recovery composition: `agent-orchestrator-653`
-- AO #5 Durable Work Identity current-base port: `agent-orchestrator-654`
-- AO #21 Session Resume AO v1, Chat-first: `agent-orchestrator-655`
-- ECP #16 Session Resume compiler/staging: `execution-control-plane-64`
+- Lawnmower F3 repair: gent-orchestrator-685
+- Runtime permission attestation current-tip port: gent-orchestrator-686
+- Session Resume current-tip semantic port: gent-orchestrator-687
+- CLI/Hook Identity current-tip semantic port: gent-orchestrator-688
+- Provider-event retention #16-A current-tip port: gent-orchestrator-689
+
+The operational objective is no longer broad fork archaeology. It is to complete the self-propelling lifecycle loop required for M4/M5.
+
 
 ## Milestone ladder
 
@@ -226,18 +232,57 @@ Examples:
 
 A plumbing change changes the readiness score only when it advances the owning macro capability through a defined maturity gate.
 
-## Critical path to M3
+## Critical path from M2 to Overnight AO
 
-Current highest-value sequence:
+The serial autonomy spine is now:
 
-1. Finish W62 current-base Spawn Recovery and fresh composition review.
-2. Finish AO Session Resume Chat v1 and ECP compiler/staging, then fresh review.
-3. Qualify AO #20 native REAP, then AO #15 FINALIZE/Lawnmower.
-4. Finish #5 current-base Durable Work Identity and fresh review.
-5. Wake #6 Execution Lease.
-6. Recalculate Qualified Reach and M3 hard gates.
+`	ext
+Lawnmower / ExecutionBaseSHA acceptance
+        |
+        v
+#6 Execution Lease
+        |
+        +----------+
+        v          v
+   #7 Outbox   #8 Reports
+        \          /
+         \        /
+          v      v
+      #9 Parent Re-engagement
+               |
+               v
+      #10 DAG / Backpressure
+               |
+               v
+      #11 Overnight Chaos
+`
 
-W62 should not be counted as progress merely because workers were launched. The score moves only when their durable results cross stages.
+Parallel M4 plumbing that must advance without stealing the serial spine:
+
+- Session Resume current-tip/runtime/actuator qualification;
+- native effective-permission attestation (ypass-permissions requested is not enough);
+- storage sustainability (#16/#17);
+- CLI/Hook identity and compatibility/migration maintenance;
+- AO #13 only when a **production** ECP trusted-evaluator/profile contract exists.
+
+### Immediate priorities
+
+1. Close Lawnmower F3 and fresh-review the repaired current-tip lineage.
+2. Wake #6 immediately after shared ExecutionBaseSHA/Lawnmower acceptance.
+3. Reconcile/implement #7 + #8 as sibling durable completion/delivery substrates.
+4. Implement #9 Parent Re-engagement using exact parent identity + Session Resume, never idle-means-wake.
+5. Implement #10 dependency-aware admission/backpressure so resource pressure reduces admission instead of amplifying retries.
+6. Run sustained multi-generation dogfood.
+7. Qualify #11 Overnight Chaos and cross M5.
+
+### Supporting/deferred rules
+
+- #13 is not Step 0 for the serial autonomy spine while ECP's production evaluator contract is absent.
+- accepted #14, #2/#12 closeout, historical migration maintenance, and storage work may run in parallel but must not preempt the serial spine unless they block source/runtime truth or safe operation.
+- Tier1 RECOVERY source/composition work is complete enough for its next explicit gate: isolated runtime smoke.
+
+A FULLWAVE should always ask: **what advances the serial autonomy spine, what unblocks the next lane, and what parallel maintenance can run without stealing critical resources?**
+
 
 ## Fullwave readiness reporting contract
 
