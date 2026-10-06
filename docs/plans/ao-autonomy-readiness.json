@@ -1,7 +1,7 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-06T12:07:42.058448-04:00",
+  "updatedAt": "2026-10-06T12:13:20.974672-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
@@ -227,19 +227,66 @@
   },
   "currentWave": {
     "id": "AO-WAVE76-20261006",
-    "status": "STAGED",
+    "status": "LAUNCHED",
     "frozenAOUpstream": "b7deb152ffe988c6198a1fed9312ca4230f50fb6",
-    "frozenECPOrigin": "d3862a9f14bb665f3c98f4d82f71e858f424632f",
-    "plannedLanes": [
-      "lawnmower-f3",
-      "runtime-attestation-tip-port",
-      "issue16a-tip-port",
-      "cli-hook-tip-implement",
-      "session-resume-tip-implement",
-      "issue14-tip-review",
-      "storage17a-tip-review",
-      "v66-review-r1"
-    ]
+    "lanes": [
+      {
+        "session": "agent-orchestrator-685",
+        "capability": "lawnmower-reap-finalize",
+        "role": "F3-repair"
+      },
+      {
+        "session": "agent-orchestrator-686",
+        "capability": "runtime-attestation",
+        "role": "current-tip-port"
+      },
+      {
+        "session": "agent-orchestrator-687",
+        "capability": "session-resume",
+        "role": "current-tip-semantic-port"
+      },
+      {
+        "session": "agent-orchestrator-688",
+        "capability": "cli-hook-identity",
+        "role": "current-tip-semantic-port"
+      },
+      {
+        "session": "agent-orchestrator-689",
+        "capability": "provider-event-retention",
+        "role": "issue16a-current-tip-port"
+      }
+    ],
+    "skippedByResourceGate": [
+      {
+        "capability": "backlog-review-bundle",
+        "covers": [
+          "issue14-current-tip",
+          "storage17a-current-tip",
+          "v66-r1"
+        ],
+        "reason": "disk margin below optional threshold after five critical births",
+        "cFreeGB": 70.42
+      }
+    ],
+    "readyButNotLaunched": [
+      {
+        "capability": "tier1-lifecycle-smoke",
+        "reason": "separate explicit isolated runtime launch authority required"
+      },
+      {
+        "capability": "execution-lease",
+        "reason": "waits on W76 Lawnmower/ExecutionBaseSHA repair + fresh review"
+      },
+      {
+        "capability": "issue13-pstack-adapter",
+        "reason": "production ECP protected evaluator/profile contract still absent"
+      }
+    ],
+    "resourcesAtLaunch": {
+      "codexCount": 79,
+      "freeRAMGB": 22.66,
+      "cFreeGB": 70.42
+    }
   },
   "waveReportingContract": {
     "required": true,
