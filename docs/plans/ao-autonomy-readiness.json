@@ -1,11 +1,11 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-05T20:15:53.422869-04:00",
+  "updatedAt": "2026-10-05T20:47:59.730336-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
-    "qualifiedReach": 43.0,
+    "qualifiedReach": 40.6,
     "buildReach": 53.9,
     "buildReachDisplay": 54,
     "currentMilestone": "M2",
@@ -13,8 +13,8 @@
     "nextMilestone": "M3",
     "nextMilestoneName": "Durable Work Lifecycle",
     "nextMilestoneThreshold": 45,
-    "pointsToNextMilestone": 2.0,
-    "projectedQualifiedAfterCurrentWave": 47.6
+    "pointsToNextMilestone": 4.4,
+    "projectedQualifiedAfterCurrentWave": 45.8
   },
   "stageRuler": {
     "UNMAPPED": 0,
@@ -94,14 +94,14 @@
     {
       "id": "session-resume",
       "weightPercent": 12,
-      "qualifiedStage": 45,
+      "qualifiedStage": 25,
       "buildStage": 45,
       "issues": [
         "AO#21",
         "ECP#16"
       ],
-      "state": "AO Session Resume candidate 55c3e6a4 is fresh independent review PASS. ECP repaired compiler/staging candidate e12f7487 is current-base candidate green pending W69 fresh review. W69 also ports AO exact reviewed delta to current upstream 31f9cc59.",
-      "nextGate": "ECP e12f7487 fresh review PASS, then Session Resume macro can advance to FRESH_REVIEW_PASS; AO current-tip port/review/runtime packet follows."
+      "state": "AO Session Resume donor 55c3e6a4 remains fresh-review PASS; exact current-tip 29-path port is staged on 31f9cc59 and W70 validation/commit is active. ECP fresh review found blocking R4/R5 in e12f7487, so cross-repo macro regresses to IMPLEMENTATION_PACKET_READY until repaired candidate is green.",
+      "nextGate": "ECP R4/R5 repaired candidate green + AO current-tip committed candidate; then fresh reviews/current-tip runtime packet"
     },
     {
       "id": "lawnmower-reap-finalize",
@@ -113,8 +113,8 @@
         "AO#15",
         "ECP#28"
       ],
-      "state": "REAP remains fresh-review PASS. W68 FINALIZE R2 remains actively running on 658 with authorized adapter-owned ExecutionBaseSHA seam; carried untouched into W69.",
-      "nextGate": "FINALIZE current-base candidate green, then fresh review/runtime dogfood"
+      "state": "REAP fresh-review PASS. Preserved FINALIZE candidate has adapter-owned ExecutionBaseSHA publication/persistence implemented; W70 attacks the remaining expected-generation idle-only native Chat release seam before FINALIZE/GC completion.",
+      "nextGate": "FINALIZE combined candidate green, then fresh review/runtime dogfood"
     },
     {
       "id": "durable-work-identity-execution-lease",
@@ -125,8 +125,8 @@
         "AO#5",
         "AO#6"
       ],
-      "state": "Durable Work Identity remains fresh-review PASS. Shared ExecutionBaseSHA/Execution Lease packet is final and ready after prerequisite; no #6 implementation until active Lawnmower produces/reviews the prerequisite.",
-      "nextGate": "ExecutionBaseSHA prerequisite candidate/review, then #6 implementation from frozen packet"
+      "state": "Work Identity remains fresh-review PASS. Shared ExecutionBaseSHA source is implemented inside active Lawnmower candidate but uncommitted; final #6 packet remains ready after prerequisite candidate/review.",
+      "nextGate": "combined ExecutionBaseSHA/FINALIZE candidate and fresh review, then #6 implementation"
     },
     {
       "id": "worker-reports-event-outbox",
@@ -226,26 +226,23 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE69-20261005",
+    "id": "AO-WAVE70-20261005",
     "status": "LAUNCHED",
-    "frozenAOUpstream": "31f9cc59c7365afee6acc2dc3e8f377d2a78e41c",
-    "frozenECPOrigin": "e780c1a29150f87ecbc588ba99c869c54a03355e",
     "lanes": [
+      {
+        "session": "agent-orchestrator-658",
+        "capability": "lawnmower-reap-finalize",
+        "role": "finalize-r3-exact-chat-generation-release"
+      },
       {
         "session": "agent-orchestrator-655",
         "capability": "session-resume",
-        "role": "ao-current-tip-port"
+        "role": "ao-current-tip-validation-and-commit"
       },
       {
         "session": "execution-control-plane-105",
         "capability": "session-resume",
-        "role": "ecp-repaired-candidate-fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-658",
-        "capability": "lawnmower-reap-finalize",
-        "role": "carry-forward-running",
-        "untouched": true
+        "role": "ecp-r4-r5-repair"
       }
     ],
     "deferred": [
@@ -253,18 +250,18 @@
         "session": "agent-orchestrator-653",
         "capability": "spawn-recovery-lifecycle-continuity",
         "role": "tier1-composition-review",
-        "reason": "disk budget and M3 critical path"
+        "reason": "M3 critical-path priority"
       },
       {
         "capability": "execution-lease",
         "role": "implementation",
-        "reason": "shared ExecutionBaseSHA implementation/review not yet landed"
+        "reason": "shared ExecutionBaseSHA combined candidate/review not yet landed"
       }
     ],
     "resourcesAtLaunch": {
-      "freeRAMGB": 19.77,
-      "cFreeGB": 70.65,
-      "codexCount": 120
+      "freeRAMGB": 20.41,
+      "cFreeGB": 72.78,
+      "codexCount": 123
     }
   },
   "waveReportingContract": {
@@ -285,59 +282,55 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE68-20261005",
-    "partial": true,
-    "carriedForward": [
-      "agent-orchestrator-658"
-    ],
-    "qualifiedReachBefore": 40.6,
-    "qualifiedReachAfter": 43.0,
+    "wave": "AO-WAVE69-20261005",
+    "qualifiedReachBefore": 43.0,
+    "qualifiedReachAfter": 40.6,
     "buildReachBefore": 53.9,
     "buildReachAfter": 53.9,
     "milestoneBefore": "M2",
     "milestoneAfter": "M2",
-    "pointsToNextMilestone": 2.0,
-    "deltaReason": "Session Resume advanced from IMPLEMENTATION_PACKET_READY (25) to CURRENT_BASE_CANDIDATE_GREEN (45): AO candidate 55c3e6a4 passed fresh independent review and ECP repaired compiler/staging candidate e12f7487 is green pending fresh review. Lawnmower remained active and unharvested.",
+    "pointsToNextMilestone": 4.4,
+    "deltaReason": "Fresh ECP review found blocking R4/R5 defects in the Session Resume compiler/staging candidate, invalidating CURRENT_BASE_CANDIDATE_GREEN for the cross-repo macro. Session Resume therefore regressed 45->25. AO fresh-review PASS remains valid subcapability evidence. Lawnmower advanced its execution-base slice but produced no FINALIZE candidate.",
     "capabilityDeltas": [
       {
         "capability": "session-resume",
-        "before": 25,
-        "after": 45,
-        "evidence": "AO 55c3e6a4 fresh-review PASS + ECP e12f7487 repaired candidate green"
+        "before": 45,
+        "after": 25,
+        "evidence": "W69 ECP fresh review REPAIR R4/R5 on e12f748703ee659458489446e887cb2017d7c09c"
       }
     ],
     "subcapabilityProgress": [
       {
         "capability": "session-resume",
-        "subcapability": "AO Session Resume v1",
+        "subcapability": "AO Session Resume source",
         "evidenceStage": "FRESH_REVIEW_PASS",
         "candidate": "55c3e6a44e88d0d8606bfcc814cc205c0b692b9d"
       },
       {
         "capability": "session-resume",
-        "subcapability": "ECP compiler/staging",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "e12f748703ee659458489446e887cb2017d7c09c"
+        "subcapability": "AO current-tip port",
+        "evidenceStage": "STAGED_EXACT_PORT_PENDING_VALIDATION_ADJUDICATION",
+        "candidateTree": "4f22b3b76963f6f24d0742105aac5e80c2a4997c"
       },
       {
-        "capability": "durable-work-identity-execution-lease",
-        "subcapability": "ExecutionBaseSHA + #6 packet",
-        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
-        "candidate": "W68 final packet"
+        "capability": "lawnmower-reap-finalize",
+        "subcapability": "ExecutionBaseSHA prerequisite",
+        "evidenceStage": "IMPLEMENTED_UNCOMMITTED_BLOCKED_DOWNSTREAM_SEAM",
+        "candidate": "agent-orchestrator-658 preserved worktree"
       }
     ],
     "noMovement": [
       "lawnmower-reap-finalize"
     ],
     "newlyUnlocked": [
-      "ECP repaired compiler fresh review",
-      "AO Session Resume current-tip port",
-      "#6 implementation immediately after shared prerequisite acceptance"
+      "ECP R4/R5 bounded repair",
+      "AO current-tip validation adjudication",
+      "exact-generation Chat FINALIZE release scope"
     ],
     "criticalPath": [
       "Lawnmower FINALIZE candidate",
-      "ECP Session Resume fresh review",
-      "AO Session Resume current-tip port",
+      "ECP Session Resume R4/R5 repair/review",
+      "AO Session Resume current-tip commit/review",
       "ExecutionBaseSHA prerequisite review",
       "#6 Execution Lease"
     ]
