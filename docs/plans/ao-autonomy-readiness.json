@@ -1,11 +1,11 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-05T21:12:49.611863-04:00",
+  "updatedAt": "2026-10-05T21:51:40.705269-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
-    "qualifiedReach": 43.0,
+    "qualifiedReach": 40.6,
     "buildReach": 53.9,
     "buildReachDisplay": 54,
     "currentMilestone": "M2",
@@ -13,8 +13,8 @@
     "nextMilestone": "M3",
     "nextMilestoneName": "Durable Work Lifecycle",
     "nextMilestoneThreshold": 45,
-    "pointsToNextMilestone": 2.0,
-    "projectedQualifiedAfterCurrentWave": 47.6
+    "pointsToNextMilestone": 4.4,
+    "projectedQualifiedAfterCurrentWave": 45.8
   },
   "stageRuler": {
     "UNMAPPED": 0,
@@ -76,8 +76,8 @@
         "AO#2",
         "AO#22"
       ],
-      "state": "substantial foundation; effective runtime attestation remains separate",
-      "nextGate": "maintain canonical integration/evidence truth"
+      "state": "Historical foundation remains substantial. W72 is actively porting accepted #14 schema compatibility and resolving #13 against the exact current ECP trusted-evaluator contract.",
+      "nextGate": "#14 current-base candidate/review; #13 exact ECP contract -> AO adapter implementation"
     },
     {
       "id": "spawn-recovery-lifecycle-continuity",
@@ -88,20 +88,20 @@
         "AO#3",
         "AO#4"
       ],
-      "state": "RECOVERY source remains fresh-review PASS. Exact RECOVERY-only Tier1 current-tip composition finally under W71 fresh independent review after five deferred waves.",
-      "nextGate": "W71 Tier1 composition review PASS, then separately authorized isolated runtime smoke"
+      "state": "RECOVERY source and RECOVERY-only Tier1 current-tip composition are both fresh independent review PASS. Isolated runtime smoke is now the only remaining Tier1 gate and requires separate explicit runtime authority.",
+      "nextGate": "separately authorized isolated Tier1 runtime smoke"
     },
     {
       "id": "session-resume",
       "weightPercent": 12,
-      "qualifiedStage": 45,
+      "qualifiedStage": 25,
       "buildStage": 45,
       "issues": [
         "AO#21",
         "ECP#16"
       ],
-      "state": "AO current-tip Session Resume candidate 8afdc7c1 is candidate-green; ECP R1-R5 repaired compiler/staging candidate 0f725ea5 is candidate-green. W71 fresh independent reviews of both exact candidates are in flight.",
-      "nextGate": "Both W71 fresh reviews PASS -> cross-repo Session Resume FRESH_REVIEW_PASS; installed runtime/actuator dogfood remains separate."
+      "state": "ECP compiler/staging 0f725ea5 is FRESH_REVIEW_PASS. AO current-tip candidate 8afdc7c1 failed fresh review on one HIGH native-settings freshness race; W72 exact two-file owner repair is active.",
+      "nextGate": "AO freshness repair candidate green + fresh review; ECP side is already fresh-review qualified."
     },
     {
       "id": "lawnmower-reap-finalize",
@@ -113,7 +113,7 @@
         "AO#15",
         "ECP#28"
       ],
-      "state": "REAP remains fresh-review PASS; W70 FINALIZE R3 remains active on agent-orchestrator-658 and is carried untouched into W71.",
+      "state": "REAP fresh-review PASS; W70 FINALIZE R3 remains actively working on 658 and is carried untouched through W72.",
       "nextGate": "FINALIZE combined candidate green, then fresh review/runtime dogfood"
     },
     {
@@ -125,7 +125,7 @@
         "AO#5",
         "AO#6"
       ],
-      "state": "Work Identity fresh-review PASS. Shared ExecutionBaseSHA implementation remains inside active Lawnmower candidate; frozen #6 implementation packet waits on that prerequisite candidate/review.",
+      "state": "Work Identity fresh-review PASS. Shared ExecutionBaseSHA remains inside active Lawnmower candidate; final #6 packet remains ready but source implementation waits on prerequisite candidate/review.",
       "nextGate": "Lawnmower/ExecutionBaseSHA combined candidate + fresh review, then #6 implementation"
     },
     {
@@ -226,40 +226,40 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE71-20261005",
+    "id": "AO-WAVE72-20261005",
     "status": "LAUNCHED",
     "frozenAOUpstream": "9a1cb73134ac4f994efb1cd944ea1c17309708d8",
     "frozenECPOrigin": "e780c1a29150f87ecbc588ba99c869c54a03355e",
     "lanes": [
       {
-        "session": "agent-orchestrator-664",
+        "session": "agent-orchestrator-655",
         "capability": "session-resume",
-        "role": "ao-current-tip-fresh-review"
-      },
-      {
-        "session": "execution-control-plane-122",
-        "capability": "session-resume",
-        "role": "ecp-r1-r5-fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-665",
-        "capability": "spawn-recovery-lifecycle-continuity",
-        "role": "tier1-recovery-composition-review"
+        "role": "freshness-repair-r1"
       },
       {
         "session": "agent-orchestrator-666",
         "capability": "cli-hook-identity",
-        "role": "current-base-reconciliation"
+        "role": "implementation"
       },
       {
         "session": "agent-orchestrator-667",
         "capability": "proof-admission-foundation",
-        "role": "issue13-14-current-base-reconciliation"
+        "role": "issue14-current-base-implementation"
       },
       {
         "session": "agent-orchestrator-668",
         "capability": "storage-sustainability",
-        "role": "issues16-17-current-base-reconciliation"
+        "role": "issue17a-pure-implementation"
+      },
+      {
+        "session": "execution-control-plane-123",
+        "capability": "proof-admission-foundation",
+        "role": "issue13-shared-contract-reconciliation"
+      },
+      {
+        "session": "agent-orchestrator-669",
+        "capability": "storage-sustainability",
+        "role": "issue16-semantic-adjudication"
       },
       {
         "session": "agent-orchestrator-658",
@@ -268,10 +268,20 @@
         "untouched": true
       }
     ],
+    "readyButNotLaunched": [
+      {
+        "capability": "tier1-lifecycle-smoke",
+        "reason": "separate explicit isolated runtime launch authority required"
+      },
+      {
+        "capability": "execution-lease",
+        "reason": "shared ExecutionBaseSHA candidate/review not yet landed"
+      }
+    ],
     "resourcesAtLaunch": {
-      "freeRAMGB": 17.18,
-      "cFreeGB": 73.28,
-      "codexCount": 141
+      "freeRAMGB": 13.75,
+      "cFreeGB": 71.54,
+      "codexCount": 140
     }
   },
   "waveReportingContract": {
@@ -292,58 +302,69 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE70-20261005",
-    "partial": true,
-    "carriedForward": [
-      "agent-orchestrator-658"
-    ],
-    "qualifiedReachBefore": 40.6,
-    "qualifiedReachAfter": 43.0,
+    "wave": "AO-WAVE71-20261005",
+    "qualifiedReachBefore": 43.0,
+    "qualifiedReachAfter": 40.6,
     "buildReachBefore": 53.9,
     "buildReachAfter": 53.9,
     "milestoneBefore": "M2",
     "milestoneAfter": "M2",
-    "pointsToNextMilestone": 2.0,
-    "deltaReason": "Session Resume returned to CURRENT_BASE_CANDIDATE_GREEN (25->45): AO current-tip candidate 8afdc7c1 passed all owner gates and ECP R4/R5 repair candidate 0f725ea5 passed all owner gates. Both require fresh independent review. Lawnmower remained active and was not harvested.",
+    "pointsToNextMilestone": 4.4,
+    "deltaReason": "AO current-tip Session Resume fresh review found HIGH SR-NATIVE-FRESHNESS-AFTER-CATALOG, invalidating cross-repo CURRENT_BASE_CANDIDATE_GREEN. ECP R1-R5 remains FRESH_REVIEW_PASS. Other W71 lanes advanced packets/reviews without crossing weighted stages.",
     "capabilityDeltas": [
       {
         "capability": "session-resume",
-        "before": 25,
-        "after": 45,
-        "evidence": "AO 8afdc7c13e949eed9d977c08387247418df97e9d + ECP 0f725ea5f720657453f86b7433c6c75d4d606281 owner-green"
+        "before": 45,
+        "after": 25,
+        "evidence": "W71 AO fresh review REPAIR on 8afdc7c13e949eed9d977c08387247418df97e9d"
       }
     ],
     "subcapabilityProgress": [
       {
         "capability": "session-resume",
-        "subcapability": "AO current-tip Session Resume",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "8afdc7c13e949eed9d977c08387247418df97e9d"
+        "subcapability": "ECP compiler/staging",
+        "evidenceStage": "FRESH_REVIEW_PASS",
+        "candidate": "0f725ea5f720657453f86b7433c6c75d4d606281"
       },
       {
-        "capability": "session-resume",
-        "subcapability": "ECP R1-R5 compiler/staging",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "0f725ea5f720657453f86b7433c6c75d4d606281"
+        "capability": "spawn-recovery-lifecycle-continuity",
+        "subcapability": "Tier1 RECOVERY composition",
+        "evidenceStage": "FRESH_REVIEW_PASS",
+        "candidate": "frozen three-path composition on 3de63c52"
+      },
+      {
+        "capability": "proof-admission-foundation",
+        "subcapability": "CLI/Hook current-base packet",
+        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
+        "candidate": "W71 packet"
+      },
+      {
+        "capability": "proof-admission-foundation",
+        "subcapability": "#14 current-base packet",
+        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
+        "candidate": "W71 issue14 packet"
+      },
+      {
+        "capability": "storage-sustainability",
+        "subcapability": "#17-A",
+        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
+        "candidate": "W71 packet"
       }
     ],
-    "noMovement": [
-      "lawnmower-reap-finalize"
-    ],
     "newlyUnlocked": [
-      "AO current-tip Session Resume fresh review",
-      "ECP R1-R5 fresh review",
-      "deferred Tier1 RECOVERY composition review",
-      "CLI/Hook current-base reconciliation",
-      "#13/#14 current-base reconciliation",
-      "#16/#17 storage reconciliation"
+      "Tier1 isolated runtime smoke behind explicit authority",
+      "CLI/Hook implementation",
+      "#14 current-base implementation",
+      "#17-A pure implementation",
+      "#13 shared-contract reconciliation",
+      "#16 semantic packet adjudication"
     ],
     "criticalPath": [
       "Lawnmower FINALIZE candidate",
-      "Session Resume fresh reviews",
-      "Tier1 composition review",
+      "AO Session Resume freshness repair/review",
       "ExecutionBaseSHA prerequisite review",
-      "#6 Execution Lease"
+      "#6 Execution Lease",
+      "Tier1 runtime dogfood"
     ]
   }
 }
