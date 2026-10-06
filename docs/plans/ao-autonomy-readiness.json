@@ -1,7 +1,7 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-06T13:37:49.591324-04:00",
+  "updatedAt": "2026-10-06T14:41:36.219272-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
@@ -100,8 +100,8 @@
         "AO#21",
         "ECP#16"
       ],
-      "state": "AO and ECP source halves are FRESH_REVIEW_PASS. W75 current-tip reconciliation produced an executable 29-path packet; W76 semantic port to b7deb152 is active.",
-      "nextGate": "W76 b7deb current-tip candidate + fresh review; ECP actuator contract remains separate."
+      "state": "Source semantics remain fresh-review qualified. W77 committed b7 composition 12fd6307 and produced a 7c56 packet. W78 ports strict Chat-first Session Resume to latest dff591.",
+      "nextGate": "W78 latest candidate + fresh review; runtime/ECP composition later"
     },
     {
       "id": "lawnmower-reap-finalize",
@@ -113,8 +113,8 @@
         "AO#15",
         "ECP#28"
       ],
-      "state": "W75 fresh review found P1 F3 after R4: attached reviewer can survive while FINALIZE removes its workspace. W76 narrow manager/test repair active.",
-      "nextGate": "F3 repair candidate + fresh review, then current-tip semantic port/runtime qualification"
+      "state": "W77 full 7c56 semantic port implemented but commit held on an ambient-authority test incident. W78 adjudicates that incident, reruns scrubbed fixture-safe gates, commits if green, then reconciles latest dff591.",
+      "nextGate": "W78 committed candidate -> fresh review -> latest port/runtime qualification"
     },
     {
       "id": "durable-work-identity-execution-lease",
@@ -226,36 +226,36 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE77-20261006",
+    "id": "AO-WAVE78-20261006",
     "status": "LAUNCHED",
-    "frozenAOUpstream": "7c56deb79c5ae2bc025e67d9dda5fda2797c196d",
+    "frozenAOUpstream": "dff591270bd23f82056c10e0342d560ba277b3e7",
     "lanes": [
-      {
-        "session": "agent-orchestrator-687",
-        "capability": "session-resume",
-        "role": "execution-boundary-adjudication-and-current-tip-packet"
-      },
       {
         "session": "agent-orchestrator-690",
         "capability": "lawnmower-reap-finalize",
-        "role": "full-current-tip-semantic-port"
+        "role": "authority-adjudication-commit-latest-recon"
       },
       {
-        "session": "agent-orchestrator-691",
-        "capability": "autonomy-spine",
-        "role": "issue6-preflight-plus-issue7-8-packet-prep"
+        "session": "agent-orchestrator-694",
+        "capability": "session-resume",
+        "role": "latest-semantic-port"
       },
       {
-        "session": "agent-orchestrator-692",
+        "session": "agent-orchestrator-695",
         "capability": "runtime-attestation",
-        "role": "current-tip-semantic-port"
+        "role": "fresh-review-plus-latest-reconciliation"
       },
       {
-        "session": "agent-orchestrator-693",
-        "capability": "maintenance",
-        "role": "fresh-review-bundle"
+        "session": "agent-orchestrator-696",
+        "capability": "autonomy-spine",
+        "role": "finalize-issue6-and-preposition-issue9-10-11"
       }
     ],
+    "resourcesAtLaunch": {
+      "codexCount": 19,
+      "freeRAMGB": 24.37,
+      "cFreeGB": 71.65
+    },
     "prioritySpine": [
       "Lawnmower/ExecutionBaseSHA",
       "#6 Execution Lease",
@@ -263,16 +263,7 @@
       "#9 Parent Re-engagement",
       "#10 DAG/Backpressure",
       "#11 Overnight Chaos"
-    ],
-    "parallelM4Plumbing": [
-      "Session Resume current-tip/runtime qualification",
-      "Runtime permission attestation current-tip/runtime qualification"
-    ],
-    "resourcesAtLaunch": {
-      "codexCount": 23,
-      "freeRAMGB": 24.39,
-      "cFreeGB": 71.01
-    }
+    ]
   },
   "waveReportingContract": {
     "required": true,
@@ -292,7 +283,7 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE76-20261006",
+    "wave": "AO-WAVE77-20261006",
     "qualifiedReachBefore": 44.8,
     "qualifiedReachAfter": 44.8,
     "buildReachBefore": 53.9,
@@ -300,47 +291,39 @@
     "milestoneBefore": "M2",
     "milestoneAfter": "M2",
     "pointsToNextMilestone": 0.2,
-    "deltaReason": "No weighted macro crossed a stage. F3 was repaired on the Lawnmower lineage but the full current-tip port remained outstanding because current upstream overlaps the 74-path lineage and migration 0178 conflicted. Session Resume remained stage60. Attestation, CLI and #16 current-tip candidates advanced.",
-    "capabilityDeltas": [],
+    "deltaReason": "No weighted macro crossed a stage. Lawnmower full current-base source port was implemented but left uncommitted after an ambient live-loopback authority incident. Session Resume produced committed candidate 12fd6307 and a later-target packet. Attestation produced candidate a6f64f66. #7/#8 packets became ready and #6 permission-boundary design was resolved.",
     "subcapabilityProgress": [
       {
         "capability": "lawnmower-reap-finalize",
-        "subcapability": "F3 reviewer lifecycle repair",
-        "evidenceStage": "LOCAL_REPAIR_CANDIDATE_GREEN",
-        "candidate": "64c16be38d89ad0879f711df8b04a9005ca3e123"
+        "evidenceStage": "SOURCE_PORT_IMPLEMENTED_UNCOMMITTED_AUTHORITY_INCIDENT",
+        "candidate": "W77 preserved 7c56 working tree"
+      },
+      {
+        "capability": "session-resume",
+        "evidenceStage": "COMMITTED_SOURCE_CANDIDATE_PLUS_TARGET_PACKET",
+        "candidate": "12fd6307dfe1e23a901c3e0ecf4ec70ef73255a8"
       },
       {
         "capability": "runtime-attestation",
         "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "7d014ff8e61ba7f977a329d7f19faf5fc38fe44e"
+        "candidate": "a6f64f6686929deb20de6cc5c467b9027afcf4ad"
       },
       {
-        "capability": "cli-hook-identity",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "5199970b53d598bd98c03441225220c78a3f3e22"
-      },
-      {
-        "capability": "provider-event-retention",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "9344b8e55109e9c42af3c9836e959f99f0ed94fe"
-      },
-      {
-        "capability": "session-resume",
-        "subcapability": "b7 semantic current-base composition",
-        "evidenceStage": "SOURCE_COMPOSITION_GREEN_UNCOMMITTED_BOUNDARY_ADJUDICATION",
-        "candidate": "29-path preserved worktree agent-orchestrator-687"
+        "capability": "worker-reports-event-outbox",
+        "evidenceStage": "ISSUE7_AND_ISSUE8_PACKETS_READY",
+        "candidate": "W77 source packets"
       }
     ],
     "newlyUnlocked": [
-      "current-tip Lawnmower semantic port with migrations 0181/0182",
-      "#6 current-tip preflight and 0183 lease reservation",
-      "#7/#8 sibling packet preparation",
-      "Session Resume source-boundary adjudication",
-      "attestation current-tip semantic port"
+      "#6 permission-boundary decision",
+      "completed #7/#8 coexistence contract",
+      "#9/#10/#11 read-only pre-positioning",
+      "maintenance fresh-review PASS bundle"
     ],
     "criticalPath": [
-      "Lawnmower current-tip candidate/review",
-      "Execution Lease",
+      "W78 Lawnmower commit/reconcile",
+      "Lawnmower fresh review/latest port",
+      "#6 Execution Lease",
       "#7/#8 Outbox+Reports",
       "#9 Parent Re-engagement",
       "#10 DAG/Backpressure",
@@ -348,25 +331,16 @@
     ]
   },
   "runtimeAttestation": {
-    "state": "FRESH_REVIEW_PASS_SOURCE_SLICE_PORTING_CURRENT_TIP",
-    "sourceCandidate": "3a1e5c32795fb55b30e9b542905b55deb4f38fc7",
-    "target": "b7deb152ffe988c6198a1fed9312ca4230f50fb6",
-    "requestedPosture": {
-      "permission": "bypass-permissions",
-      "approvalPolicy": "never",
-      "sandbox": "danger-full-access"
-    },
+    "state": "CURRENT_BASE_CANDIDATE_REVIEWING_AND_RECONCILING_LATEST",
+    "candidate": "a6f64f6686929deb20de6cc5c467b9027afcf4ad",
+    "candidateBase": "7c56deb79c5ae2bc025e67d9dda5fda2797c196d",
+    "latestTarget": "dff591270bd23f82056c10e0342d560ba277b3e7",
     "currentAdmission": "UNATTESTED_DIRECT_AO_USER_APPROVED",
     "effectiveRuntimeProof": "UNPROVEN",
-    "provenAtSource": [
-      "provider-native thread/start-resume permission readback",
-      "same-thread validation",
-      "controller-generation binding"
-    ],
     "remaining": [
-      "current-tip port/review",
-      "per-turn freshness",
-      "settings-change freshness",
+      "fresh independent candidate review",
+      "latest semantic port",
+      "per-turn/settings freshness",
       "ECP autonomous admission consumption",
       "installed runtime qualification"
     ]
