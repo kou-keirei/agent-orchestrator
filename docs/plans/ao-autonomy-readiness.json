@@ -1,7 +1,7 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-06T12:13:20.974672-04:00",
+  "updatedAt": "2026-10-06T13:37:49.591324-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
@@ -226,66 +226,52 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE76-20261006",
+    "id": "AO-WAVE77-20261006",
     "status": "LAUNCHED",
-    "frozenAOUpstream": "b7deb152ffe988c6198a1fed9312ca4230f50fb6",
+    "frozenAOUpstream": "7c56deb79c5ae2bc025e67d9dda5fda2797c196d",
     "lanes": [
-      {
-        "session": "agent-orchestrator-685",
-        "capability": "lawnmower-reap-finalize",
-        "role": "F3-repair"
-      },
-      {
-        "session": "agent-orchestrator-686",
-        "capability": "runtime-attestation",
-        "role": "current-tip-port"
-      },
       {
         "session": "agent-orchestrator-687",
         "capability": "session-resume",
+        "role": "execution-boundary-adjudication-and-current-tip-packet"
+      },
+      {
+        "session": "agent-orchestrator-690",
+        "capability": "lawnmower-reap-finalize",
+        "role": "full-current-tip-semantic-port"
+      },
+      {
+        "session": "agent-orchestrator-691",
+        "capability": "autonomy-spine",
+        "role": "issue6-preflight-plus-issue7-8-packet-prep"
+      },
+      {
+        "session": "agent-orchestrator-692",
+        "capability": "runtime-attestation",
         "role": "current-tip-semantic-port"
       },
       {
-        "session": "agent-orchestrator-688",
-        "capability": "cli-hook-identity",
-        "role": "current-tip-semantic-port"
-      },
-      {
-        "session": "agent-orchestrator-689",
-        "capability": "provider-event-retention",
-        "role": "issue16a-current-tip-port"
+        "session": "agent-orchestrator-693",
+        "capability": "maintenance",
+        "role": "fresh-review-bundle"
       }
     ],
-    "skippedByResourceGate": [
-      {
-        "capability": "backlog-review-bundle",
-        "covers": [
-          "issue14-current-tip",
-          "storage17a-current-tip",
-          "v66-r1"
-        ],
-        "reason": "disk margin below optional threshold after five critical births",
-        "cFreeGB": 70.42
-      }
+    "prioritySpine": [
+      "Lawnmower/ExecutionBaseSHA",
+      "#6 Execution Lease",
+      "#7/#8 Outbox+Reports",
+      "#9 Parent Re-engagement",
+      "#10 DAG/Backpressure",
+      "#11 Overnight Chaos"
     ],
-    "readyButNotLaunched": [
-      {
-        "capability": "tier1-lifecycle-smoke",
-        "reason": "separate explicit isolated runtime launch authority required"
-      },
-      {
-        "capability": "execution-lease",
-        "reason": "waits on W76 Lawnmower/ExecutionBaseSHA repair + fresh review"
-      },
-      {
-        "capability": "issue13-pstack-adapter",
-        "reason": "production ECP protected evaluator/profile contract still absent"
-      }
+    "parallelM4Plumbing": [
+      "Session Resume current-tip/runtime qualification",
+      "Runtime permission attestation current-tip/runtime qualification"
     ],
     "resourcesAtLaunch": {
-      "codexCount": 79,
-      "freeRAMGB": 22.66,
-      "cFreeGB": 70.42
+      "codexCount": 23,
+      "freeRAMGB": 24.39,
+      "cFreeGB": 71.01
     }
   },
   "waveReportingContract": {
@@ -306,7 +292,7 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE75-20261006",
+    "wave": "AO-WAVE76-20261006",
     "qualifiedReachBefore": 44.8,
     "qualifiedReachAfter": 44.8,
     "buildReachBefore": 53.9,
@@ -314,30 +300,51 @@
     "milestoneBefore": "M2",
     "milestoneAfter": "M2",
     "pointsToNextMilestone": 0.2,
-    "deltaReason": "No weighted macro changed stage. Lawnmower remained stage25 after fresh review found F3. Session Resume remained stage60. Attestation/#16 achieved fresh-review PASS source slices; #14/Storage17 current-tip candidates and CLI/Session Resume implementation packets were produced.",
+    "deltaReason": "No weighted macro crossed a stage. F3 was repaired on the Lawnmower lineage but the full current-tip port remained outstanding because current upstream overlaps the 74-path lineage and migration 0178 conflicted. Session Resume remained stage60. Attestation, CLI and #16 current-tip candidates advanced.",
+    "capabilityDeltas": [],
     "subcapabilityProgress": [
       {
+        "capability": "lawnmower-reap-finalize",
+        "subcapability": "F3 reviewer lifecycle repair",
+        "evidenceStage": "LOCAL_REPAIR_CANDIDATE_GREEN",
+        "candidate": "64c16be38d89ad0879f711df8b04a9005ca3e123"
+      },
+      {
         "capability": "runtime-attestation",
-        "evidenceStage": "FRESH_REVIEW_PASS_SOURCE_SLICE",
-        "candidate": "3a1e5c32795fb55b30e9b542905b55deb4f38fc7"
+        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "candidate": "7d014ff8e61ba7f977a329d7f19faf5fc38fe44e"
+      },
+      {
+        "capability": "cli-hook-identity",
+        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "candidate": "5199970b53d598bd98c03441225220c78a3f3e22"
       },
       {
         "capability": "provider-event-retention",
-        "evidenceStage": "FRESH_REVIEW_PASS",
-        "candidate": "cad65c5ac087911cb57478bec3ed4ea95b9ddab3"
+        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "candidate": "9344b8e55109e9c42af3c9836e959f99f0ed94fe"
       },
       {
-        "capability": "proof-admission-foundation",
-        "subcapability": "#14 current-tip port",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "e287a8e315a82b3a37596998b122c3116493b355"
-      },
-      {
-        "capability": "storage-sustainability",
-        "subcapability": "#17-A current-tip port",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
-        "candidate": "19b783a42acaa96b2c6b69e0c4c874e39863e5fe"
+        "capability": "session-resume",
+        "subcapability": "b7 semantic current-base composition",
+        "evidenceStage": "SOURCE_COMPOSITION_GREEN_UNCOMMITTED_BOUNDARY_ADJUDICATION",
+        "candidate": "29-path preserved worktree agent-orchestrator-687"
       }
+    ],
+    "newlyUnlocked": [
+      "current-tip Lawnmower semantic port with migrations 0181/0182",
+      "#6 current-tip preflight and 0183 lease reservation",
+      "#7/#8 sibling packet preparation",
+      "Session Resume source-boundary adjudication",
+      "attestation current-tip semantic port"
+    ],
+    "criticalPath": [
+      "Lawnmower current-tip candidate/review",
+      "Execution Lease",
+      "#7/#8 Outbox+Reports",
+      "#9 Parent Re-engagement",
+      "#10 DAG/Backpressure",
+      "#11 Overnight Chaos"
     ]
   },
   "runtimeAttestation": {
@@ -363,5 +370,23 @@
       "ECP autonomous admission consumption",
       "installed runtime qualification"
     ]
+  },
+  "roadmapPriorityRevision": {
+    "date": "2026-10-06",
+    "canonicalSpine": [
+      "Lawnmower/ExecutionBaseSHA",
+      "#6",
+      "#7/#8",
+      "#9",
+      "#10",
+      "#11"
+    ],
+    "parallel": [
+      "Session Resume",
+      "Runtime Permission Attestation",
+      "Storage Sustainability",
+      "CLI/Hook and compatibility maintenance"
+    ],
+    "issue13Rule": "AO #13 is not a serial autonomy blocker while the production ECP protected-evaluator/profile contract is absent"
   }
 }
