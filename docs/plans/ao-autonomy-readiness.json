@@ -1,20 +1,20 @@
 {
   "schema": "ao.autonomy-readiness.v1",
   "project": "agent-orchestrator-fork",
-  "updatedAt": "2026-10-05T22:33:34.438972-04:00",
+  "updatedAt": "2026-10-05T23:45:23.469519-04:00",
   "baselineWave": "AO-WAVE62-20261005",
   "scoring": {
     "formula": "sum(weightPercent * stagePercent) / 100",
-    "qualifiedReach": 45.8,
+    "qualifiedReach": 44.8,
     "buildReach": 53.9,
     "buildReachDisplay": 54,
-    "currentMilestone": "M3",
-    "currentMilestoneName": "Durable Work Lifecycle",
-    "nextMilestone": "M4",
-    "nextMilestoneName": "Autonomous Orchestration",
-    "nextMilestoneThreshold": 65,
-    "pointsToNextMilestone": 19.2,
-    "projectedQualifiedAfterCurrentWave": null
+    "currentMilestone": "M2",
+    "currentMilestoneName": "Recoverable Lifecycle",
+    "nextMilestone": "M3",
+    "nextMilestoneName": "Durable Work Lifecycle",
+    "nextMilestoneThreshold": 45,
+    "pointsToNextMilestone": 0.2,
+    "projectedQualifiedAfterCurrentWave": 47.6
   },
   "stageRuler": {
     "UNMAPPED": 0,
@@ -76,8 +76,8 @@
         "AO#2",
         "AO#22"
       ],
-      "state": "#14 current-base implementation R1 active; #13 remains blocked on absent concrete ECP protected-evaluator contract.",
-      "nextGate": "#14 candidate/review; ECP-WORK-017 contract before #13 AO adapter implementation"
+      "state": "#14 current-base candidate 0207b6a8 and CLI/Hook candidate 9506122d are under W74 fresh review. #13 remains blocked because new ECP SC1 interfaces are reference-only/synthetic rather than production evaluator authority.",
+      "nextGate": "CLI/#14 fresh review; production ECP evaluator contract before #13 AO adapter implementation"
     },
     {
       "id": "spawn-recovery-lifecycle-continuity",
@@ -94,27 +94,27 @@
     {
       "id": "session-resume",
       "weightPercent": 12,
-      "qualifiedStage": 45,
+      "qualifiedStage": 60,
       "buildStage": 45,
       "issues": [
         "AO#21",
         "ECP#16"
       ],
-      "state": "AO repaired current-tip candidate 17e7a6d9 is owner-green pending W73 fresh review; ECP compiler/staging 0f725ea5 is FRESH_REVIEW_PASS. Cross-repo macro returns to CURRENT_BASE_CANDIDATE_GREEN.",
-      "nextGate": "W73 AO fresh review PASS -> source halves both FRESH_REVIEW_PASS; runtime/actuator qualification later."
+      "state": "AO current-tip repaired candidate 17e7a6d9 and ECP compiler/staging 0f725ea5 are both FRESH_REVIEW_PASS. W74 current-base ECP actuator reconciliation is in flight; runtime dogfood and permission attestation remain separate.",
+      "nextGate": "W74 actuator packet, then separately authorized actuator implementation/runtime qualification"
     },
     {
       "id": "lawnmower-reap-finalize",
       "weightPercent": 14,
-      "qualifiedStage": 45,
+      "qualifiedStage": 25,
       "buildStage": 60,
       "issues": [
         "AO#20",
         "AO#15",
         "ECP#28"
       ],
-      "state": "Combined Lawnmower candidate a1f42e13 is source/fixture candidate-green with REAP, ExecutionBaseSHA, FINALIZE and terminal GC; W73 fresh independent review in flight. Latest upstream has zero 74-path overlap.",
-      "nextGate": "W73 fresh review PASS, then installed-runtime qualification/dogfood"
+      "state": "W73 fresh review found two blocking P1s in candidate a1f42e13: Windows case-variant live-successor preservation and context-unbounded exact Chat release. W74 narrow same-owner repair active.",
+      "nextGate": "W74 repaired candidate green + fresh review, then installed-runtime qualification"
     },
     {
       "id": "durable-work-identity-execution-lease",
@@ -125,8 +125,8 @@
         "AO#5",
         "AO#6"
       ],
-      "state": "Work Identity remains fresh-review PASS. Shared ExecutionBaseSHA is committed inside Lawnmower candidate a1f42e13 and under W73 fresh review; final #6 packet is ready.",
-      "nextGate": "W73 shared-prerequisite review PASS -> #6 implementation"
+      "state": "Work Identity remains fresh-review PASS. Shared ExecutionBaseSHA source exists inside Lawnmower lineage but acceptance is coupled to the repaired Lawnmower fresh review; final #6 packet waits.",
+      "nextGate": "repaired Lawnmower/ExecutionBaseSHA fresh review PASS -> #6 implementation"
     },
     {
       "id": "worker-reports-event-outbox",
@@ -226,44 +226,45 @@
     ]
   },
   "currentWave": {
-    "id": "AO-WAVE73-20261005",
+    "id": "AO-WAVE74-20261005",
     "status": "LAUNCHED",
     "frozenAOUpstream": "9a1cb73134ac4f994efb1cd944ea1c17309708d8",
+    "frozenECPOrigin": "b52ce5efc878c0f622e4e37522c25ec56d21183a",
     "lanes": [
       {
-        "session": "agent-orchestrator-670",
+        "session": "agent-orchestrator-658",
         "capability": "lawnmower-reap-finalize",
-        "role": "fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-671",
-        "capability": "session-resume",
-        "role": "ao-repaired-candidate-fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-672",
-        "capability": "storage-sustainability",
-        "role": "storage17a-fresh-review"
-      },
-      {
-        "session": "agent-orchestrator-666",
-        "capability": "cli-hook-identity",
-        "role": "commit-gate-r1"
-      },
-      {
-        "session": "agent-orchestrator-667",
-        "capability": "proof-admission-foundation",
-        "role": "issue14-r1"
+        "role": "F1-F2-repair"
       },
       {
         "session": "agent-orchestrator-669",
         "capability": "provider-event-retention",
-        "role": "issue16a-implementation"
+        "role": "issue16a-r1"
       },
       {
         "session": "agent-orchestrator-673",
         "capability": "historical-sqlite-upgrade",
-        "role": "v66-current-tip-revalidation"
+        "role": "v66-two-path-implementation"
+      },
+      {
+        "session": "agent-orchestrator-674",
+        "capability": "runtime-attestation",
+        "role": "native-permission-attestation-slice-a"
+      },
+      {
+        "session": "agent-orchestrator-675",
+        "capability": "cli-hook-identity",
+        "role": "fresh-review"
+      },
+      {
+        "session": "agent-orchestrator-676",
+        "capability": "proof-admission-foundation",
+        "role": "issue14-fresh-review"
+      },
+      {
+        "session": "execution-control-plane-154",
+        "capability": "session-resume",
+        "role": "actuator-current-base-reconciliation"
       }
     ],
     "readyButNotLaunched": [
@@ -273,17 +274,17 @@
       },
       {
         "capability": "execution-lease",
-        "reason": "waits on W73 shared ExecutionBaseSHA fresh review"
+        "reason": "waits on repaired shared ExecutionBaseSHA/Lawnmower fresh review"
       },
       {
         "capability": "issue13-pstack-adapter",
-        "reason": "current ECP protected evaluator/profile API is not implemented/contracted"
+        "reason": "ECP SC1 source is reference-only/synthetic, not production evaluator authority"
       }
     ],
     "resourcesAtLaunch": {
-      "freeRAMGB": 16.57,
-      "cFreeGB": 73.53,
-      "codexCount": 132
+      "freeRAMGB": 18.67,
+      "cFreeGB": 70.87,
+      "codexCount": 129
     }
   },
   "waveReportingContract": {
@@ -304,69 +305,94 @@
     "rule": "Worker launch alone never changes readiness. Advance stages only from durable qualifying evidence."
   },
   "lastHarvest": {
-    "wave": "AO-WAVE72-20261005",
-    "qualifiedReachBefore": 40.6,
-    "qualifiedReachAfter": 45.8,
+    "wave": "AO-WAVE73-20261005",
+    "qualifiedReachBefore": 45.8,
+    "qualifiedReachAfter": 44.8,
     "buildReachBefore": 53.9,
     "buildReachAfter": 53.9,
-    "milestoneBefore": "M2",
-    "milestoneAfter": "M3",
-    "pointsToNextMilestone": 19.2,
-    "deltaReason": "Session Resume advanced 25->45 after exact AO freshness repair 17e7a6d9 became owner-green while ECP remained FRESH_REVIEW_PASS. Lawnmower advanced 25->45 after combined candidate a1f42e13 became owner-green. All four M3 hard gates are now >=45 at candidate level.",
+    "milestoneBefore": "M3",
+    "milestoneAfter": "M2",
+    "pointsToNextMilestone": 0.2,
+    "deltaReason": "Session Resume advanced 45->60 on fresh AO review PASS, while Lawnmower regressed 45->25 after fresh review found two blocking P1 source defects. Net -1.0 weighted point. Other backlog lanes advanced without changing weighted macro stages.",
     "capabilityDeltas": [
       {
         "capability": "session-resume",
-        "before": 25,
-        "after": 45,
-        "evidence": "AO 17e7a6d93de9585f37d8f173cb1cc4fb8980fd3a + ECP 0f725ea5f720657453f86b7433c6c75d4d606281"
+        "before": 45,
+        "after": 60,
+        "evidence": "W73 AO fresh review PASS on 17e7a6d93de9585f37d8f173cb1cc4fb8980fd3a plus ECP fresh review PASS"
       },
       {
         "capability": "lawnmower-reap-finalize",
-        "before": 25,
-        "after": 45,
-        "evidence": "a1f42e135e019f988b6caa9df2c2e4e390e4faa0"
+        "before": 45,
+        "after": 25,
+        "evidence": "W73 fresh review REPAIR F1/F2 on a1f42e135e019f988b6caa9df2c2e4e390e4faa0"
       }
     ],
     "subcapabilityProgress": [
       {
         "capability": "storage-sustainability",
         "subcapability": "#17-A",
-        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "evidenceStage": "FRESH_REVIEW_PASS",
         "candidate": "988061c904c6b3fe618ecab0cdc840d38aa9c91a"
-      },
-      {
-        "capability": "provider-event-retention",
-        "subcapability": "#16-A",
-        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
-        "candidate": "W72 packet"
       },
       {
         "capability": "cli-hook-identity",
         "subcapability": "current-base port",
-        "evidenceStage": "IMPLEMENTED_UNCOMMITTED",
-        "candidatePatch": "6f08b7536f1326b39cf0a3ff688bf1c11107a7535ae81f303cb52395c9b7c5b8"
+        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "candidate": "9506122d9c608b241145692daa13f603487ecf81"
       },
       {
         "capability": "proof-admission-foundation",
         "subcapability": "#14 current-base port",
-        "evidenceStage": "BLOCKED_BEFORE_IMPLEMENTATION_ENVIRONMENT",
-        "candidate": null
+        "evidenceStage": "CURRENT_BASE_CANDIDATE_GREEN",
+        "candidate": "0207b6a873c5735edc0d79f3d609bd9224b54dfd"
+      },
+      {
+        "capability": "provider-event-retention",
+        "subcapability": "#16-A",
+        "evidenceStage": "IMPLEMENTED_UNCOMMITTED_SCOPE_STOP",
+        "candidate": "two-file preserved worktree"
+      },
+      {
+        "capability": "historical-sqlite-upgrade",
+        "subcapability": "v66 repair",
+        "evidenceStage": "IMPLEMENTATION_PACKET_READY",
+        "candidate": "W73 packet"
       }
     ],
     "newlyUnlocked": [
-      "M3 Durable Work Lifecycle",
-      "#6 after Lawnmower/ExecutionBaseSHA fresh review",
-      "Lawnmower installed-runtime qualification",
-      "Session Resume source fresh review",
-      "#17-A fresh review",
-      "#16-A implementation"
+      "native runtime permission attestation implementation",
+      "CLI/Hook fresh review",
+      "#14 fresh review",
+      "#16-A R1",
+      "v66 implementation",
+      "Session Resume actuator current-base reconciliation"
     ],
     "criticalPath": [
-      "Lawnmower fresh review/runtime proof",
-      "Session Resume AO fresh review",
+      "Lawnmower repair/review",
+      "runtime permission attestation",
       "Execution Lease",
-      "#14 compatibility candidate",
+      "Session Resume actuator/runtime qualification",
       "Tier1 runtime dogfood"
+    ]
+  },
+  "runtimeAttestation": {
+    "state": "ACTIVE_IMPLEMENTATION",
+    "stage": "SLICE_A_NATIVE_LAUNCH_RESUME_READBACK",
+    "owner": "agent-orchestrator-674",
+    "requestedPosture": {
+      "permission": "bypass-permissions",
+      "approvalPolicy": "never",
+      "sandbox": "danger-full-access"
+    },
+    "currentAdmission": "UNATTESTED_DIRECT_AO_USER_APPROVED",
+    "effectiveRuntimeProof": "UNPROVEN",
+    "sliceAGoal": "capture provider-returned thread/start or thread/resume approval/sandbox snapshot and bind it to exact provider thread and controller generation",
+    "notYetProven": [
+      "live reconnect without retained native snapshot",
+      "per-turn override/effective posture after settings-changing turns",
+      "ECP_AUTONOMOUS qualification",
+      "installed runtime dogfood"
     ]
   }
 }
