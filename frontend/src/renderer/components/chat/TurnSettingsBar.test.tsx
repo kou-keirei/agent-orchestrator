@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { ChatConfigOption } from "../../types/conversation";
+import type { ApprovalMode, ChatConfigOption } from "../../types/conversation";
 import { TurnSettingsBar } from "./TurnSettingsBar";
 
 const OPTIONS: ChatConfigOption[] = [
@@ -121,7 +121,7 @@ describe.each(["native", "ACP submenu", "ACP standalone"] as const)("%s model se
 		expect(screen.getAllByRole("menuitemradio")).toHaveLength(1);
 		await user.click(screen.getByRole("menuitemradio", { name: "Model 99" }));
 		if (path === "native") {
-			expect(onChange).toHaveBeenCalledWith({ model: "provider-1/model-99", reasoningEffort: undefined, approvalMode: "accept-edits" });
+			expect(onChange).toHaveBeenCalledWith({ model: "provider-1/model-99", reasoningEffort: undefined, reasoningEffortSet: false, approvalMode: "accept-edits" });
 		} else {
 			expect(onChange).toHaveBeenCalledWith("model", { value: "provider-1/model-99" });
 		}
@@ -627,6 +627,55 @@ describe("ACP session config options", () => {
 		expect(
 			screen.queryByRole("button", { name: "Model and reasoning effort for the next turn" }),
 		).not.toBeInTheDocument();
+	});
+});
+
+describe.each([undefined, "codex"])("%s approval policy compatibility", (harness) => {
+	it("labels the current read-only policy and marks it selected", async () => {
+		const user = userEvent.setup();
+		const onChange = vi.fn();
+		render(<TurnSettingsBar models={[]} harness={harness}
+			settings={{ approvalMode: "read-only" }} onChange={onChange} />);
+
+		const trigger = screen.getByRole("button", { name: "Approval policy for the next turn" });
+		expect(trigger).toHaveTextContent("Read-only");
+		await user.click(trigger);
+		expect(screen.getByRole("menuitemradio", { name: "Read-only" })).toHaveAttribute("aria-checked", "true");
+		expect(onChange).not.toHaveBeenCalled();
+	});
+
+	it("selects read-only without changing the other turn settings", async () => {
+		const user = userEvent.setup();
+		const onChange = vi.fn();
+		const settings = {
+			model: "custom-model", reasoningEffort: "high", reasoningEffortSet: true,
+			approvalMode: "default" as const,
+		};
+		render(<TurnSettingsBar models={[]} harness={harness} settings={settings} onChange={onChange} />);
+
+		await user.click(screen.getByRole("button", { name: "Approval policy for the next turn" }));
+		const choice = screen.getByRole("menuitemradio", { name: "Read-only" });
+		expect(choice).toHaveAttribute("aria-checked", "false");
+		await user.click(choice);
+		expect(onChange).toHaveBeenCalledExactlyOnceWith({ ...settings, approvalMode: "read-only" });
+	});
+
+	it("renders a future approval mode without guessing or changing its policy", async () => {
+		const user = userEvent.setup();
+		const onChange = vi.fn();
+		// Model a newer daemon's wire value outside this renderer's known union.
+		const settings = { approvalMode: "future-mode" as ApprovalMode, model: "custom-model" };
+		render(<TurnSettingsBar models={[]} harness={harness} settings={settings} onChange={onChange} />);
+
+		const trigger = screen.getByRole("button", { name: "Approval policy for the next turn" });
+		expect(trigger).toHaveTextContent("Unknown approval mode");
+		expect(onChange).not.toHaveBeenCalled();
+		await user.click(trigger);
+		for (const choice of screen.getAllByRole("menuitemradio")) {
+			expect(choice).toHaveAttribute("aria-checked", "false");
+		}
+		await user.click(screen.getByRole("menuitemradio", { name: "Read-only" }));
+		expect(onChange).toHaveBeenCalledExactlyOnceWith({ ...settings, approvalMode: "read-only" });
 	});
 });
 
