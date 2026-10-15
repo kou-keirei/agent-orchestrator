@@ -144,7 +144,7 @@ export function TurnSettingsBar({
 			: settings.reasoningEffort ?? (selected ?? fallback)?.defaultEffort ?? undefined;
 	const approvalCopy = harness === "codex" ? CODEX_APPROVAL_COPY : APPROVAL_COPY;
 	const approvalOrder = harness === "codex" ? CODEX_APPROVAL_ORDER : APPROVAL_ORDER;
-	const approvalLabel = approvalCopy[settings.approvalMode ?? "default"].label;
+	const approvalLabel = approvalCopy[settings.approvalMode ?? "default"]?.label ?? "Unknown approval mode";
 	const modelGroupLabel = effortLabel
 		? `${modelLabel} ${capitalize(effortLabel)}`
 		: modelLabel;
