@@ -1087,6 +1087,13 @@ SELECT EXISTS (
       AND status = 'pending'
 );
 
+-- All branches and promotion-reserved turns count as unfinished recovery work.
+-- name: HasUnsettledConversationTurns :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = ? AND state IN ('queued', 'running')
+);
+
 -- Any approval still pending when a controller dies can never be answered: the
 -- provider call it was blocking is gone.
 -- name: FailPendingConversationApprovals :exec

@@ -56,12 +56,14 @@ type Service struct {
 	onAccountChanged       func(domain.SessionID, string, domain.AgentHarness)
 	onCodexCapacityChanged func(domain.SessionID, string, ports.CodexCapacityObservation)
 	stopProviderHost       func(context.Context, domain.SessionID) error
+	restoreController      func(context.Context, domain.SessionID) error
 
 	mu           sync.RWMutex
 	controllers  map[domain.SessionID]*Controller
 	startConfigs map[domain.SessionID]StartConfig
 	gateMu       sync.Mutex
 	gates        map[domain.SessionID]controllerGate
+	inputGates   map[domain.SessionID]controllerGate
 	probeMu      sync.Mutex
 	probed       map[capabilityProbeKey]ports.ChatCapabilities
 }
@@ -142,6 +144,7 @@ func New(opts Options) *Service {
 		controllers:            make(map[domain.SessionID]*Controller),
 		startConfigs:           make(map[domain.SessionID]StartConfig),
 		gates:                  make(map[domain.SessionID]controllerGate),
+		inputGates:             make(map[domain.SessionID]controllerGate),
 		probed:                 make(map[capabilityProbeKey]ports.ChatCapabilities),
 	}
 }
@@ -995,13 +998,16 @@ func (s *Service) Send(
 	id domain.SessionID,
 	msg ports.ChatUserMessage,
 ) (domain.ConversationTurn, error) {
-	if _, err := s.requireChatSession(ctx, id); err != nil {
+	gate := s.inputGate(id)
+	if err := gate.lock(ctx); err != nil {
 		return domain.ConversationTurn{}, err
 	}
-	controller, err := s.Controller(id)
+	defer gate.unlock()
+	controller, release, err := s.workingController(ctx, id)
 	if err != nil {
 		return domain.ConversationTurn{}, err
 	}
+	defer release()
 	return controller.Send(ctx, msg)
 }
 
@@ -1287,7 +1293,7 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 			SessionID:           id,
 			Harness:             record.Harness,
 			Mode:                domain.NormalizeSessionMode(record.Mode),
-			Controller:          ports.ChatControllerStopped,
+			Controller:          s.absentControllerState(ctx, record),
 			PermissionFloor:     record.Metadata.Permissions,
 			NativeEvidence:      unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
 			DispatchConformance: unprovenDispatchConformance(),
@@ -1302,7 +1308,7 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 		return Snapshot{}, fmt.Errorf("load conversation %s: %w", conversation.ID, err)
 	}
 
-	state := ports.ChatControllerStopped
+	state := s.absentControllerState(ctx, record)
 	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
 	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
@@ -1351,7 +1357,7 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 			SessionID:           id,
 			Harness:             record.Harness,
 			Mode:                domain.NormalizeSessionMode(record.Mode),
-			Controller:          ports.ChatControllerStopped,
+			Controller:          s.absentControllerState(ctx, record),
 			PermissionFloor:     record.Metadata.Permissions,
 			NativeEvidence:      unprovenNativeEvidence(record.Harness, record.Metadata.Permissions),
 			DispatchConformance: unprovenDispatchConformance(),
@@ -1369,7 +1375,7 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("load conversation page %s: %w", conversation.ID, err)
 	}
-	state := ports.ChatControllerStopped
+	state := s.absentControllerState(ctx, record)
 	permissionFloor := record.Metadata.Permissions
 	var caps ports.ChatCapabilities
 	nativeEvidence := unprovenNativeEvidence(record.Harness, record.Metadata.Permissions)
@@ -1869,11 +1875,7 @@ func (s *Service) RelayChatTurnWithID(
 	id domain.SessionID,
 	text, clientMessageID string,
 ) (string, error) {
-	controller, err := s.Controller(id)
-	if err != nil {
-		return "", err
-	}
-	turn, err := controller.Send(ctx, ports.ChatUserMessage{
+	turn, err := s.Send(ctx, id, ports.ChatUserMessage{
 		Text:            text,
 		ClientMessageID: clientMessageID,
 		Origin:          domain.MessageOriginAutomation,

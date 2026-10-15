@@ -821,6 +821,12 @@ func (s *Store) HasConversationTurns(ctx context.Context, conversationID string)
 	return hasTurns, nil
 }
 
+// HasUnsettledConversationTurns includes hidden branches and promotion reservations.
+func (s *Store) HasUnsettledConversationTurns(ctx context.Context, conversationID string) (bool, error) {
+	work, err := s.qr.HasUnsettledConversationTurns(ctx, conversationID)
+	return work, err
+}
+
 // AppendUserMessage records an inbound message and the turn it opens.
 //
 // Idempotent on clientMessageID: a retried send returns the message and turn that

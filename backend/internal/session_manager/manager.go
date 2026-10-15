@@ -439,6 +439,7 @@ type Manager struct {
 	statusVerificationLimit        time.Duration
 	agentOpMu                      sync.Mutex
 	agentOperations                map[domain.SessionID]agentOperationKind
+	chatRestores                   map[domain.SessionID]*chatRestore
 	interfaceRecoveryMu            sync.Mutex
 	deferredInterfaceRecovery      map[domain.SessionID]string
 	// switchDecisionInput opens a narrow human-only terminal lane while the
@@ -782,6 +783,7 @@ func New(d Deps) *Manager {
 		backgroundContext:              d.BackgroundContext,
 		startupBackgroundReconcileDone: make(chan struct{}),
 		agentOperations:                make(map[domain.SessionID]agentOperationKind),
+		chatRestores:                   make(map[domain.SessionID]*chatRestore),
 		switchDecisionInput:            make(map[domain.SessionID]domain.AgentSwitchID),
 		retainedSwitches:               make(map[domain.SessionID]struct{}),
 		inputLeases:                    make(map[domain.SessionID]int),
@@ -2354,6 +2356,17 @@ func (m *Manager) recordAgentExited(ctx context.Context, rec domain.SessionRecor
 // identity and never changes the durable terminated flag as an intermediate
 // step.
 func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) (RestoreResult, error) {
+	rec, found, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if found && domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
+		return m.ensureChatController(ctx, id, true)
+	}
+	return m.resumeAgentWithMode(ctx, id, true)
+}
+
+func (m *Manager) resumeAgentWithMode(ctx context.Context, id domain.SessionID, explicit bool) (RestoreResult, error) {
 	if err := m.beginAgentResume(ctx, id); err != nil {
 		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, err)
 	}
@@ -2378,7 +2391,29 @@ func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) 
 	if rec.IsTerminated {
 		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrTerminated)
 	}
-	if m.SessionStatusReadiness(rec) == "unavailable" {
+	if !explicit {
+		if domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat || m.chat == nil {
+			return RestoreResult{}, ports.ErrChatUnsupported
+		}
+		if rec.Activity.State == domain.ActivityExited {
+			return RestoreResult{}, ErrAgentExited
+		}
+		if m.chat.HasLiveChatController(id) {
+			return RestoreResult{Session: rec, Mode: RestoreModeNative}, nil
+		}
+		if recovery, ok := m.chat.(interface {
+			ChatNeedsController(context.Context, domain.SessionID) (bool, error)
+		}); ok {
+			needs, err := recovery.ChatNeedsController(ctx, id)
+			if err != nil {
+				return RestoreResult{}, err
+			}
+			if needs {
+				return RestoreResult{}, ports.ErrChatRecoveryInconclusive
+			}
+		}
+	}
+	if explicit && m.SessionStatusReadiness(rec) == "unavailable" {
 		m.beginStatusRecovery(id)
 		recoveryCtx, cancel := context.WithTimeout(ctx, m.statusVerificationLimit)
 		defer cancel()
@@ -3110,6 +3145,16 @@ func (m *Manager) reconcileLivePass(ctx context.Context, recs []domain.SessionRe
 		if rec.IsTerminated {
 			continue
 		}
+		if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
+			hot, err := m.chatNeedsStartupRestore(ctx, rec)
+			if err != nil || !hot {
+				m.finishStatusRecovery(ctx, rec, err)
+				if err != nil {
+					m.logger.Warn("reconcile: Chat continuity read failed", "sessionID", rec.ID, "error", err)
+				}
+				continue
+			}
+		}
 		candidates = append(candidates, rec)
 		ids = append(ids, rec.ID)
 	}
@@ -3159,7 +3204,14 @@ func (m *Manager) reconcileLivePass(ctx context.Context, recs []domain.SessionRe
 					defer m.endAgentOperation(rec.ID, agentOperationReconcile)
 					recoveryCtx, cancel := context.WithTimeout(ctx, m.statusVerificationLimit)
 					defer cancel()
-					return m.reconcileLive(recoveryCtx, rec)
+					current, err := m.getRecord(recoveryCtx, rec.ID)
+					if err != nil || current.IsTerminated {
+						return err
+					}
+					if m.chat != nil && domain.NormalizeSessionMode(current.Mode) == domain.SessionModeChat && m.chat.HasLiveChatController(current.ID) {
+						return nil
+					}
+					return m.checkSessionHealth(recoveryCtx, current)
 				}()
 				m.finishStatusRecovery(ctx, rec, err)
 				if err != nil {
@@ -3688,6 +3740,21 @@ func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id doma
 	if strings.TrimSpace(clientMessageID) == "" {
 		return false, errors.New("automation send requires a client message id")
 	}
+	// Restore before acquiring the input lease: resume closes admission and
+	// drains those leases. Recheck all delivery facts under the lease below.
+	if _, lazy := m.chat.(interface {
+		ChatNeedsController(context.Context, domain.SessionID) (bool, error)
+	}); lazy {
+		if rec, found, err := m.store.GetSession(ctx, id); err != nil {
+			return false, err
+		} else if found && rec.Mode == domain.SessionModeChat && !rec.IsTerminated &&
+			rec.Activity.State != domain.ActivityExited && !rec.Activity.State.NeedsInput() &&
+			rec.Metadata.ProviderConversationID != "" && !m.chat.HasLiveChatController(id) {
+			if err := m.EnsureChatController(ctx, id); err != nil {
+				return false, err
+			}
+		}
+	}
 	release, admitted := m.AcquireSessionInput(id)
 	if !admitted {
 		return false, ErrSwitchInProgress
@@ -3711,7 +3778,7 @@ func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id doma
 			return false, ErrAgentExited
 		case rec.Activity.State.NeedsInput():
 			return false, ErrAwaitingDecision
-		case rec.FirstSignalAt.IsZero():
+		case rec.FirstSignalAt.IsZero() && (m.chat == nil || !m.chat.HasLiveChatController(id)):
 			return false, ErrStartupPending
 		}
 		// Do not fall through to manual pane delivery or transition queuing:

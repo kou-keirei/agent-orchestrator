@@ -1112,7 +1112,7 @@ function ChatWorkspaceContent({
 					configPending={configOptionPending}
 					error={configOptionError}
 					disabled={
-						snapshot.controller.state === "stopped" || controllerTransitioning || configOptionPending || newWorkDisabled
+						snapshot.controller.state === "stopped" || snapshot.controller.state === "cold" || controllerTransitioning || configOptionPending || newWorkDisabled
 					}
 				/>
 			) : null,

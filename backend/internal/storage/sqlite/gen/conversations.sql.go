@@ -723,6 +723,21 @@ func (q *Queries) HasPendingConversationInteractions(ctx context.Context, conver
 	return exists, err
 }
 
+const hasUnsettledConversationTurns = `-- name: HasUnsettledConversationTurns :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = ? AND state IN ('queued', 'running')
+)
+`
+
+// All branches and promotion-reserved turns count as unfinished recovery work.
+func (q *Queries) HasUnsettledConversationTurns(ctx context.Context, conversationID string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, hasUnsettledConversationTurns, conversationID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const insertConversation = `-- name: InsertConversation :exec
 
 INSERT INTO conversations (

@@ -928,7 +928,12 @@ const (
 	ChatControllerBusy       ChatControllerState = "busy"
 	ChatControllerRecovering ChatControllerState = "recovering"
 	ChatControllerStopped    ChatControllerState = "stopped"
+	ChatControllerCold       ChatControllerState = "cold"
 )
+
+// ErrChatControllerRestore is retryable before input delivery. Native history,
+// session ownership and the retained workspace remain available for retry.
+var ErrChatControllerRestore = errors.New("chat controller restoration failed; retry the message")
 
 type chatProviderFailure struct {
 	message string

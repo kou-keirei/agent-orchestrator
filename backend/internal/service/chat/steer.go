@@ -142,6 +142,11 @@ func (s *Service) SteerOrSend(
 	msg ports.ChatUserMessage,
 	recoverOnly bool,
 ) (SteerOrSendResult, error) {
+	gate := s.inputGate(id)
+	if err := gate.lock(ctx); err != nil {
+		return SteerOrSendResult{}, err
+	}
+	defer gate.unlock()
 	if strings.TrimSpace(msg.Text) == "" && !recoverOnly {
 		return SteerOrSendResult{}, ErrSteerTextRequired
 	}
@@ -151,10 +156,11 @@ func (s *Service) SteerOrSend(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return SteerOrSendResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.workingController(ctx, id)
 	if err != nil {
 		return SteerOrSendResult{}, err
 	}
+	defer release()
 	return controller.SteerOrSend(ctx, msg, recoverOnly)
 }
 

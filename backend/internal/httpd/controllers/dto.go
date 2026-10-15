@@ -2326,7 +2326,7 @@ type ConversationSnapshotResponse struct {
 	Mode                       string `json:"mode" enum:"chat,tui"`
 	// Controller is reported separately from history so a client can tell "no
 	// messages yet" apart from "the agent is not running".
-	Controller          string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped"`
+	Controller          string                   `json:"controller" enum:"connecting,ready,busy,recovering,stopped,cold"`
 	PermissionFloor     string                   `json:"permissionFloor,omitempty" enum:"default,read-only,accept-edits,auto,bypass-permissions"`
 	NativeEvidence      NativePermissionEvidence `json:"nativeEvidence"`
 	DispatchConformance ChatDispatchConformance  `json:"dispatchConformance"`

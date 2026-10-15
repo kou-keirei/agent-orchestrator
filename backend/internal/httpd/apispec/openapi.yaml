@@ -9290,6 +9290,7 @@ components:
           - busy
           - recovering
           - stopped
+          - cold
           type: string
         conversationId:
           type: string
