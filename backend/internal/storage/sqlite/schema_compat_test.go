@@ -38,7 +38,7 @@ func legacy169(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	trigger = strings.Replace(trigger, "OR OLD.latest_user_prompt_at IS NOT NEW.latest_user_prompt_at", "OR OLD.latest_user_prompt_at IS NOT NEW.latest_user_prompt_at OR OLD.provision_state <> NEW.provision_state", 1)
-	trigger = strings.Replace(trigger, "'autoReviewEnabled', NEW.auto_review_enabled", "'autoReviewEnabled', NEW.auto_review_enabled, 'provisionState', NEW.provision_state", 1)
+	trigger = strings.Replace(trigger, "'autoReviewEnabled', json(CASE WHEN NEW.auto_review_enabled THEN 'true' ELSE 'false' END)", "'autoReviewEnabled', json(CASE WHEN NEW.auto_review_enabled THEN 'true' ELSE 'false' END), 'provisionState', NEW.provision_state", 1)
 	if _, err := db.Exec(`DROP TRIGGER sessions_cdc_update; ` + trigger); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestLegacy169MigrationNumbersRemainReserved(t *testing.T) {
 func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 	t.Helper()
 	hash := sha256.New()
-	rows, err := db.Query(`SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master ORDER BY type,name`)
+	rows, err := db.Query(`SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master UNION ALL SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_temp_master ORDER BY type,name`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 		if err := json.NewEncoder(hash).Encode([]string{kind, name, owner, ddl}); err != nil {
 			t.Fatal(err)
 		}
-		if kind == "table" && !strings.HasPrefix(name, "sqlite_") {
+		if kind == "table" && (!strings.HasPrefix(name, "sqlite_") || name == "sqlite_sequence") {
 			tables = append(tables, name)
 		}
 	}
@@ -200,7 +200,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 	}
 	_ = rows.Close()
 	for _, table := range tables {
-		rows, err := db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `" ORDER BY rowid`)
+		rows, err := db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `" ORDER BY 1`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -345,6 +345,148 @@ func TestLegacy169R2DestinationCollisions(t *testing.T) {
 	}
 }
 
+// The declaration used by the observed live lineage, including migration 41's
+// appended resolved_at column. Keep this control independent of the preflight.
+const legacy169NotificationsDDL = `CREATE TABLE notifications (
+id TEXT PRIMARY KEY,
+session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+pr_url TEXT NOT NULL DEFAULT '',
+type TEXT NOT NULL CHECK (type IN ('needs_input', 'ready_to_merge', 'pr_merged', 'pr_closed_unmerged')),
+title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('read', 'unread')),
+created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
+
+func TestLegacy169R3NotificationDeclarations(t *testing.T) {
+	for _, tc := range []struct{ name, old, replacement string }{
+		{"real affinity", "title TEXT NOT NULL", "title REAL NOT NULL"},
+		{"integer affinity", "title TEXT NOT NULL", "title INTEGER NOT NULL"},
+		{"implicit unique", "title TEXT NOT NULL", "title TEXT NOT NULL UNIQUE"},
+		{"composite unique", "resolved_at TIMESTAMP)", "resolved_at TIMESTAMP, UNIQUE(title,body))"},
+		{"foreign check", "title TEXT NOT NULL", "title TEXT NOT NULL CHECK(length(title)>0)"},
+		{"missing type check", "CHECK (type IN ('needs_input', 'ready_to_merge', 'pr_merged', 'pr_closed_unmerged'))", ""},
+		{"changed type check", "'pr_closed_unmerged'", "'pr_closed_unmerged', 'foreign_kind'"},
+		{"literal whitespace", "'pr_closed_unmerged'", "'pr_closed_ unmerged'"},
+		{"foreign default", "body TEXT NOT NULL DEFAULT ''", "body TEXT NOT NULL DEFAULT 'foreign default'"},
+		{"literal default whitespace", "body TEXT NOT NULL DEFAULT ''", "body TEXT NOT NULL DEFAULT ' '"},
+		{"missing default", "pr_url TEXT NOT NULL DEFAULT ''", "pr_url TEXT NOT NULL"},
+		{"nullable title", "title TEXT NOT NULL", "title TEXT"},
+		{"composite primary key", "id TEXT PRIMARY KEY", "id TEXT"},
+		{"missing foreign key", "project_id TEXT REFERENCES projects(id) ON DELETE CASCADE", "project_id TEXT"},
+		{"changed foreign key", "REFERENCES projects(id) ON DELETE CASCADE", "REFERENCES projects(id) ON DELETE SET NULL"},
+		{"foreign collation", "title TEXT NOT NULL", "title TEXT COLLATE NOCASE NOT NULL"},
+		{"without rowid", "resolved_at TIMESTAMP)", "resolved_at TIMESTAMP) WITHOUT ROWID"},
+		{"stored generated", "resolved_at TIMESTAMP)", "resolved_at TIMESTAMP, extra TEXT GENERATED ALWAYS AS (title) STORED)"},
+		{"virtual generated", "resolved_at TIMESTAMP)", "resolved_at TIMESTAMP, extra TEXT GENERATED ALWAYS AS (title) VIRTUAL)"},
+		{"strict storage", "TIMESTAMP", "TEXT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := legacy169(t)
+			ddl := strings.ReplaceAll(legacy169NotificationsDDL, tc.old, tc.replacement)
+			if tc.name == "composite primary key" {
+				ddl = strings.TrimSuffix(ddl, ")") + ", PRIMARY KEY(id,title))"
+			}
+			if tc.name == "strict storage" {
+				ddl += " STRICT"
+			}
+			if _, err := db.Exec(`DROP TABLE notifications; ` + ddl); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`CREATE INDEX idx_notifications_status_history ON notifications(status,created_at DESC,id DESC);
+CREATE INDEX idx_notifications_history ON notifications(created_at DESC,id DESC);
+CREATE UNIQUE INDEX idx_notifications_open_dedupe ON notifications(session_id,type,pr_url) WHERE status='unread' OR resolved_at IS NULL;
+CREATE INDEX idx_notifications_unresolved ON notifications(resolved_at,created_at DESC,id DESC);`); err != nil {
+				t.Fatal(err)
+			}
+			var title any = "preserve notification"
+			if tc.name == "real affinity" || tc.name == "integer affinity" {
+				title = 1.2345678901234567
+			}
+			if _, err := db.Exec(`INSERT INTO notifications(id,session_id,pr_url,type,title,body,created_at) VALUES ('notice','legacy-1','','needs_input',?,'',CURRENT_TIMESTAMP)`, title); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+			if tc.name == "real affinity" {
+				var got any
+				if err := db.QueryRow(`SELECT title FROM notifications WHERE id='notice'`).Scan(&got); err != nil || got != title {
+					t.Errorf("numeric title changed: got=%v (%T) want=%v err=%v", got, got, title, err)
+				}
+			}
+			if tc.name == "implicit unique" {
+				if _, err := db.Exec(`INSERT INTO notifications(id,session_id,pr_url,type,title,created_at) VALUES ('duplicate','legacy-1','different-pr','needs_input','preserve notification',CURRENT_TIMESTAMP)`); err == nil {
+					t.Error("foreign title uniqueness was lost")
+				}
+			}
+		})
+	}
+}
+
+func TestLegacy169R3NotificationDependencies(t *testing.T) {
+	for _, reference := range []string{"notifications", "Notifications", `"NOTIFICATIONS"`, "[nOtIfIcAtIoNs]", "`notifications`", "'notifications'", `main."NOTIFICATIONS"`} {
+		t.Run(reference, func(t *testing.T) {
+			db := legacy169(t)
+			if _, err := db.Exec(`CREATE VIEW foreign_notice_view AS SELECT id,title FROM ` + reference); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+			var title string
+			if err := db.QueryRow(`SELECT title FROM foreign_notice_view WHERE id='notice'`).Scan(&title); err != nil || title != "preserve notification" {
+				t.Errorf("dependent view invalidated: title=%q err=%v", title, err)
+			}
+		})
+	}
+	for _, ddl := range []string{
+		`CREATE TRIGGER foreign_notice_trigger AFTER UPDATE ON foreign_history BEGIN UPDATE "NOTIFICATIONS" SET title=title; END`,
+		`CREATE TEMP TRIGGER foreign_notice_trigger AFTER UPDATE ON main.foreign_history BEGIN UPDATE [Notifications] SET title=title; END`,
+		`CREATE TEMP VIEW foreign_notice_view AS SELECT * FROM main."Notifications"`,
+		`CREATE VIEW foreign_broken_view AS SELECT * FROM missing_foreign_table`,
+	} {
+		t.Run(ddl, func(t *testing.T) {
+			db := legacy169(t)
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169R3OtherDestructiveActions(t *testing.T) {
+	for _, ddl := range []string{
+		`DROP INDEX idx_notifications_history; CREATE UNIQUE INDEX idx_notifications_history ON notifications(title)`,
+		`CREATE TRIGGER foreign_session_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='unexpected backfill side effect'; END`,
+		`DROP TRIGGER sessions_cdc_update; CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='foreign CDC'; END`,
+		`ALTER TABLE sessions ADD COLUMN terminal_revision INTEGER GENERATED ALWAYS AS (revision) VIRTUAL`,
+		`ALTER TABLE review_run ADD COLUMN target_binding_json TEXT GENERATED ALWAYS AS ('{}') VIRTUAL`,
+		`ALTER TABLE sessions ADD COLUMN TERMINAL_REVISION INTEGER NOT NULL DEFAULT 0`,
+	} {
+		t.Run(ddl, func(t *testing.T) {
+			db := legacy169(t)
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169R3CanonicalLiveShape(t *testing.T) {
+	db := legacy169(t)
+	if _, err := db.Exec(`CREATE VIEW unrelated_history AS SELECT content FROM foreign_history`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("canonical restart: %v", err)
+	}
+	var content string
+	if err := db.QueryRow(`SELECT content FROM unrelated_history`).Scan(&content); err != nil || content != "keep verbatim" {
+		t.Fatalf("unrelated view changed: %q %v", content, err)
+	}
+}
+
 // Opt-in, read-only backup input; every writable connection targets a fresh
 // testing-owned copy. Set TEMP/TMP inside the worker before invoking this test.
 func TestLegacy169BackupCopy(t *testing.T) {
@@ -434,6 +576,10 @@ func TestLegacy169BackupCopy(t *testing.T) {
 		return fmt.Sprintf("%x", hash.Sum(nil))
 	}
 	before := snapshot(db)
+	var expectedSessions int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&expectedSessions); err != nil {
+		t.Fatal(err)
+	}
 	_ = db.Close()
 	store, err := Open(dir)
 	if err != nil {
@@ -444,9 +590,24 @@ func TestLegacy169BackupCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("migrated independent copy; sessions=%d", len(sessions))
+	if len(sessions) != expectedSessions {
+		t.Fatalf("session readability: got=%d want=%d", len(sessions), expectedSessions)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("independent copy restart: %v", err)
+	}
+	sessions, err = store.ListAllSessions(t.Context())
+	if err != nil || len(sessions) != expectedSessions {
+		t.Fatalf("restart session readability: got=%d want=%d err=%v", len(sessions), expectedSessions, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("independent copy idempotent restart; sessions=%d", len(sessions))
 	if info, err := os.Stat(filepath.Join(dir, "ao.db-wal")); err == nil && info.Size() != 0 {
 		t.Fatal("scratch WAL not checkpointed; immutable snapshot would be incomplete")
 	}

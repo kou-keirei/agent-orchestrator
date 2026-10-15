@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -55,9 +56,18 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		if tableExists == 0 && !feature.newTable {
 			return fmt.Errorf("desktop schema compatibility: missing prerequisite table %s", feature.table)
 		}
+		if !feature.newTable {
+			var ordinary int
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_list WHERE schema='main' AND name=? AND type='table' AND wr=0 AND strict=0`, feature.table).Scan(&ordinary); err != nil {
+				return err
+			}
+			if ordinary != 1 {
+				return fmt.Errorf("desktop schema compatibility: foreign %s storage options", feature.table)
+			}
+		}
 		for _, column := range feature.columns {
 			var n int
-			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, feature.table, column).Scan(&n); err != nil {
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_xinfo(?) WHERE name=? COLLATE NOCASE`, feature.table, column).Scan(&n); err != nil {
 				return err
 			}
 			present += n
@@ -76,11 +86,11 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 					wantType = "INTEGER"
 				}
 				var gotType string
-				var gotNotNull int
-				if err := db.QueryRowContext(ctx, `SELECT upper(type), "notnull" FROM pragma_table_info(?) WHERE name=?`, feature.table, column).Scan(&gotType, &gotNotNull); err != nil {
+				var gotNotNull, hidden int
+				if err := db.QueryRowContext(ctx, `SELECT upper(type), "notnull",hidden FROM pragma_table_xinfo(?) WHERE name=? COLLATE NOCASE`, feature.table, column).Scan(&gotType, &gotNotNull, &hidden); err != nil {
 					return err
 				}
-				if gotType != wantType || gotNotNull != wantNotNull {
+				if gotType != wantType || gotNotNull != wantNotNull || hidden != 0 {
 					return fmt.Errorf("desktop schema compatibility: foreign %s.%s declaration", feature.table, column)
 				}
 			}
@@ -128,6 +138,28 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 	}
 	plan[152] = !strings.Contains(notificationSQL, "'orchestration_attention'")
 	if plan[152] {
+		var ordinary int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_list WHERE schema='main' AND name='notifications' AND type='table' AND wr=0 AND strict=0`).Scan(&ordinary); err != nil {
+			return err
+		}
+		if ordinary != 1 {
+			return fmt.Errorf("desktop schema compatibility: foreign notifications storage options")
+		}
+		// Names alone do not establish copy safety: affinity can change values,
+		// and the replacement can silently discard constraints/storage options.
+		// Qualify only the complete observed declaration, not SQL equivalence.
+		const declaration = `(id TEXT PRIMARY KEY,
+session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+pr_url TEXT NOT NULL DEFAULT '',
+type TEXT NOT NULL CHECK(type IN ('needs_input','ready_to_merge','pr_merged','pr_closed_unmerged')),
+title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('read','unread')),
+created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
+		_, body, found := strings.Cut(notificationSQL, "(")
+		if !found || desktop169SQL("("+body) != desktop169SQL(declaration) {
+			return fmt.Errorf("desktop schema compatibility: foreign notifications declaration; refusing lossy table replacement")
+		}
 		// Migration 152 copies SELECT * positionally. table_info alone hides
 		// generated columns and cannot establish the physical copy order.
 		wantColumns := []string{"id", "session_id", "project_id", "pr_url", "type", "title", "body", "status", "created_at", "resolved_at"}
@@ -155,6 +187,12 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		}
 		if !ordered || columnCount != len(wantColumns) {
 			return fmt.Errorf("desktop schema compatibility: notifications physical column order differs; refusing positional copy")
+		}
+		if err := checkDesktop169NotificationIndexes(ctx, db); err != nil {
+			return err
+		}
+		if err := checkDesktop169NotificationDependencies(ctx, db); err != nil {
+			return err
 		}
 		var foreignObjects, incoming int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE tbl_name='notifications' AND ((type='trigger') OR (type='index' AND sql IS NOT NULL AND name NOT IN ('idx_notifications_status_history','idx_notifications_history','idx_notifications_open_dedupe','idx_notifications_unresolved')))`).Scan(&foreignObjects); err != nil {
@@ -262,6 +300,11 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 	for _, missing := range plan {
 		needed = needed || missing
 	}
+	// The later schema reconciliation also replaces CDC on restart. Validate
+	// its known owner/behavior even when no historical SQL needs replay.
+	if err := checkDesktop169SessionTriggers(ctx, db, plan[150], plan[153]); err != nil {
+		return err
+	}
 	if !needed {
 		return nil
 	}
@@ -304,4 +347,154 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("desktop schema compatibility: replay absent source effects: %w", err)
 	}
 	return nil
+}
+
+// Token equality is a conservative declaration allowlist, not a SQL parser or
+// an equivalence claim. Preserve quoted bytes and identifier/token boundaries;
+// only whitespace between tokens and a final semicolon are insignificant.
+var desktop169Tokens = regexp.MustCompile(`'(?:[^']|'')*'|"(?:[^"]|"")*"|` + "`(?:[^`]|``)*`" + `|\[[^]]*\]|[[:alnum:]_]+|[^[:space:]]`)
+
+func desktop169SQL(sqlText string) string {
+	return strings.Join(desktop169Tokens.FindAllString(strings.TrimSuffix(strings.TrimSpace(sqlText), ";"), -1), "\x00")
+}
+
+func checkDesktop169NotificationIndexes(ctx context.Context, db *sql.DB) error {
+	// Include implicit constraints. Only the canonical id primary-key index
+	// and these four exact explicit indexes survive a canonical replacement.
+	want := map[string]string{
+		"idx_notifications_status_history": `CREATE INDEX idx_notifications_status_history ON notifications(status,created_at DESC,id DESC)`,
+		"idx_notifications_history":        `CREATE INDEX idx_notifications_history ON notifications(created_at DESC,id DESC)`,
+		"idx_notifications_open_dedupe":    `CREATE UNIQUE INDEX idx_notifications_open_dedupe ON notifications(session_id,type,pr_url) WHERE status='unread' OR resolved_at IS NULL`,
+		"idx_notifications_unresolved":     `CREATE INDEX idx_notifications_unresolved ON notifications(resolved_at,created_at DESC,id DESC)`,
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('notifications')`).Scan(&count); err != nil {
+		return err
+	}
+	if count != len(want)+1 {
+		return fmt.Errorf("desktop schema compatibility: foreign notifications implicit/explicit indexes")
+	}
+	var primaryKeys int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list('notifications') WHERE origin='pk' AND "unique"=1 AND partial=0`).Scan(&primaryKeys); err != nil {
+		return err
+	}
+	if primaryKeys != 1 {
+		return fmt.Errorf("desktop schema compatibility: foreign notifications primary key")
+	}
+	for name, ddl := range want {
+		var actual string
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='notifications' AND name=?`, name).Scan(&actual); err != nil {
+			return fmt.Errorf("desktop schema compatibility: inspect notifications index %s: %w", name, err)
+		}
+		if desktop169SQL(actual) != desktop169SQL(ddl) {
+			return fmt.Errorf("desktop schema compatibility: foreign notifications index %s", name)
+		}
+	}
+	return nil
+}
+
+func checkDesktop169NotificationDependencies(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT type,name,sql FROM sqlite_master WHERE type IN ('view','trigger')`)
+	if err != nil {
+		return err
+	}
+	var views []string
+	for rows.Next() {
+		var kind, name, ddl string
+		if err := rows.Scan(&kind, &name, &ddl); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		// Conservative text containment covers quoted/case-folded references,
+		// including triggers on other owners and the first view in a chain.
+		// False positives (e.g. literals/comments) require lineage review.
+		if strings.Contains(strings.ToLower(ddl), "notifications") {
+			_ = rows.Close()
+			return fmt.Errorf("desktop schema compatibility: possible notifications dependency in %s %s", kind, name)
+		}
+		if kind == "view" {
+			views = append(views, name)
+		}
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	// SQLite's ALTER TABLE validates unrelated views too. Prepare each without
+	// reading rows so an existing broken view cannot cause a late replay error.
+	for _, name := range views {
+		rows, err := db.QueryContext(ctx, `SELECT * FROM "`+strings.ReplaceAll(name, `"`, `""`)+`" LIMIT 0`)
+		if err != nil {
+			return fmt.Errorf("desktop schema compatibility: invalid prerequisite view %s: %w", name, err)
+		}
+		_ = rows.Close()
+	}
+	return nil
+}
+
+func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissing, terminalMissing bool) error {
+	var temporary int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_temp_master`).Scan(&temporary); err != nil {
+		return err
+	}
+	if temporary != 0 {
+		return fmt.Errorf("desktop schema compatibility: unqualified connection-local schema dependencies")
+	}
+	var canonical string
+	for _, repair := range schemaRepairs {
+		if repair.version == 150 {
+			for _, statement := range repair.postAdd {
+				if strings.HasPrefix(statement, "CREATE TRIGGER sessions_cdc_update") {
+					canonical = statement
+				}
+			}
+		}
+	}
+	if canonical == "" {
+		return fmt.Errorf("desktop schema compatibility: missing canonical session CDC definition")
+	}
+	var provisioning int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='provision_state'`).Scan(&provisioning); err != nil {
+		return err
+	}
+	if hiddenMissing {
+		canonical = strings.Replace(canonical, "OR OLD.hidden_at IS NOT NEW.hidden_at", "", 1)
+		canonical = strings.Replace(canonical, ",\n            'hiddenAt', NEW.hidden_at", "", 1)
+		if provisioning != 0 {
+			canonical = strings.Replace(canonical, "OR OLD.latest_user_prompt_at IS NOT NEW.latest_user_prompt_at", "OR OLD.latest_user_prompt_at IS NOT NEW.latest_user_prompt_at OR OLD.provision_state <> NEW.provision_state", 1)
+			canonical = strings.Replace(canonical, "'autoReviewEnabled', json(CASE WHEN NEW.auto_review_enabled THEN 'true' ELSE 'false' END)", "'autoReviewEnabled', json(CASE WHEN NEW.auto_review_enabled THEN 'true' ELSE 'false' END), 'provisionState', NEW.provision_state", 1)
+		}
+	} else if provisioning != 0 {
+		canonical = strings.Replace(canonical, "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at OR OLD.provision_state <> NEW.provision_state", 1)
+		canonical = strings.Replace(canonical, "'hiddenAt', NEW.hidden_at", "'hiddenAt', NEW.hidden_at, 'provisionState', NEW.provision_state", 1)
+	}
+	var actual string
+	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='sessions' AND name='sessions_cdc_update'`).Scan(&actual); err != nil {
+		return err
+	}
+	if desktop169SQL(actual) != desktop169SQL(canonical) {
+		return fmt.Errorf("desktop schema compatibility: foreign session CDC behavior; refusing replacement")
+	}
+	if !terminalMissing {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='sessions' AND name NOT IN ('sessions_cdc_update','sessions_revision_update')`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, ddl string
+		if err := rows.Scan(&name, &ddl); err != nil {
+			return err
+		}
+		// These native headers cannot fire on the terminal_revision backfill.
+		if strings.HasPrefix(desktop169SQL(ddl), desktop169SQL(`CREATE TRIGGER sessions_cdc_insert AFTER INSERT ON sessions BEGIN`)) ||
+			strings.HasPrefix(desktop169SQL(ddl), desktop169SQL(`CREATE TRIGGER conversation_branch_root_provider_update AFTER UPDATE OF provider_conversation_id ON sessions`)+"\x00") {
+			continue
+		}
+		return fmt.Errorf("desktop schema compatibility: unqualified session backfill trigger %s", name)
+	}
+	return rows.Err()
 }
