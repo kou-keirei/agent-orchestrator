@@ -3208,6 +3208,12 @@ func (m *Manager) reconcileLivePass(ctx context.Context, recs []domain.SessionRe
 					if err != nil || current.IsTerminated {
 						return err
 					}
+					if domain.NormalizeSessionMode(current.Mode) == domain.SessionModeChat {
+						hot, err := m.chatNeedsStartupRestore(recoveryCtx, current)
+						if err != nil || !hot {
+							return err
+						}
+					}
 					if m.chat != nil && domain.NormalizeSessionMode(current.Mode) == domain.SessionModeChat && m.chat.HasLiveChatController(current.ID) {
 						return nil
 					}
@@ -3740,19 +3746,37 @@ func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id doma
 	if strings.TrimSpace(clientMessageID) == "" {
 		return false, errors.New("automation send requires a client message id")
 	}
-	// Restore before acquiring the input lease: resume closes admission and
-	// drains those leases. Recheck all delivery facts under the lease below.
-	if _, lazy := m.chat.(interface {
-		ChatNeedsController(context.Context, domain.SessionID) (bool, error)
-	}); lazy {
+	// Join Chat's input order before restoring. The service invokes admission
+	// only after restoration, since resume must first drain existing leases.
+	if ordered, ok := m.chat.(interface {
+		RelayChatTurnWithAdmission(context.Context, domain.SessionID, string, string, func() (func(), error)) (string, error)
+	}); ok {
 		if rec, found, err := m.store.GetSession(ctx, id); err != nil {
 			return false, err
-		} else if found && rec.Mode == domain.SessionModeChat && !rec.IsTerminated &&
-			rec.Activity.State != domain.ActivityExited && !rec.Activity.State.NeedsInput() &&
-			rec.Metadata.ProviderConversationID != "" && !m.chat.HasLiveChatController(id) {
-			if err := m.EnsureChatController(ctx, id); err != nil {
+		} else if found && rec.Mode == domain.SessionModeChat {
+			if err := m.chatAutomationAdmissionError(rec, true); err != nil {
 				return false, err
 			}
+			_, err := ordered.RelayChatTurnWithAdmission(ctx, id, message, clientMessageID, func() (func(), error) {
+				release, admitted := m.AcquireSessionInput(id)
+				if !admitted {
+					return nil, ErrSwitchInProgress
+				}
+				current, found, err := m.store.GetSession(ctx, id)
+				if err == nil {
+					if !found {
+						err = ErrNotFound
+					} else {
+						err = m.chatAutomationAdmissionError(current, false)
+					}
+				}
+				if err != nil {
+					release()
+					return nil, err
+				}
+				return release, nil
+			})
+			return err == nil, err
 		}
 	}
 	release, admitted := m.AcquireSessionInput(id)
@@ -3771,15 +3795,8 @@ func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id doma
 		return false, ErrAutomationUnsupported
 	}
 	if rec.Mode == domain.SessionModeChat {
-		switch {
-		case rec.IsTerminated:
-			return false, ErrTerminated
-		case rec.Activity.State == domain.ActivityExited:
-			return false, ErrAgentExited
-		case rec.Activity.State.NeedsInput():
-			return false, ErrAwaitingDecision
-		case rec.FirstSignalAt.IsZero() && (m.chat == nil || !m.chat.HasLiveChatController(id)):
-			return false, ErrStartupPending
+		if err := m.chatAutomationAdmissionError(rec, false); err != nil {
+			return false, err
 		}
 		// Do not fall through to manual pane delivery or transition queuing:
 		// only this controller's durable client-message-id admission can ack.
@@ -3817,6 +3834,24 @@ func (m *Manager) SendAutomationWithAcknowledgement(ctx context.Context, id doma
 		return false, ErrSwitchInProgress
 	default:
 		return false, ErrAutomationUnsupported
+	}
+}
+
+func (m *Manager) chatAutomationAdmissionError(rec domain.SessionRecord, allowRestore bool) error {
+	switch {
+	case rec.Mode != domain.SessionModeChat:
+		return ErrSwitchInProgress
+	case rec.IsTerminated:
+		return ErrTerminated
+	case rec.Activity.State == domain.ActivityExited:
+		return ErrAgentExited
+	case rec.Activity.State.NeedsInput():
+		return ErrAwaitingDecision
+	case rec.FirstSignalAt.IsZero() && (m.chat == nil || !m.chat.HasLiveChatController(rec.ID)) &&
+		(!allowRestore || rec.Metadata.ProviderConversationID == ""):
+		return ErrStartupPending
+	default:
+		return nil
 	}
 }
 

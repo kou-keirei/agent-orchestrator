@@ -527,3 +527,217 @@ type lazyChatLauncher struct{ integrationChatLauncher }
 func (l lazyChatLauncher) ChatNeedsController(ctx context.Context, id domain.SessionID) (bool, error) {
 	return l.service.ChatNeedsController(ctx, id)
 }
+
+// The boot snapshot precedes serving; ExitAgent can finish before the live pass
+// reserves its operation gate. Feed that stale snapshot to the real live pass.
+func TestR4StaleStartupSnapshotDoesNotResurrectParkedWorker(t *testing.T) {
+	m, svc, st, driver, rec := lazyChatFixture(t)
+	ctx := context.Background()
+	snapshot := rec
+	snapshot.Activity.State = domain.ActivityActive
+	// A completed user ExitAgent is represented by durable exited state. Use the
+	// public operation so lifecycle and controller shutdown run normally.
+	if _, err := m.ExitAgent(ctx, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := st.GetSession(ctx, rec.ID)
+	if err != nil || before.Activity.State != domain.ActivityExited {
+		t.Fatalf("parking failed: %+v %v", before, err)
+	}
+	m.reconcileLivePass(ctx, []domain.SessionRecord{snapshot})
+	after, _, err := st.GetSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.resumes.Load() != 0 || svc.HasLiveChatController(rec.ID) || after.Activity.State != domain.ActivityExited {
+		t.Fatalf("stale startup snapshot resurrected parked worker: resumes=%d live=%v before=%s after=%s", driver.resumes.Load(), svc.HasLiveChatController(rec.ID), before.Activity.State, after.Activity.State)
+	}
+}
+
+func TestR4StaleStartupSnapshotDoesNotWarmNowSettledWorker(t *testing.T) {
+	m, svc, _, driver, rec := lazyChatFixture(t)
+	snapshot := rec
+	snapshot.Activity.State = domain.ActivityActive
+	m.reconcileLivePass(context.Background(), []domain.SessionRecord{snapshot})
+	if driver.resumes.Load() != 0 || svc.HasLiveChatController(rec.ID) {
+		t.Fatalf("settled worker warmed from stale snapshot: resumes=%d live=%v", driver.resumes.Load(), svc.HasLiveChatController(rec.ID))
+	}
+}
+
+type r4UnreadableContinuity struct {
+	lazyChatLauncher
+	err error
+}
+
+func (r r4UnreadableContinuity) ChatNeedsController(context.Context, domain.SessionID) (bool, error) {
+	return false, r.err
+}
+func TestR4UnknownContinuityReaderFailsClosed(t *testing.T) {
+	m, svc, _, driver, rec := lazyChatFixture(t)
+	readErr := errors.New("R4 continuity read unavailable")
+	m.chat = r4UnreadableContinuity{lazyChatLauncher: m.chat.(lazyChatLauncher), err: readErr}
+	m.reconcileLivePass(context.Background(), []domain.SessionRecord{rec})
+	if m.SessionStatusReadiness(rec) != "unavailable" || driver.resumes.Load() != 0 {
+		t.Fatal("unknown startup evidence treated as absence")
+	}
+	_, err := svc.Send(context.Background(), rec.ID, ports.ChatUserMessage{Text: "must not deliver", ClientMessageID: "r4-reader-error"})
+	if !errors.Is(err, ports.ErrChatControllerRestore) || !errors.Is(err, readErr) || driver.resumes.Load() != 0 {
+		t.Fatalf("reader error did not fence wake: resumes=%d err=%v", driver.resumes.Load(), err)
+	}
+}
+
+// Automation begins first and owns the blocked restore. Human input joins it
+// later. The retained input order must not invert across the lazy restore.
+func TestR4AutomationFirstColdWakePreservesInputOrder(t *testing.T) {
+	m, svc, st, driver, rec := lazyChatFixture(t)
+	driver.entered = make(chan struct{}, 1)
+	driver.release = make(chan struct{})
+	automationDone := make(chan error, 1)
+	go func() {
+		automationDone <- m.SendAutomation(context.Background(), rec.ID, "automation first", "r4-auto-first")
+	}()
+	select {
+	case <-driver.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("automation did not own restore")
+	}
+	humanCtx := &r4AdmissionContext{Context: context.Background(), waiting: make(chan struct{})}
+	humanDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Send(humanCtx, rec.ID, ports.ChatUserMessage{Text: "human second", ClientMessageID: "r4-human-second", Origin: domain.MessageOriginHuman})
+		humanDone <- err
+	}()
+	select {
+	case <-humanCtx.waiting:
+	case <-time.After(5 * time.Second):
+		close(driver.release)
+		t.Fatal("human did not join restore")
+	}
+	close(driver.release)
+	if err := <-automationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-humanDone; err != nil {
+		t.Fatal(err)
+	}
+	conv, err := st.ConversationForSession(context.Background(), rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.LoadConversationSnapshot(context.Background(), conv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver.mu.Lock()
+	provider := driver.conversations[0]
+	driver.mu.Unlock()
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(rows.Messages) != 2 || rows.Messages[0].ClientMessageID != "r4-auto-first" || len(provider.sent) != 1 || provider.sent[0].ClientMessageID != "r4-auto-first" {
+		t.Fatalf("cold wake inverted input order: first durable=%q first provider=%q resumes=%d", rows.Messages[0].ClientMessageID, provider.sent[0].ClientMessageID, driver.resumes.Load())
+	}
+}
+
+// The repaired path keeps automation inside the shared input gate while it
+// restores. The first Done evaluation proves the later human has reached that
+// gate; it cannot own admission until automation has persisted its input.
+// Only the waiting-point probe changes; the reviewer assertions above remain.
+type r4AdmissionContext struct {
+	context.Context
+	calls   atomic.Int64
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *r4AdmissionContext) Done() <-chan struct{} {
+	if c.calls.Add(1) >= 1 {
+		c.once.Do(func() { close(c.waiting) })
+	}
+	return c.Context.Done()
+}
+
+// Match the production adapter's ordered automation boundary in this fixture.
+func (l lazyChatLauncher) RelayChatTurnWithAdmission(
+	ctx context.Context, id domain.SessionID, text, clientMessageID string,
+	admit func() (func(), error),
+) (string, error) {
+	return l.service.RelayChatTurnWithAdmission(ctx, id, text, clientMessageID, admit)
+}
+
+func TestR5StaleExitedSnapshotPreservesProtectedWork(t *testing.T) {
+	for _, kind := range []string{"queued", "running", "reserved", "approval", "user_input", "checkpoint"} {
+		t.Run(kind, func(t *testing.T) {
+			m, svc, st, driver, rec := lazyChatFixture(t)
+			ctx := context.Background()
+			snapshot := rec
+			snapshot.Activity.State = domain.ActivityActive
+			if _, err := m.ExitAgent(ctx, rec.ID); err != nil {
+				t.Fatal(err)
+			}
+			conversation, err := st.ConversationForSession(ctx, rec.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "queued" || kind == "running" || kind == "reserved" {
+				if _, err := st.AppendUserMessage(ctx, conversation.ID, rec.ID, rec.Metadata.ControllerGeneration, domain.ConversationMessage{ID: "r5-protected-message", Text: "preserve protected work", Origin: domain.MessageOriginHuman}, "r5-protected-turn", time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "running" {
+					if err := st.BindTurnToProvider(ctx, "r5-protected-turn", "native-running", time.Now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if kind == "reserved" {
+					if _, err := st.ReserveQueuedTurnForPromotion(ctx, conversation.ID, "r5-protected-turn", time.Now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else if kind == "checkpoint" {
+				current, _, err := st.GetSession(ctx, rec.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				current.Metadata.ConversationCheckpointUnsettled = true
+				if err := st.UpdateSession(ctx, current); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := st.UpsertActivity(ctx, conversation.ID, "", domain.ConversationActivity{ID: "r5-pending", Kind: domain.ActivityKind(kind), Status: domain.ActivityStatusPending, RequestID: "r5-pending"}, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m.reconcileLivePass(ctx, []domain.SessionRecord{snapshot})
+			current, _, err := st.GetSession(ctx, rec.ID)
+			// Public readiness intentionally treats exited rows as ready. A
+			// recorded recovery failure proves protected work was evaluated,
+			// rather than silently skipped just because the worker was parked.
+			m.statusRecoveryMu.RLock()
+			failed := m.statusRecoveries[rec.ID].failed != nil
+			m.statusRecoveryMu.RUnlock()
+			if err != nil || current.Activity.State != domain.ActivityExited || driver.resumes.Load() != 0 || svc.HasLiveChatController(rec.ID) || !failed {
+				t.Fatalf("exited protected %s was skipped or resurrected: current=%+v resumes=%d err=%v", kind, current, driver.resumes.Load(), err)
+			}
+			if kind == "queued" || kind == "running" || kind == "reserved" {
+				turn, err := st.TurnByID(ctx, "r5-protected-turn")
+				want := domain.TurnStateQueued
+				if kind == "running" {
+					want = domain.TurnStateRunning
+				}
+				if err != nil || turn.State != want {
+					t.Fatalf("protected turn changed: %+v err=%v", turn, err)
+				}
+				if kind == "reserved" {
+					if _, err := st.NextQueuedTurn(ctx, conversation.ID); !errors.Is(err, domain.ErrNoQueuedTurn) {
+						t.Fatalf("reservation cleared: %v", err)
+					}
+				}
+			} else if kind == "checkpoint" {
+				if !current.Metadata.ConversationCheckpointUnsettled {
+					t.Fatal("checkpoint cleared")
+				}
+			} else if pending, err := st.HasPendingConversationInteractions(ctx, conversation.ID); err != nil || !pending {
+				t.Fatalf("interaction lost: pending=%v err=%v", pending, err)
+			}
+		})
+	}
+}

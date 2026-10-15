@@ -998,6 +998,15 @@ func (s *Service) Send(
 	id domain.SessionID,
 	msg ports.ChatUserMessage,
 ) (domain.ConversationTurn, error) {
+	return s.sendWithAdmission(ctx, id, msg, nil)
+}
+
+func (s *Service) sendWithAdmission(
+	ctx context.Context,
+	id domain.SessionID,
+	msg ports.ChatUserMessage,
+	admit func() (func(), error),
+) (domain.ConversationTurn, error) {
 	gate := s.inputGate(id)
 	if err := gate.lock(ctx); err != nil {
 		return domain.ConversationTurn{}, err
@@ -1008,6 +1017,13 @@ func (s *Service) Send(
 		return domain.ConversationTurn{}, err
 	}
 	defer release()
+	if admit != nil {
+		releaseInput, err := admit()
+		if err != nil {
+			return domain.ConversationTurn{}, err
+		}
+		defer releaseInput()
+	}
 	return controller.Send(ctx, msg)
 }
 
@@ -1884,6 +1900,21 @@ func (s *Service) RelayChatTurnWithID(
 		return "", err
 	}
 	return turn.ID, nil
+}
+
+// RelayChatTurnWithAdmission retains automation's position in the same input
+// order as human sends. Admission rechecks manager facts and acquires its input
+// lease after restoration, holding it until the durable send has completed.
+func (s *Service) RelayChatTurnWithAdmission(
+	ctx context.Context,
+	id domain.SessionID,
+	text, clientMessageID string,
+	admit func() (func(), error),
+) (string, error) {
+	turn, err := s.sendWithAdmission(ctx, id, ports.ChatUserMessage{
+		Text: text, ClientMessageID: clientMessageID, Origin: domain.MessageOriginAutomation,
+	}, admit)
+	return turn.ID, err
 }
 
 // StopChat releases a session's controller.

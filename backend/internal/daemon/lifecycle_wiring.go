@@ -541,6 +541,15 @@ func (c chatLauncher) RelayChatTurnWithID(
 	return c.svc.RelayChatTurnWithID(ctx, id, text, clientMessageID)
 }
 
+func (c chatLauncher) RelayChatTurnWithAdmission(
+	ctx context.Context,
+	id domain.SessionID,
+	text, clientMessageID string,
+	admit func() (func(), error),
+) (string, error) {
+	return c.svc.RelayChatTurnWithAdmission(ctx, id, text, clientMessageID, admit)
+}
+
 func (c chatLauncher) HasLiveChatController(id domain.SessionID) bool {
 	return c.svc.HasLiveChatController(id)
 }
