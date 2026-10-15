@@ -297,6 +297,9 @@ func migrate(db *sql.DB) error {
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return fmt.Errorf("set goose dialect: %w", err)
 	}
+	if err := reconcileDesktop169(context.Background(), db); err != nil {
+		return err
+	}
 	if err := repairRenumberedAgentInstallJobsMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered agent-install-jobs migration history: %w", err)
 	}
@@ -1783,6 +1786,17 @@ func reconcileSessionHiddenCDCTrigger(db *sql.DB) error {
 	if canonicalTriggerSQL == "" {
 		return errors.New("schema verification: session hidden CDC repair definition is missing")
 	}
+	// The observed desktop lineage also owns provisioning CDC on this trigger.
+	// Retain that fact when adding visibility CDC; never replace it with a
+	// second, parallel change-log emitter.
+	var provisioning int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='provision_state'`).Scan(&provisioning); err != nil {
+		return err
+	}
+	if provisioning != 0 {
+		canonicalTriggerSQL = strings.Replace(canonicalTriggerSQL, "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at\n    OR OLD.provision_state <> NEW.provision_state", 1)
+		canonicalTriggerSQL = strings.Replace(canonicalTriggerSQL, "'hiddenAt', NEW.hidden_at", "'hiddenAt', NEW.hidden_at,\n            'provisionState', NEW.provision_state", 1)
+	}
 
 	var triggerSQL string
 	if err := db.QueryRow(`
@@ -1796,18 +1810,18 @@ SELECT COALESCE((
 		return nil
 	}
 
-	for _, rc := range schemaRepairs {
-		if rc.version != 150 || rc.table != "sessions" || rc.column != "hidden_at" {
-			continue
-		}
-		for _, stmt := range rc.postAdd {
-			if _, err := db.Exec(stmt); err != nil {
-				return fmt.Errorf("schema repair: replay session hidden CDC trigger: %w", err)
-			}
-		}
-		return nil
+	tx, err := db.Begin()
+	if err != nil {
+		return err
 	}
-	return errors.New("schema verification: session hidden CDC repair definition is missing")
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DROP TRIGGER IF EXISTS sessions_cdc_update`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(canonicalTriggerSQL); err != nil {
+		return fmt.Errorf("schema repair: replay session hidden CDC trigger: %w", err)
+	}
+	return tx.Commit()
 }
 
 func normalizeSQLiteTriggerSQL(sqlText string) string {
