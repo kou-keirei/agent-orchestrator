@@ -128,24 +128,73 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 	}
 	plan[152] = !strings.Contains(notificationSQL, "'orchestration_attention'")
 	if plan[152] {
-		var columns, foreignObjects, incoming int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('notifications')`).Scan(&columns); err != nil {
-			return err
-		}
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE tbl_name='notifications' AND ((type='trigger') OR (type='index' AND sql IS NOT NULL AND name NOT IN ('idx_notifications_status_history','idx_notifications_history','idx_notifications_open_dedupe','idx_notifications_unresolved')))`).Scan(&foreignObjects); err != nil {
-			return err
-		}
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type='table' AND f."table"='notifications'`).Scan(&incoming); err != nil {
-			return err
-		}
-		if columns != 10 || foreignObjects != 0 || incoming != 0 {
-			return fmt.Errorf("desktop schema compatibility: foreign notifications shape; refusing table copy")
-		}
-		rows, err := db.QueryContext(ctx, `SELECT id,session_id,project_id,pr_url,type,title,body,status,created_at,resolved_at FROM notifications LIMIT 0`)
+		// Migration 152 copies SELECT * positionally. table_info alone hides
+		// generated columns and cannot establish the physical copy order.
+		wantColumns := []string{"id", "session_id", "project_id", "pr_url", "type", "title", "body", "status", "created_at", "resolved_at"}
+		rows, err := db.QueryContext(ctx, `SELECT cid,name,hidden FROM pragma_table_xinfo('notifications') ORDER BY cid`)
 		if err != nil {
 			return err
 		}
+		columnCount, ordered := 0, true
+		for rows.Next() {
+			var cid, hidden int
+			var name string
+			if err := rows.Scan(&cid, &name, &hidden); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if columnCount >= len(wantColumns) || cid != columnCount || hidden != 0 || name != wantColumns[columnCount] {
+				ordered = false
+			}
+			columnCount++
+		}
+		err = rows.Err()
 		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+		if !ordered || columnCount != len(wantColumns) {
+			return fmt.Errorf("desktop schema compatibility: notifications physical column order differs; refusing positional copy")
+		}
+		var foreignObjects, incoming int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE tbl_name='notifications' AND ((type='trigger') OR (type='index' AND sql IS NOT NULL AND name NOT IN ('idx_notifications_status_history','idx_notifications_history','idx_notifications_open_dedupe','idx_notifications_unresolved')))`).Scan(&foreignObjects); err != nil {
+			return err
+		}
+		// SQLite identifiers fold ASCII case, even for quoted REFERENCES names.
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type='table' AND f."table"='notifications' COLLATE NOCASE`).Scan(&incoming); err != nil {
+			return err
+		}
+		if foreignObjects != 0 || incoming != 0 {
+			return fmt.Errorf("desktop schema compatibility: foreign notifications shape; refusing table copy")
+		}
+	}
+	var indexCount, ownedIndex, uniqueIndex, partialIndex int
+	var indexSQL string
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(type='index' AND tbl_name='review_run' COLLATE NOCASE),0),COALESCE(MAX(sql),'') FROM sqlite_master WHERE name='idx_review_run_session_pr_sha_harness' COLLATE NOCASE`).Scan(&indexCount, &ownedIndex, &indexSQL); err != nil {
+		return err
+	}
+	if indexCount != 1 || ownedIndex != 1 {
+		return fmt.Errorf("desktop schema compatibility: foreign review-run index owner")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT "unique",partial FROM pragma_index_list('review_run') WHERE name='idx_review_run_session_pr_sha_harness' COLLATE NOCASE`).Scan(&uniqueIndex, &partialIndex); err != nil {
+		return err
+	}
+	if uniqueIndex != 1 || partialIndex != 1 {
+		return fmt.Errorf("desktop schema compatibility: review-run index must be unique and partial")
+	}
+	// Accept the canonical predicate spelling with whitespace differences only.
+	// Do not lowercase SQL string literals or attempt general SQL equivalence.
+	where := strings.Index(strings.ToUpper(indexSQL), "WHERE")
+	const predicate = "target_sha != '' AND status NOT IN ('failed', 'cancelled') AND (status = 'running' OR verdict NOT IN ('', 'changes_requested'))"
+	if where < 0 || strings.Join(strings.Fields(strings.TrimSuffix(strings.TrimSpace(indexSQL[where+len("WHERE"):]), ";")), " ") != predicate {
+		return fmt.Errorf("desktop schema compatibility: foreign review-run index predicate")
+	}
+	var foreignKeys int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_xinfo('idx_review_run_session_pr_sha_harness') WHERE "key"=1 AND ("desc"!=0 OR COALESCE(coll,'')!='BINARY')`).Scan(&foreignKeys); err != nil {
+		return err
+	}
+	if foreignKeys != 0 {
+		return fmt.Errorf("desktop schema compatibility: foreign review-run index key semantics")
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info('idx_review_run_session_pr_sha_harness') ORDER BY seqno`)
 	if err != nil {
@@ -172,6 +221,42 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		plan[155] = false
 	default:
 		return fmt.Errorf("desktop schema compatibility: foreign review-run uniqueness index")
+	}
+	// Reserve every explicit destination of the selected Up SQL before the
+	// first transaction. DROP/replace names may already exist only on their
+	// intended owner. New names must be free across SQLite object namespaces.
+	for _, destination := range []struct {
+		version           int64
+		name, kind, owner string
+		replace           bool
+	}{
+		{150, "sessions_cdc_update", "trigger", "sessions", true},
+		{151, "orchestration_events", "table", "orchestration_events", false},
+		{151, "orchestration_source_states", "table", "orchestration_source_states", false},
+		{151, "idx_orchestration_events_due", "index", "orchestration_events", false},
+		{151, "idx_orchestration_events_project", "index", "orchestration_events", false},
+		{152, "notifications_before_orchestration_attention", "table", "notifications_before_orchestration_attention", false},
+		{152, "notifications", "table", "notifications", true},
+		{152, "idx_notifications_open_dedupe", "index", "notifications", true},
+		{152, "idx_notifications_unresolved", "index", "notifications", true},
+		{152, "idx_notifications_status_history", "index", "notifications", true},
+		{152, "idx_notifications_history", "index", "notifications", true},
+		{153, "sessions_revision_update", "trigger", "sessions", true},
+		{154, "review_run_immutable_binding", "trigger", "review_run", false},
+		{155, "idx_review_run_session_pr_sha_harness", "index", "review_run", true},
+		{156, "reviewer_cleanup_obligation", "table", "reviewer_cleanup_obligation", false},
+		{156, "idx_reviewer_cleanup_obligation_unresolved", "index", "reviewer_cleanup_obligation", false},
+	} {
+		if destination.name == "notifications_before_orchestration_attention" && !plan[152] {
+			continue
+		}
+		var count, foreign int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(NOT(type=? AND tbl_name=? COLLATE NOCASE)),0) FROM sqlite_master WHERE name=? COLLATE NOCASE`, destination.kind, destination.owner, destination.name).Scan(&count, &foreign); err != nil {
+			return err
+		}
+		if foreign != 0 || count > 1 || (plan[destination.version] && !destination.replace && count != 0) {
+			return fmt.Errorf("desktop schema compatibility: replay destination %s is already owned by another schema effect", destination.name)
+		}
 	}
 	var needed bool
 	for _, missing := range plan {

@@ -173,6 +173,178 @@ func TestLegacy169MigrationNumbersRemainReserved(t *testing.T) {
 	}
 }
 
+// Snapshot all synthetic table values as well as schema, including CDC and
+// Goose history. An eventual error is insufficient if an earlier step wrote.
+func desktop169Snapshot(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	hash := sha256.New()
+	rows, err := db.Query(`SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master ORDER BY type,name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tables []string
+	for rows.Next() {
+		var kind, name, owner, ddl string
+		if err := rows.Scan(&kind, &name, &owner, &ddl); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(hash).Encode([]string{kind, name, owner, ddl}); err != nil {
+			t.Fatal(err)
+		}
+		if kind == "table" && !strings.HasPrefix(name, "sqlite_") {
+			tables = append(tables, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	for _, table := range tables {
+		rows, err := db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `" ORDER BY rowid`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			args := make([]any, len(columns))
+			for i := range args {
+				args[i] = &values[i]
+			}
+			if err := rows.Scan(args...); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.NewEncoder(hash).Encode(values); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		_ = rows.Close()
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+func rejectDesktop169Unchanged(t *testing.T, db *sql.DB) {
+	t.Helper()
+	before := desktop169Snapshot(t, db)
+	if err := migrate(db); err == nil {
+		t.Error("unsafe schema accepted")
+	}
+	if after := desktop169Snapshot(t, db); after != before {
+		t.Errorf("compatibility wrote before rejection: before=%s after=%s", before, after)
+	}
+}
+
+func TestLegacy169R2IncomingForeignKey(t *testing.T) {
+	for _, parent := range []string{"Notifications", `"NOTIFICATIONS"`, "nOtIfIcAtIoNs"} {
+		t.Run(parent, func(t *testing.T) {
+			db := legacy169(t)
+			if _, err := db.Exec(`PRAGMA foreign_keys=ON; CREATE TABLE foreign_child(id TEXT PRIMARY KEY, notice_id TEXT REFERENCES ` + parent + `(id) ON DELETE CASCADE, content TEXT); INSERT INTO foreign_child VALUES ('child','notice','retain child')`); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+			var value string
+			if err := db.QueryRow(`SELECT content FROM foreign_child WHERE id='child'`).Scan(&value); err != nil || value != "retain child" {
+				t.Errorf("child corrupted: value=%q err=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestLegacy169R2NotificationPhysicalColumns(t *testing.T) {
+	for _, shape := range []string{"reordered", "generated hidden"} {
+		t.Run(shape, func(t *testing.T) {
+			db := legacy169(t)
+			if shape == "reordered" {
+				if _, err := db.Exec(`ALTER TABLE notifications RENAME TO original_notifications;
+CREATE TABLE notifications(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,pr_url TEXT NOT NULL DEFAULT '',type TEXT NOT NULL CHECK(type IN ('needs_input','ready_to_merge','pr_merged','pr_closed_unmerged')),body TEXT NOT NULL DEFAULT '',title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('read','unread')),created_at TIMESTAMP NOT NULL,resolved_at TIMESTAMP);
+INSERT INTO notifications(id,session_id,project_id,pr_url,type,title,body,status,created_at,resolved_at) SELECT id,session_id,project_id,pr_url,type,title,'retain body',status,created_at,resolved_at FROM original_notifications;
+DROP TABLE original_notifications;`); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := db.Exec(`ALTER TABLE notifications ADD COLUMN foreign_generated TEXT GENERATED ALWAYS AS (title) VIRTUAL`); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+			var title, body string
+			if err := db.QueryRow(`SELECT title,body FROM notifications WHERE id='notice'`).Scan(&title, &body); err != nil {
+				t.Fatal(err)
+			}
+			wantBody := ""
+			if shape == "reordered" {
+				wantBody = "retain body"
+			}
+			if title != "preserve notification" || body != wantBody {
+				t.Errorf("positional copy corrupted title=%q body=%q", title, body)
+			}
+		})
+	}
+}
+
+func TestLegacy169R2ReviewIndex(t *testing.T) {
+	const predicate = ` WHERE target_sha != '' AND status NOT IN ('failed', 'cancelled') AND (status = 'running' OR verdict NOT IN ('', 'changes_requested'))`
+	for _, restart := range []bool{false, true} {
+		for _, shape := range []string{"nonunique", "not partial", "wrong predicate", "foreign owner", "literal case"} {
+			t.Run(fmt.Sprintf("restart=%v/%s", restart, shape), func(t *testing.T) {
+				db := legacy169(t)
+				columns := "session_id, pr_url, target_sha, harness"
+				if restart {
+					if err := migrate(db); err != nil {
+						t.Fatal(err)
+					}
+					columns += ", reviewer_provenance_json"
+				}
+				ddl := "CREATE UNIQUE INDEX idx_review_run_session_pr_sha_harness ON review_run (" + columns + ")" + predicate
+				switch shape {
+				case "nonunique":
+					ddl = strings.Replace(ddl, "CREATE UNIQUE INDEX", "CREATE INDEX", 1)
+				case "not partial":
+					ddl = strings.TrimSuffix(ddl, predicate)
+				case "wrong predicate":
+					ddl = strings.TrimSuffix(ddl, predicate) + ` WHERE target_sha != ''`
+				case "literal case":
+					ddl = strings.Replace(ddl, "'failed'", "'FAILED'", 1)
+				case "foreign owner":
+					if _, err := db.Exec(`CREATE TABLE foreign_reviews(session_id TEXT,pr_url TEXT,target_sha TEXT,harness TEXT,reviewer_provenance_json TEXT,status TEXT,verdict TEXT)`); err != nil {
+						t.Fatal(err)
+					}
+					ddl = strings.Replace(ddl, "ON review_run", "ON foreign_reviews", 1)
+				}
+				if _, err := db.Exec(`DROP INDEX idx_review_run_session_pr_sha_harness; ` + ddl); err != nil {
+					t.Fatal(err)
+				}
+				rejectDesktop169Unchanged(t, db)
+			})
+		}
+	}
+}
+
+func TestLegacy169R2DestinationCollisions(t *testing.T) {
+	for _, ddl := range []string{
+		`CREATE INDEX idx_orchestration_events_due ON foreign_history(content)`,
+		`CREATE INDEX IDX_ORCHESTRATION_EVENTS_PROJECT ON foreign_history(content)`,
+		`CREATE TABLE notifications_before_orchestration_attention(id TEXT)`,
+		`CREATE TRIGGER review_run_immutable_binding AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`,
+		`CREATE INDEX idx_reviewer_cleanup_obligation_unresolved ON foreign_history(content)`,
+		`CREATE TABLE Orchestration_Events(id TEXT)`,
+		`DROP TRIGGER sessions_cdc_update; CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`,
+		`DROP INDEX idx_notifications_history; CREATE INDEX idx_notifications_history ON foreign_history(content)`,
+	} {
+		t.Run(ddl, func(t *testing.T) {
+			db := legacy169(t)
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatal(err)
+			}
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
 // Opt-in, read-only backup input; every writable connection targets a fresh
 // testing-owned copy. Set TEMP/TMP inside the worker before invoking this test.
 func TestLegacy169BackupCopy(t *testing.T) {
