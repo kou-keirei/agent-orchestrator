@@ -302,7 +302,7 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 	}
 	// The later schema reconciliation also replaces CDC on restart. Validate
 	// its known owner/behavior even when no historical SQL needs replay.
-	if err := checkDesktop169SessionTriggers(ctx, db, plan[150], plan[153]); err != nil {
+	if err := checkDesktop169SessionTriggers(ctx, db, plan[150], plan[153], version); err != nil {
 		return err
 	}
 	if !needed {
@@ -433,7 +433,7 @@ func checkDesktop169NotificationDependencies(ctx context.Context, db *sql.DB) er
 	return nil
 }
 
-func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissing, terminalMissing bool) error {
+func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissing, terminalMissing bool, journalVersion int64) error {
 	var temporary int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_temp_master`).Scan(&temporary); err != nil {
 		return err
@@ -454,6 +454,12 @@ func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissi
 	if canonical == "" {
 		return fmt.Errorf("desktop schema compatibility: missing canonical session CDC definition")
 	}
+	// Migration 150 replaces the entire trigger without provisioning CDC, even
+	// when the foreign desktop column already exists. The observed 169 lineage
+	// can therefore legitimately have this exact definition. The existing
+	// reconcileSessionHiddenCDCTrigger transaction upgrades it after preflight
+	// and historical replay; no row backfill or second CDC emitter is needed.
+	historical150 := canonical
 	var provisioning int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='provision_state'`).Scan(&provisioning); err != nil {
 		return err
@@ -473,7 +479,8 @@ func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissi
 	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='sessions' AND name='sessions_cdc_update'`).Scan(&actual); err != nil {
 		return err
 	}
-	if desktop169SQL(actual) != desktop169SQL(canonical) {
+	knownHistorical := journalVersion == 169 && !hiddenMissing && provisioning != 0 && desktop169SQL(actual) == desktop169SQL(historical150)
+	if desktop169SQL(actual) != desktop169SQL(canonical) && !knownHistorical {
 		return fmt.Errorf("desktop schema compatibility: foreign session CDC behavior; refusing replacement")
 	}
 	if !terminalMissing {

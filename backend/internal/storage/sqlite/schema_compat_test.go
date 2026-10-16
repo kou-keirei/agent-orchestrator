@@ -11,6 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	modernsqlite "modernc.org/sqlite"
+	sqlitelib "modernc.org/sqlite/lib"
 )
 
 // This is a small reproduction of the observed desktop lineage: the canonical
@@ -621,4 +624,208 @@ func TestLegacy169BackupCopy(t *testing.T) {
 		t.Fatalf("retention snapshot changed: before=%s after=%s", before, after)
 	}
 	t.Logf("retention snapshot sha256=%s", after)
+}
+
+// Exact captured historical SQL, independent of the production allowlist.
+const historical169CDC = `CREATE TRIGGER sessions_cdc_update
+AFTER UPDATE ON sessions
+WHEN OLD.activity_state <> NEW.activity_state
+    OR OLD.is_terminated <> NEW.is_terminated
+    OR (OLD.first_signal_at IS NULL AND NEW.first_signal_at IS NOT NULL)
+    OR OLD.preview_url <> NEW.preview_url
+    OR OLD.preview_revision <> NEW.preview_revision
+    OR OLD.display_name <> NEW.display_name
+    OR OLD.terminate_on_pr_merge <> NEW.terminate_on_pr_merge
+    OR OLD.is_pinned <> NEW.is_pinned
+    OR OLD.pinned_at <> NEW.pinned_at
+    OR (OLD.pinned_at IS NULL AND NEW.pinned_at IS NOT NULL)
+    OR (OLD.pinned_at IS NOT NULL AND NEW.pinned_at IS NULL)
+    OR OLD.session_mode <> NEW.session_mode
+    OR OLD.auto_inject_review <> NEW.auto_inject_review
+    OR OLD.auto_review_enabled <> NEW.auto_review_enabled
+    OR OLD.harness <> NEW.harness
+    OR OLD.runtime_launch_id <> NEW.runtime_launch_id
+    OR OLD.agent_session_id <> NEW.agent_session_id
+    OR OLD.native_transcript_path <> NEW.native_transcript_path
+    OR OLD.auto_inject_ci <> NEW.auto_inject_ci
+    OR OLD.latest_user_prompt_at IS NOT NEW.latest_user_prompt_at
+    OR OLD.hidden_at IS NOT NEW.hidden_at
+BEGIN
+    INSERT INTO change_log (project_id, session_id, event_type, payload, created_at)
+    VALUES (NEW.project_id, NEW.id, 'session_updated',
+        json_object(
+            'id', NEW.id,
+            'activity', NEW.activity_state,
+            'isTerminated', json(CASE WHEN NEW.is_terminated THEN 'true' ELSE 'false' END),
+            'terminateOnPrMerge', json(CASE WHEN NEW.terminate_on_pr_merge THEN 'true' ELSE 'false' END),
+            'previewUrl', NEW.preview_url,
+            'previewRevision', NEW.preview_revision,
+            'isPinned', json(CASE WHEN NEW.is_pinned THEN 'true' ELSE 'false' END),
+            'mode', NEW.session_mode,
+            'autoInjectReview', json(CASE WHEN NEW.auto_inject_review THEN 'true' ELSE 'false' END),
+            'autoInjectCI', json(CASE WHEN NEW.auto_inject_ci THEN 'true' ELSE 'false' END),
+            'autoReviewEnabled', json(CASE WHEN NEW.auto_review_enabled THEN 'true' ELSE 'false' END),
+            'hiddenAt', NEW.hidden_at
+        ),
+        NEW.updated_at);
+END`
+
+func historical169DB(t *testing.T, reconciled bool) *sql.DB {
+	t.Helper()
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(historical169CDC))); got != "a029ee1be09785960daaa41277c16e6d11150c97ccae9a46fa227b1ca4c48f0f" {
+		t.Fatalf("historical fixture changed: %s", got)
+	}
+	db := legacy169(t)
+	if reconciled {
+		if err := migrate(db); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		mustExec(t, db, `ALTER TABLE sessions ADD COLUMN hidden_at TIMESTAMP`)
+	}
+	mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+historical169CDC)
+	return db
+}
+
+func TestLegacy169HistoricalCDCUpgrade(t *testing.T) {
+	for _, reconciled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reconciled=%v", reconciled), func(t *testing.T) {
+			db := historical169DB(t, reconciled)
+			// Retain a real historical event byte-for-byte across startup.
+			mustExec(t, db, `UPDATE sessions SET display_name='before upgrade' WHERE id='legacy-1'`)
+			var before string
+			if err := db.QueryRow(`SELECT json_group_array(json_array(seq,project_id,session_id,event_type,payload,created_at)) FROM change_log`).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrate(db); err != nil {
+				t.Fatalf("historical startup: %v", err)
+			}
+			var after string
+			if err := db.QueryRow(`SELECT json_group_array(json_array(seq,project_id,session_id,event_type,payload,created_at)) FROM change_log`).Scan(&after); err != nil || after != before {
+				t.Fatalf("startup lost or manufactured CDC: before=%s after=%s err=%v", before, after, err)
+			}
+			// A second startup must change neither schema nor any durable value.
+			snapshot := desktop169Snapshot(t, db)
+			if err := migrate(db); err != nil {
+				t.Fatalf("historical restart: %v", err)
+			}
+			if got := desktop169Snapshot(t, db); got != snapshot {
+				t.Fatal("restart changed schema or data")
+			}
+			for _, set := range []string{
+				`display_name='after upgrade'`, `activity_state='active'`, `is_terminated=0`,
+				`first_signal_at=CURRENT_TIMESTAMP`, `preview_url='http://localhost'`, `preview_revision=1`,
+				`terminate_on_pr_merge=1`, `is_pinned=1`, `pinned_at=CURRENT_TIMESTAMP`, `pinned_at=NULL`,
+				`session_mode='chat'`, `auto_inject_review=0`, `auto_review_enabled=1`, `harness='codex'`,
+				`runtime_launch_id='launch'`, `agent_session_id='native'`, `native_transcript_path='transcript'`,
+				`auto_inject_ci=0`, `latest_user_prompt_at=CURRENT_TIMESTAMP`,
+				`hidden_at=CURRENT_TIMESTAMP`, `hidden_at=NULL`, `provision_state='ready'`,
+			} {
+				t.Run(set, func(t *testing.T) {
+					count := countChangeLog(t, db, "session_updated")
+					mustExec(t, db, `UPDATE sessions SET `+set+` WHERE id='legacy-1'`)
+					if got := countChangeLog(t, db, "session_updated"); got != count+1 {
+						t.Fatalf("want exactly one event: before=%d after=%d", count, got)
+					}
+					var project, session, eventType, payload string
+					if err := db.QueryRow(`SELECT project_id,session_id,event_type,payload FROM change_log ORDER BY seq DESC LIMIT 1`).Scan(&project, &session, &eventType, &payload); err != nil {
+						t.Fatal(err)
+					}
+					var event map[string]any
+					if err := json.Unmarshal([]byte(payload), &event); err != nil {
+						t.Fatal(err)
+					}
+					if project != "legacy" || session != "legacy-1" || eventType != "session_updated" || event["id"] != "legacy-1" || len(event) != 13 {
+						t.Fatalf("invalid CDC envelope/payload: %s %s %s %s", project, session, eventType, payload)
+					}
+					if _, ok := event["isTerminated"].(bool); !ok {
+						t.Fatalf("boolean lost JSON type: %s", payload)
+					}
+					if _, ok := event["hiddenAt"]; !ok {
+						t.Fatal("hiddenAt missing")
+					}
+					if value, ok := event["provisionState"]; !ok || (set == `provision_state='ready'` && value != "ready") {
+						t.Fatalf("provisionState missing/wrong: %s", payload)
+					}
+				})
+			}
+			count := countChangeLog(t, db, "session_updated")
+			mustExec(t, db, `UPDATE sessions SET prompt='not a CDC predicate',provision_state='ready' WHERE id='legacy-1'`)
+			if got := countChangeLog(t, db, "session_updated"); got != count {
+				t.Fatal("noise or unchanged provisioning emitted CDC")
+			}
+		})
+	}
+}
+
+func TestLegacy169HistoricalCDCRejectsForeign(t *testing.T) {
+	for _, tc := range []struct{ name, old, replacement string }{
+		{"foreign literal", "'session_updated'", "'SESSION_UPDATED'"},
+		{"foreign payload", "'hiddenAt'", "'hidden_at'"},
+		{"missing old predicate", "OR OLD.display_name <> NEW.display_name", ""},
+		{"provision predicate only", "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at OR OLD.provision_state <> NEW.provision_state"},
+		{"provision payload only", "'hiddenAt', NEW.hidden_at", "'hiddenAt', NEW.hidden_at, 'provisionState', NEW.provision_state"},
+		{"extra side effect", "\nEND", "\nUPDATE foreign_history SET content='unexpected'; END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, false)
+			mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+strings.Replace(historical169CDC, tc.old, tc.replacement, 1))
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+	for _, tc := range []struct{ name, ddl string }{
+		{"higher journal", `INSERT INTO goose_db_version(version_id,is_applied) VALUES (170,1)`},
+		{"rolled back claim", `INSERT INTO goose_db_version(version_id,is_applied) VALUES (153,0)`},
+		{"foreign backfill dependency", `CREATE TRIGGER foreign_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='unexpected'; END`},
+		{"temporary dependency", `CREATE TEMP TRIGGER temp_update AFTER UPDATE ON main.sessions BEGIN SELECT 1; END`},
+		{"foreign CDC owner", `DROP TRIGGER sessions_cdc_update; CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, false)
+			mustExec(t, db, tc.ddl)
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169HistoricalCDCTransactionalReplacement(t *testing.T) {
+	db := historical169DB(t, true)
+	before := desktop169Snapshot(t, db)
+	// Native per-connection SQL length limit lets DROP succeed and forces the
+	// larger CREATE to fail. The reconciler must roll the DROP back, with no
+	// production data, global hooks, or product injection seam involved.
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, len(historical169CDC)+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	err = reconcileSessionHiddenCDCTrigger(db)
+	conn, connErr := db.Conn(t.Context())
+	if connErr != nil {
+		t.Fatal(connErr)
+	}
+	_, resetErr := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, old)
+	_ = conn.Close()
+	if resetErr != nil {
+		t.Fatal(resetErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "replay session hidden CDC trigger") {
+		t.Fatalf("expected CREATE failure after DROP: %v", err)
+	}
+	if got := desktop169Snapshot(t, db); got != before {
+		t.Fatal("failed replacement lost trigger or changed durable state")
+	}
+	// The rolled-back original still emits a complete historical event.
+	count := countChangeLog(t, db, "session_updated")
+	mustExec(t, db, `UPDATE sessions SET display_name='after rollback' WHERE id='legacy-1'`)
+	if countChangeLog(t, db, "session_updated") != count+1 {
+		t.Fatal("rollback left a CDC gap")
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("retry after rollback: %v", err)
+	}
 }
