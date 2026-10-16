@@ -659,12 +659,20 @@ func (g *generator) renderDef(b *strings.Builder, name string, s *schema, inline
 		emitted[name] = true
 		doc(b, name, s.Description)
 		fmt.Fprintf(b, "type %s string\n\nconst (\n", name)
+		var values []string
 		for _, v := range s.Enum {
-			str, ok := v.(string)
-			if !ok {
+			if str, ok := v.(string); ok {
+				values = append(values, str)
+			}
+		}
+		names := enumIdentifiers(values)
+		seen := map[string]bool{}
+		for _, str := range values {
+			if seen[str] {
 				continue
 			}
-			fmt.Fprintf(b, "\t%s%s %s = %q\n", name, exportName(str), name, str)
+			seen[str] = true
+			fmt.Fprintf(b, "\t%s%s %s = %q\n", name, names[str], name, str)
 		}
 		b.WriteString(")\n\n")
 		return
@@ -678,6 +686,15 @@ func (g *generator) renderDef(b *strings.Builder, name string, s *schema, inline
 		if len(arms) == 0 {
 			arms = s.AnyOf
 		}
+		var values []string
+		for _, a := range arms {
+			for _, v := range a.Enum {
+				if str, ok := v.(string); ok {
+					values = append(values, str)
+				}
+			}
+		}
+		names := enumIdentifiers(values)
 		seen := map[string]bool{}
 		for _, a := range arms {
 			for _, v := range a.Enum {
@@ -689,7 +706,7 @@ func (g *generator) renderDef(b *strings.Builder, name string, s *schema, inline
 				if a.Description != "" {
 					fmt.Fprintf(b, "\t// %s\n", oneLine(a.Description))
 				}
-				fmt.Fprintf(b, "\t%s%s %s = %q\n", name, exportName(str), name, str)
+				fmt.Fprintf(b, "\t%s%s %s = %q\n", name, names[str], name, str)
 			}
 		}
 		b.WriteString(")\n\n")
@@ -955,14 +972,54 @@ func (g *generator) renderFlattenedUnion(
 	fmt.Fprintf(b, "// %s is the discriminator of %s.\ntype %s string\n\nconst (\n", tagType, name, tagType)
 	seen := map[string]bool{}
 	sort.Strings(tagValues)
+	names := enumIdentifiers(tagValues)
 	for _, v := range tagValues {
 		if seen[v] {
 			continue
 		}
 		seen[v] = true
-		fmt.Fprintf(b, "\t%s%s %s = %q\n", tagType, exportName(v), tagType, v)
+		fmt.Fprintf(b, "\t%s%s %s = %q\n", tagType, names[v], tagType, v)
 	}
 	b.WriteString(")\n\n")
+}
+
+// enumIdentifiers preserves distinct wire values whose exported names collide.
+// Sort before allocating so schema order cannot change the chosen names. Reserve
+// every original name so a numeric suffix cannot steal a non-colliding name.
+func enumIdentifiers(values []string) map[string]string {
+	values = append([]string(nil), values...)
+	sort.Strings(values)
+	preferred := map[string]bool{}
+	for _, value := range values {
+		name := exportName(value)
+		if name == "" {
+			name = "Value"
+		}
+		preferred[name] = true
+	}
+	names := map[string]string{}
+	used := map[string]bool{}
+	for _, value := range values {
+		if _, exists := names[value]; exists {
+			continue
+		}
+		base := exportName(value)
+		if base == "" {
+			base = "Value"
+		}
+		name := base
+		if used[name] {
+			for suffix := 2; ; suffix++ {
+				name = fmt.Sprintf("%s%d", base, suffix)
+				if !used[name] && !preferred[name] {
+					break
+				}
+			}
+		}
+		names[value] = name
+		used[name] = true
+	}
+	return names
 }
 
 func isStringEnum(s *schema) bool {

@@ -146,8 +146,9 @@ var _ ports.ChatDriver = (*Driver)(nil)
 // Harness reports which agent this driver serves.
 func (d *Driver) Harness() domain.AgentHarness { return domain.HarnessCodex }
 
-// capabilities is what a Codex app-server of a supported version provides. Each
-// entry here was exercised against a live app-server rather than read off a doc.
+// capabilities is the adapter surface for supported Codex app-server versions.
+// Entries have live-provider evidence except the newer rollback replacement,
+// whose method recognition is measured and whose compatibility path is mock-tested.
 func capabilities() ports.ChatCapabilities {
 	return ports.ChatCapabilities{
 		ports.ChatCapabilityStreaming:   true,
@@ -169,10 +170,10 @@ func capabilities() ports.ChatCapabilities {
 		// all: every turn re-sends the history, so context fills on its own and the
 		// only way back is to summarize what is already there.
 		ports.ChatCapabilityCompaction: true,
-		// History operations, all three exercised against a live app-server. Rollback
-		// is advertised despite thread/rollback carrying a DEPRECATED annotation:
-		// what the installed provider does is the only honest answer, and gating the
-		// feature off while the call still works would take undo away for no reason.
+		// Rollback preserves the live-tested 0.146 path and uses thread/revert only
+		// after the measured unsupported-method rejection. Both paths validate the
+		// exact native anchor and fail closed; no uncertain mutation is retried.
+		// Authenticated native revert conformance remains a separate release gate.
 		ports.ChatCapabilityRollback: true,
 		ports.ChatCapabilityFork:     true,
 		ports.ChatCapabilityRename:   true,
