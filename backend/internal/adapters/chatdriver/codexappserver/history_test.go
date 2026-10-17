@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
@@ -451,4 +454,332 @@ func TestConversationAdvertisesTheHistoryCapabilities(t *testing.T) {
 func isRefusal(err error) bool {
 	var refusal interface{ ChatRefusal() bool }
 	return errors.As(err, &refusal) && refusal.ChatRefusal()
+}
+
+// This is the deserialization refusal measured in R8, before a handler can mutate
+// history. Ordinary -32600 business refusals must never select a second method.
+const unknownRollbackMethod = "Invalid request: unknown variant `thread/rollback`, expected one of `initialize`, `thread/read`, `thread/revert`"
+
+func historyRequests(srv *scriptedServer) []frame {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	var requests []frame
+	for _, f := range srv.seen {
+		switch f.Method {
+		case "thread/read", "thread/rollback", "thread/revert", "turn/start":
+			requests = append(requests, f)
+		}
+	}
+	return requests
+}
+
+func TestRollbackCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		anchor      string
+		modern      bool
+		scoped      bool
+		wantDiscard int
+	}{
+		{name: "legacy first", anchor: "turn-a", wantDiscard: 3},
+		{name: "legacy middle", anchor: "turn-b", wantDiscard: 2},
+		{name: "legacy last", anchor: "turn-c", wantDiscard: 1},
+		{name: "modern first", anchor: "turn-a", modern: true, wantDiscard: 3},
+		{name: "modern middle", anchor: "turn-b", modern: true, wantDiscard: 2},
+		{name: "modern last", anchor: "turn-c", modern: true, wantDiscard: 1},
+		{name: "modern scoped anchor", anchor: "turn-b", modern: true, scoped: true, wantDiscard: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", threadWithTurns)
+			srv.reply("thread/rollback", `{"thread":{"id":"thread-1","turns":[]}}`)
+			if tc.modern {
+				srv.replyError("thread/rollback", -32600, unknownRollbackMethod)
+				// Revert's response deliberately carries no hydrated turns.
+				srv.reply("thread/revert", `{"thread":{"id":"thread-1","turns":[]},"turnsBackwardsCursor":null}`)
+			}
+			if tc.scoped {
+				conv.providerScopeID = "test-scope"
+			}
+			if err := conv.Rollback(context.Background(), conv.scopedID(tc.anchor)); err != nil {
+				t.Fatal(err)
+			}
+			requests := historyRequests(srv)
+			wantMethods := []string{"thread/read", "thread/rollback"}
+			if tc.modern {
+				wantMethods = append(wantMethods, "thread/revert")
+			}
+			var methods []string
+			for _, f := range requests {
+				methods = append(methods, f.Method)
+			}
+			if !reflect.DeepEqual(methods, wantMethods) {
+				t.Fatalf("requests = %v, want %v", methods, wantMethods)
+			}
+			var legacy map[string]any
+			if err := json.Unmarshal(requests[1].Params, &legacy); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(legacy, map[string]any{"threadId": "thread-1", "numTurns": float64(tc.wantDiscard)}) {
+				t.Fatalf("legacy params = %v", legacy)
+			}
+			if tc.modern {
+				var modern map[string]any
+				if err := json.Unmarshal(requests[2].Params, &modern); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(modern, map[string]any{"threadId": "thread-1", "beforeTurnId": tc.anchor}) {
+					t.Fatalf("revert params = %v", modern)
+				}
+			}
+			if conv.threadID != "thread-1" || srv.sentMethod("thread/resume") {
+				t.Fatal("rollback changed or resumed provider identity")
+			}
+		})
+	}
+}
+
+func TestRollbackFallbackRequiresExactUnsupportedMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		code    int
+		message string
+	}{
+		{"inflight", -32600, "Cannot rollback while a turn is in progress."},
+		{"missing thread", -32600, "thread not found: thread-1"},
+		{"unknown turn", -32600, "turn not found: turn-b"},
+		{"unsupported prose", -32600, "thread/rollback is unsupported"},
+		{"embedded unknown variant", -32600, "Cannot rollback: " + unknownRollbackMethod},
+		{"different method", -32600, strings.ReplaceAll(unknownRollbackMethod, "thread/rollback", "thread/read")},
+		{"missing revert advertisement", -32600, strings.ReplaceAll(unknownRollbackMethod, "`thread/revert`", "`turn/start`")},
+		{"wrong code", -32603, unknownRollbackMethod},
+		{"generic method not found", -32601, "Method not found"},
+		{"unknown variant wrong code", -32601, unknownRollbackMethod},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", threadWithTurns)
+			srv.replyError("thread/rollback", tc.code, tc.message)
+			if err := conv.Rollback(context.Background(), "turn-b"); err == nil {
+				t.Fatal("provider refusal was lost")
+			}
+			requests := historyRequests(srv)
+			if len(requests) != 2 || requests[1].Method != "thread/rollback" {
+				t.Fatalf("unexpected fallback/retry: %+v", requests)
+			}
+		})
+	}
+}
+
+func TestRollbackRejectsUnsafeHistoryBeforeMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name, history, anchor, active string
+		pending                       bool
+	}{
+		{name: "unknown anchor", history: threadWithTurns, anchor: "missing"},
+		{name: "blank anchor", history: threadWithTurns, anchor: " "},
+		{name: "active local turn", history: threadWithTurns, anchor: "turn-a", active: "turn-live"},
+		{name: "pending approval", history: threadWithTurns, anchor: "turn-a", pending: true},
+		{name: "foreign thread", history: strings.ReplaceAll(threadWithTurns, "thread-1", "foreign"), anchor: "turn-a"},
+		{name: "missing thread identity", history: `{"thread":{"turns":[{"id":"turn-a","status":"completed"}]}}`, anchor: "turn-a"},
+		{name: "duplicate turn", history: strings.ReplaceAll(threadWithTurns, "turn-c", "turn-a"), anchor: "turn-a"},
+		{name: "blank turn", history: strings.ReplaceAll(threadWithTurns, "turn-c", ""), anchor: "turn-a"},
+		{name: "running later turn", history: strings.ReplaceAll(threadWithTurns, "completed", "inProgress"), anchor: "turn-a"},
+		{name: "pending native turn", history: strings.ReplaceAll(threadWithTurns, "completed", "pending"), anchor: "turn-a"},
+		{name: "queued native turn", history: strings.ReplaceAll(threadWithTurns, "completed", "queued"), anchor: "turn-a"},
+		{name: "unknown native status", history: strings.ReplaceAll(threadWithTurns, "completed", "newStatus"), anchor: "turn-a"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", tc.history)
+			// Let the old implementation complete an unsafe send so the witness
+			// fails on its assertions rather than waiting for an unscripted reply.
+			srv.reply("thread/rollback", `{}`)
+			srv.reply("thread/revert", `{}`)
+			conv.mu.Lock()
+			conv.activeTurn = tc.active
+			if tc.pending {
+				conv.pending["approval"] = &parkedRequest{ch: make(chan ports.ChatDecision, 1)}
+			}
+			conv.mu.Unlock()
+			if err := conv.Rollback(context.Background(), tc.anchor); err == nil {
+				t.Fatal("unsafe history accepted")
+			}
+			if srv.sentMethod("thread/rollback") || srv.sentMethod("thread/revert") {
+				t.Fatal("unsafe history caused mutation")
+			}
+		})
+	}
+}
+
+func TestRollbackRevertRefusalDoesNotRetry(t *testing.T) {
+	for _, message := range []string{"Cannot revert while a turn is in progress.", "turn not found: turn-b", "thread not found: thread-1"} {
+		t.Run(message, func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", threadWithTurns)
+			srv.replyError("thread/rollback", -32600, unknownRollbackMethod)
+			srv.replyError("thread/revert", -32600, message)
+			err := conv.Rollback(context.Background(), "turn-b")
+			if err == nil || !isRefusal(err) || !strings.Contains(err.Error(), message) {
+				t.Fatalf("refusal lost: %v", err)
+			}
+			if got := historyRequests(srv); len(got) != 3 || got[2].Method != "thread/revert" {
+				t.Fatalf("unexpected retry: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRollbackUncertainMutationDoesNotRetry(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		for _, failure := range []string{"cancel", "deadline", "transport"} {
+			t.Run(fmt.Sprintf("modern=%v/%s", modern, failure), func(t *testing.T) {
+				conv, srv := openConversation(t)
+				srv.reply("thread/read", threadWithTurns)
+				method := "thread/rollback"
+				if modern {
+					srv.replyError(method, -32600, unknownRollbackMethod)
+					method = "thread/revert"
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { done <- conv.Rollback(ctx, "turn-b") }()
+				request := srv.awaitFrame(func(f frame) bool { return f.Method == method })
+				want := error(context.DeadlineExceeded)
+				if failure == "cancel" {
+					cancel()
+					want = context.Canceled
+				} else if failure == "transport" {
+					_ = srv.toClient.Close()
+					want = ErrConnClosed
+				}
+				if err := <-done; !errors.Is(err, want) || isRefusal(err) {
+					t.Fatalf("error = %v, want uncertainty %v", err, want)
+				}
+				if failure != "transport" {
+					// A success arriving after the caller stopped waiting cannot retry.
+					srv.push(`{"id":` + string(*request.ID) + `,"result":{"thread":{"id":"thread-1","turns":[]}}}`)
+				}
+				wantCount := 2
+				if modern {
+					wantCount++
+				}
+				if got := historyRequests(srv); len(got) != wantCount {
+					t.Fatalf("uncertain mutation retried: %+v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestRollbackSerializesReadAndBothMethodsWithSendTurn(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(fmt.Sprint(modern), func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", threadWithTurns)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			rollbackDone := make(chan error, 1)
+			go func() { rollbackDone <- conv.Rollback(ctx, "turn-b") }()
+			request := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/rollback" })
+			if conv.sendMu.TryLock() {
+				conv.sendMu.Unlock()
+				t.Fatal("rollback released send serialization during native request")
+			}
+			sendDone := make(chan error, 1)
+			go func() { _, err := conv.SendTurn(ctx, ports.ChatUserMessage{Text: "later input"}); sendDone <- err }()
+			if modern {
+				errJSON, _ := json.Marshal(rpcError{Code: -32600, Message: unknownRollbackMethod})
+				srv.push(`{"id":` + string(*request.ID) + `,"error":` + string(errJSON) + `}`)
+				request = srv.awaitFrame(func(f frame) bool { return f.Method == "thread/revert" })
+				if conv.sendMu.TryLock() {
+					conv.sendMu.Unlock()
+					t.Fatal("fallback released send serialization")
+				}
+			}
+			if srv.sentMethod("turn/start") {
+				t.Fatal("input overtook rollback")
+			}
+			srv.push(`{"id":` + string(*request.ID) + `,"result":{"thread":{"id":"thread-1","turns":[]}}}`)
+			if err := <-rollbackDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-sendDone; err != nil {
+				t.Fatal(err)
+			}
+			requests := historyRequests(srv)
+			if requests[len(requests)-1].Method != "turn/start" {
+				t.Fatalf("input order lost: %+v", requests)
+			}
+		})
+	}
+}
+
+func TestRollbackRetryRechecksAnchorAfterSuccess(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		t.Run(fmt.Sprint(modern), func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.respondSequence("thread/read", threadWithTurns, `{"thread":{"id":"thread-1","turns":[{"id":"turn-a","status":"completed"}]}}`)
+			srv.reply("thread/rollback", `{}`)
+			if modern {
+				srv.replyError("thread/rollback", -32600, unknownRollbackMethod)
+				srv.reply("thread/revert", `{}`)
+			}
+			if err := conv.Rollback(context.Background(), "turn-b"); err != nil {
+				t.Fatal(err)
+			}
+			if err := conv.Rollback(context.Background(), "turn-b"); err == nil || !isRefusal(err) {
+				t.Fatalf("discarded anchor accepted again: %v", err)
+			}
+			wantCount := 3
+			if modern {
+				wantCount++
+			}
+			if got := historyRequests(srv); len(got) != wantCount {
+				t.Fatalf("successful mutation repeated: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRollbackRechecksOperationsAfterProviderIO(t *testing.T) {
+	for _, method := range []string{"thread/read", "thread/rollback"} {
+		for _, pending := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pending=%v", method, pending), func(t *testing.T) {
+				conv, srv := openConversation(t)
+				if method != "thread/read" {
+					srv.reply("thread/read", threadWithTurns)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				done := make(chan error, 1)
+				go func() { done <- conv.Rollback(ctx, "turn-b") }()
+				request := srv.awaitFrame(func(f frame) bool { return f.Method == method })
+				if conv.sendMu.TryLock() {
+					conv.sendMu.Unlock()
+					t.Fatalf("serialization released during %s", method)
+				}
+				conv.mu.Lock()
+				if pending {
+					conv.pending["new-request"] = &parkedRequest{ch: make(chan ports.ChatDecision, 1)}
+				} else {
+					conv.activeTurn = "new-turn"
+				}
+				conv.mu.Unlock()
+				if method == "thread/read" {
+					srv.push(`{"id":` + string(*request.ID) + `,"result":` + threadWithTurns + `}`)
+				} else {
+					errJSON, _ := json.Marshal(rpcError{Code: -32600, Message: unknownRollbackMethod})
+					srv.push(`{"id":` + string(*request.ID) + `,"error":` + string(errJSON) + `}`)
+				}
+				if err := <-done; err == nil || !isRefusal(err) {
+					t.Fatalf("fresh operation did not fence mutation: %v", err)
+				}
+				if srv.sentMethod("thread/revert") || (method == "thread/read" && srv.sentMethod("thread/rollback")) {
+					t.Fatal("mutation sent after fresh operation appeared")
+				}
+			})
+		}
+	}
 }

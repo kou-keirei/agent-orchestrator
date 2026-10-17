@@ -35,11 +35,13 @@ import (
 //	blank title            "thread name must not be empty"
 //	unloaded thread        "thread not found: <id>"
 //
-// thread/rollback is annotated DEPRECATED in the protocol schema, and the
-// provider's own `undo` experimental feature already reports stage "removed". It
-// works on 0.146.0. When it goes, the replacement is thread/fork with lastTurnId,
-// which yields a different thread id — something ChatRollbacker cannot report, so
-// that day needs a port change and not a swap of the call in here.
+// 0.163.0 rejects thread/rollback during request deserialization with -32600 and
+// an "unknown variant" error listing thread/revert. Its schema defines revert's
+// beforeTurnId as excluding that turn and all later turns, on the SAME thread.
+// Prefer the measured 0.146 rollback path, then use revert only after that exact
+// unsupported-method rejection. Revert's response need not hydrate retained turns.
+// This compatibility path is mock-tested; native authenticated revert conformance
+// remains a separate release check.
 
 // Asserted so a refactor cannot silently drop one of these: the service
 // feature-detects each interface, and a missing method would read as "the provider
@@ -310,16 +312,40 @@ func (c *conversation) Rollback(ctx context.Context, providerTurnID string) erro
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
+	checkIdle := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.activeTurn != "" || len(c.pending) != 0 {
+			return refuse("cannot rollback while a turn or provider request is in progress")
+		}
+		return nil
+	}
+	if err := checkIdle(); err != nil {
+		return err
+	}
+
 	turns, err := c.readTurns(ctx)
 	if err != nil {
 		return err
 	}
 
 	discard := 0
+	seen := make(map[string]bool, len(turns))
 	for i, turn := range turns {
+		if strings.TrimSpace(turn.ID) == "" || seen[turn.ID] {
+			return refuse("provider history has a missing or duplicate turn id")
+		}
+		seen[turn.ID] = true
+		switch turn.Status {
+		case "completed", "failed", "interrupted", "cancelled", "canceled":
+		default:
+			return refuse("cannot rollback while provider turn %q has unsettled or unknown status %q", turn.ID, turn.Status)
+		}
 		if turn.ID == providerTurnID {
 			discard = len(turns) - i
-			break
 		}
 	}
 	if discard == 0 {
@@ -329,13 +355,40 @@ func (c *conversation) Rollback(ctx context.Context, providerTurnID string) erro
 		return refuse("turn %q is not in the provider's history", providerTurnID)
 	}
 
+	if err := checkIdle(); err != nil {
+		return err
+	}
 	if err := c.conn.request(ctx, "thread/rollback", map[string]any{
 		"threadId": c.threadID,
 		"numTurns": discard,
 	}, nil); err != nil {
-		return asRefusal(fmt.Errorf("thread/rollback: %w", err))
+		if !rollbackMethodUnsupported(err) {
+			return asRefusal(fmt.Errorf("thread/rollback: %w", err))
+		}
+		// Deserialization rejected the legacy method before executing it. Never
+		// fall back on a business refusal, timeout, or uncertain transport result.
+		if err := checkIdle(); err != nil {
+			return err
+		}
+		if err := c.conn.request(ctx, "thread/revert", map[string]any{
+			"threadId":     c.threadID,
+			"beforeTurnId": providerTurnID,
+		}, nil); err != nil {
+			return asRefusal(fmt.Errorf("thread/revert: %w", err))
+		}
 	}
 	return nil
+}
+
+// rollbackMethodUnsupported recognizes only the measured request-deserialization
+// error, including the replacement method in the provider's expected-method list.
+// -32600 also covers business refusals; a code or loose substring alone is unsafe.
+func rollbackMethodUnsupported(err error) bool {
+	const prefix = "Invalid request: unknown variant `thread/rollback`, expected one of "
+	var rpcErr *rpcError
+	return errors.As(err, &rpcErr) && rpcErr.Code == -32600 &&
+		strings.HasPrefix(rpcErr.Message, prefix) &&
+		strings.Contains(strings.TrimPrefix(rpcErr.Message, prefix), "`thread/revert`")
 }
 
 // readTurns is the provider's own turn list for this thread, oldest first.
@@ -347,6 +400,7 @@ func (c *conversation) Rollback(ctx context.Context, providerTurnID string) erro
 func (c *conversation) readTurns(ctx context.Context) ([]providerTurn, error) {
 	var resp struct {
 		Thread struct {
+			ID    string         `json:"id"`
 			Turns []providerTurn `json:"turns"`
 		} `json:"thread"`
 	}
@@ -355,6 +409,9 @@ func (c *conversation) readTurns(ctx context.Context) ([]providerTurn, error) {
 		"includeTurns": true,
 	}, &resp); err != nil {
 		return nil, asRefusal(fmt.Errorf("thread/read: %w", err))
+	}
+	if resp.Thread.ID != c.threadID {
+		return nil, fmt.Errorf("thread/read returned %q, requested %q", resp.Thread.ID, c.threadID)
 	}
 	return resp.Thread.Turns, nil
 }
