@@ -4462,8 +4462,8 @@ describe("returnToHome missing production release", () => {
       message: "No stable release is published for this update source.",
     });
     const statuses = statusMessages().slice(before).map(message => message.payload);
-    expect(statuses.every(status => status.requestId === "return-home-no-release")).toBe(true);
-    expect(statuses.some(status => status.state === "error")).toBe(false);
+    expect(statuses.every(status => typeof status === "object" && status !== null && "requestId" in status && status.requestId === "return-home-no-release")).toBe(true);
+    expect(statuses.some(status => typeof status === "object" && status !== null && "state" in status && status.state === "error")).toBe(false);
   });
 
   it.each([false, true])("retains genuine check failures and ownership (event=%s)", async event => {
