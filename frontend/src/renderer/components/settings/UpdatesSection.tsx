@@ -23,6 +23,12 @@ export const updateSettingsQueryKey = ["update-settings"] as const;
 type PrimaryValue = UpdateChannel | "feature";
 
 const DEFAULT_SETTINGS: UpdateSettings = { enabled: false, channel: "latest", nightlyAck: false, feature: null };
+// Keep remote error stacks/headers out of Settings, including IPC rejections.
+function displayUpdateError(message: string): string {
+	const line = message.split(/[\r\n]/, 1)[0];
+	return line.length > 300 ? `${line.slice(0, 299)}…` : line;
+}
+
 const MIN_MANUAL_CHECK_VISIBLE_MS = 1_000;
 // Hard ceiling on how long a manual check may hold the button. The IPC call is
 // awaited and normally settles on its own, but if it ever does not, the pending
@@ -104,7 +110,7 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 			finishManualCheck(next.requestId);
 		}
 		const pending = channelSwitchRef.current;
-		if (pending && next.requestId === pending.requestId && ["not-available", "error", "unsupported"].includes(next.state)) {
+		if (pending && next.requestId === pending.requestId && ["not-available", "release-unavailable", "error", "unsupported"].includes(next.state)) {
 			setChannelSwitch(null);
 		}
 	}, true);
@@ -135,7 +141,7 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 		} else if (status.state === "downloaded") {
 			void aoBridge.updates.install();
 			autoProgressRef.current = null;
-		} else if (status.state === "error" || status.state === "unsupported" || status.state === "not-available") {
+		} else if (status.state === "release-unavailable" || status.state === "error" || status.state === "unsupported" || status.state === "not-available") {
 			autoProgressRef.current = null;
 		}
 	}, [status]);
@@ -584,7 +590,7 @@ function UpdateActions({
 			{/* The primary error already explains the failed check. Keep a separate
 			    notice only when it adds information (for example beside a staged build). */}
 			{status.checkError && !(displayState === "error" && status.message === status.checkError) && (
-				<UpdateNotice tone="error" text={status.checkError} />
+				<UpdateNotice tone="error" text={displayUpdateError(status.checkError)} />
 			)}
 
 			{!status.checkError && !status.staleCheckNudge && status.checksFailing && (
@@ -680,6 +686,7 @@ function UpdateStatusLine({
 			icon = <CheckCircle2 className="size-icon-sm shrink-0" aria-hidden="true" />;
 			label = t("settings.updates.latest");
 			break;
+		case "release-unavailable":
 		case "unsupported":
 			icon = <Info className="size-icon-sm shrink-0" aria-hidden="true" />;
 			label = status.message ?? t("settings.updates.needInstalledApp");
@@ -689,7 +696,7 @@ function UpdateStatusLine({
 			icon = <AlertTriangle className="size-icon-sm shrink-0" aria-hidden="true" />;
 			label = status.netError
 				? t("settings.updates.netErrorRestartGuidance")
-				: status.message ?? t("settings.updates.updateFailed");
+				: displayUpdateError(status.message ?? t("settings.updates.updateFailed"));
 			break;
 		default:
 			label = t("settings.updates.notChecked");

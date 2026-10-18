@@ -2334,6 +2334,13 @@ describe("Sidebar", () => {
 		expect(screen.getByTestId("sidebar-update-failed")).toBeInTheDocument();
 	});
 
+	it("does not show a red update warning for an unavailable production release", async () => {
+		updateStatusMock.mockResolvedValue({ state: "release-unavailable", message: "No stable release is published for this update source." });
+		renderSidebar();
+		await waitFor(() => expect(updateStatusMock).toHaveBeenCalled());
+		expect(screen.queryByText("Update check failed")).not.toBeInTheDocument();
+	});
+
 	it("keeps explicit update errors out of the sidebar", async () => {
 		updateStatusMock.mockResolvedValue({
 			state: "error",

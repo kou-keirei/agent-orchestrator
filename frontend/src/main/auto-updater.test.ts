@@ -4375,3 +4375,72 @@ it("falls back to the 2 GiB cap when the archive size is unknown", async () => {
     expect(required.at(-1)).toBe(2 * 1024 * 1024 * 1024);
   } finally { restore(); }
 });
+
+const noProductionRelease = () => Object.assign(new Error(
+  'Unable to find latest version on GitHub (https://github.com/kou-keirei/agent-orchestrator/releases/latest), please ensure a production release exists: HttpError: 406 "Not Acceptable"\nHeaders: secret detail\n    at HttpExecutor',
+), { code: "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" });
+
+describe("missing GitHub production release", () => {
+  it.each([false, true])("settles manual checks without success or raw detail (event=%s)", async event => {
+    const { module, autoUpdater, updaterEvents } = await importAutoUpdater();
+    autoUpdater.checkForUpdates.mockImplementationOnce(() => {
+      if (event) updaterEvents.get("error")?.(noProductionRelease());
+      return Promise.reject(noProductionRelease());
+    });
+    await module.checkForUpdatesNow(stateDir, { requestId: "no-release" });
+    expect(module.getUpdateStatus()).toEqual({
+      state: "release-unavailable", requestId: "no-release",
+      message: "No stable release is published for this update source.",
+    });
+  });
+
+  it("settles an event-only error without a false successful timestamp", async () => {
+    const { module, autoUpdater, updaterEvents } = await importAutoUpdater();
+    autoUpdater.checkForUpdates.mockImplementationOnce(() => {
+      updaterEvents.get("error")?.(noProductionRelease());
+      return Promise.resolve();
+    });
+    await module.checkForUpdatesNow(stateDir);
+    expect(module.getUpdateStatus().state).toBe("release-unavailable");
+    expect(module.getUpdateStatus().checkedAt).toBeUndefined();
+  });
+
+  it("clears a previous failure streak and preserves the last successful timestamp", async () => {
+    const { module, autoUpdater, updaterEvents } = await importAutoUpdater();
+    await module.checkForUpdatesNow(stateDir);
+    updaterEvents.get("update-not-available")?.();
+    const checkedAt = module.getUpdateStatus().checkedAt;
+    autoUpdater.checkForUpdates.mockRejectedValue(new Error("offline"));
+    for (let i = 0; i < 3; i++) await module.startAutoUpdates(stateDir);
+    expect(module.getUpdateStatus().checksFailing).toBe(true);
+    autoUpdater.checkForUpdates.mockImplementation(() => {
+      updaterEvents.get("checking-for-update")?.();
+      updaterEvents.get("error")?.(noProductionRelease());
+      return Promise.reject(noProductionRelease());
+    });
+    for (let i = 0; i < 4; i++) await module.startAutoUpdates(stateDir);
+    expect(module.getUpdateStatus()).toEqual({
+      state: "release-unavailable", checkedAt,
+      message: "No stable release is published for this update source.",
+    });
+  });
+
+  it.each([
+    new Error("HttpError: 406 Not Acceptable"),
+    Object.assign(new Error("HttpError: 406"), { code: "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" }),
+    ...[401, 403, 404, 500].map(code => Object.assign(new Error(noProductionRelease().message.replace("406", String(code))), { code: "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" })),
+    Object.assign(new Error(noProductionRelease().message.replace("github.com", "example.com")), { code: "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" }),
+  ])("keeps genuine provider failures red: %s", async error => {
+    const { module, autoUpdater } = await importAutoUpdater();
+    autoUpdater.checkForUpdates.mockRejectedValueOnce(error);
+    await module.checkForUpdatesNow(stateDir);
+    expect(module.getUpdateStatus().state).toBe("error");
+  });
+
+  it("does not suppress a download failure with the same text", async () => {
+    const { module, autoUpdater } = await importAutoUpdater();
+    autoUpdater.downloadUpdate.mockRejectedValueOnce(noProductionRelease());
+    await module.downloadUpdateNow();
+    expect(module.getUpdateStatus().state).toBe("error");
+  });
+});

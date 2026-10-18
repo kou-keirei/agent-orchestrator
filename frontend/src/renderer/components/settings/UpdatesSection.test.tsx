@@ -88,3 +88,20 @@ it("renders the installed nightly build time as the device-local instant", async
 	);
 	expect(await screen.findByText(`Built ${builtAt}`)).toBeVisible();
 });
+
+it("shows unavailable production releases neutrally without claiming latest", async () => {
+  updGetStatus.mockResolvedValue({ state: "release-unavailable", message: "No stable release is published for this update source." });
+  renderUpdates();
+  const line = await screen.findByText("No stable release is published for this update source.");
+  expect(line.closest(".text-error")).toBeNull();
+  expect(screen.queryByText("You're on the latest version.")).not.toBeInTheDocument();
+});
+
+it("bounds unexpected error text and omits stack and header lines", async () => {
+  updGetStatus.mockResolvedValue({ state: "error", message: "x".repeat(1000) + "\nHeaders: hidden", checkError: "y".repeat(1000) + "\n    at hidden" });
+  renderUpdates();
+  const line = await screen.findByText("x".repeat(299) + "…");
+  expect(line.closest(".text-error")).not.toBeNull();
+  expect(await screen.findByText("y".repeat(299) + "…")).toBeInTheDocument();
+  expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
+});

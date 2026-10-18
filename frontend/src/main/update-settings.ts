@@ -29,7 +29,7 @@ export interface UpdateSettings {
 // Live state of an automatic or manual update check/download, streamed to the
 // renderer so Settings and the sidebar can reflect progress.
 export type UpdateState =
-	"idle" | "checking" | "available" | "not-available" | "downloading" | "preparing" | "downloaded" | "error" | "unsupported";
+	"idle" | "checking" | "release-unavailable" | "available" | "not-available" | "downloading" | "preparing" | "downloaded" | "error" | "unsupported";
 
 export interface UpdateStatus {
 	state: UpdateState;

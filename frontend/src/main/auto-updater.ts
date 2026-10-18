@@ -638,7 +638,7 @@ function broadcastUpdaterStatus(status: UpdateStatus): void {
 }
 
 function broadcastCompletedCheck(status: UpdateStatus): void {
-  if (status.state !== "error" && status.state !== "unsupported") {
+  if (status.state !== "error" && status.state !== "unsupported" && status.state !== "release-unavailable") {
     lastCheckedAtMs = Date.now();
     lastCheckError = undefined;
   }
@@ -1388,6 +1388,28 @@ function errorMessage(err: unknown): string {
       : String(err);
 }
 
+// The GitHub provider wraps many failures with this code. Only its exact
+// production-release lookup plus HTTP 406 means there is no stable release.
+function isMissingProductionRelease(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null;
+  return e?.code === "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" &&
+    /^Unable to find latest version on GitHub \(https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/releases\/latest\), please ensure a production release exists: HttpError: 406\b/.test(e.message ?? "");
+}
+
+function settleMissingProductionRelease(requestId = activeUpdaterRequestId): void {
+  // This is neither a failed check nor proof that the installed build is latest.
+  // Break old failure streaks without advancing the successful-check timestamp.
+  consecutiveAutomaticNetFailures = 0;
+  consecutiveAutomaticCheckFailures = 0;
+  failingChecksPublished = false;
+  lastCheckError = undefined;
+  broadcast({
+    state: "release-unavailable",
+    message: "No stable release is published for this update source.",
+    ...(requestId === undefined ? {} : { requestId }),
+  });
+}
+
 // isManifest404Error checks whether the error is a 404 on a release
 // manifest YAML file — a routine condition that should not be surfaced
 // to users as an error dialog.
@@ -1836,6 +1858,10 @@ function wireUpdaterEvents(): void {
       console.info("native staging already in progress; request refused:", err);
       return;
     }
+    if (activeUpdaterPhase !== "download" && activeUpdaterOperation !== "manual-download" && isMissingProductionRelease(err)) {
+      settleMissingProductionRelease();
+      return;
+    }
     // Never crash on update failure (offline, unsigned macOS, etc.).
     // A one-off automatic failure restores the previous status so the UI does
     // not flash an error the user never asked for. That suppression is a UI
@@ -2109,6 +2135,10 @@ async function runAutomaticUpdateCheck(
         // pre-check status so the renderer is neither stuck on "checking" nor
         // denied the stale-check nudge once the streak crosses the threshold
         // (#3526). Record before restoring so the restore broadcast is stamped.
+        if (activeUpdaterPhase !== "download" && isMissingProductionRelease(err)) {
+          settleMissingProductionRelease();
+          return;
+        }
         if (handleMacStagingFailure(err)) return;
         if (activeUpdaterPhase === "download") {
           if (!downloadStalled && lastStatus.state !== "error") broadcast(withActiveRequest({ state: "error", message: errorMessage(err), version: pendingUpdateVersion }));
@@ -2312,6 +2342,10 @@ export async function checkForUpdatesNow(
     if (isNativeStagingBusyError(err)) {
       console.info("manual check refused: native staging already in progress:", err);
       settleWithoutFailure();
+      return;
+    }
+    if (failed.phase === "check" && isMissingProductionRelease(err)) {
+      settleMissingProductionRelease(options.requestId);
       return;
     }
     if (isManifest404Error(err)) {

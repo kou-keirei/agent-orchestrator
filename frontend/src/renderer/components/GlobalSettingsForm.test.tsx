@@ -628,6 +628,13 @@ describe("GlobalSettingsForm", () => {
 		expect(useUiStore.getState().updateInstallPromptOpen).toBe(true);
 	});
 
+	it("shows missing production releases as information in global settings", async () => {
+		updGetStatus.mockResolvedValue({ state: "release-unavailable", message: "No stable release is published for this update source." });
+		renderForm("updates");
+		const line = await screen.findByText("No stable release is published for this update source.");
+		expect(line.closest(".text-error")).toBeNull();
+	});
+
 	it("shows a non-error restart nudge when automatic checks keep failing on the network", async () => {
 		updGetStatus.mockResolvedValue({ state: "not-available", staleCheckNudge: true });
 		renderForm();
