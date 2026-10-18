@@ -166,7 +166,10 @@ export function configureFeed(
 ): void {
   // A saved channel choice remains intent until the running build reaches it.
   // Assign after channel: electron-updater's channel setter enables downgrades.
-  const allowDowngrade = isChannelTransition(settings);
+  // Fork builds return to Stable only through a newer SemVer target. Let the
+  // native updater enforce that comparison, including prerelease/build metadata.
+  const forkToLatest = installedUpdateChannel() === "fork" && effectiveChannel(settings) === "latest";
+  const allowDowngrade = isChannelTransition(settings) && !forkToLatest;
   if (settings.feature !== null && settings.feature !== undefined) {
     // Feature build: pin to the pr<N> semver prerelease identifier channel.
     autoUpdater.channel = `pr${settings.feature.pr}`;

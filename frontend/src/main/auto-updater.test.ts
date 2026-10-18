@@ -3663,6 +3663,32 @@ describe("channel downgrade safety", () => {
     });
   }
 
+  it.each([
+    { offered: "0.13.0", available: false },
+    { offered: "0.13.1-fork.0", available: false },
+    { offered: "0.13.1-fork.1", available: false },
+    { offered: "0.13.1-fork.1+build.2", available: false },
+    { offered: "0.13.1", available: true },
+    { offered: "0.13.2", available: true },
+    { offered: "0.13.2+build.2", available: true },
+    { offered: "0.13.2-rc.1", available: true },
+  ])("keeps fork-to-latest monotonic for $offered", async ({ offered, available }) => {
+    const installed = "0.13.1-fork.1";
+    const h = await importAutoUpdater(stable, { version: installed });
+    serveVersion(h, offered, installed);
+    for (const check of [
+      () => h.module.startAutoUpdates(stateDir),
+      () => h.module.checkForUpdatesNow(stateDir),
+      () => h.module.returnToHome(stateDir, "fork-to-latest"),
+    ]) {
+      await check();
+      expect(h.autoUpdater.allowDowngrade).toBe(false);
+      expect(h.module.getUpdateStatus().state).toBe(available ? "available" : "not-available");
+      expect(h.autoUpdater.downloadUpdate).not.toHaveBeenCalled();
+    }
+    expect(h.module.getUpdateStatus().requestId).toBe("fork-to-latest");
+  });
+
   it.each([false, true])("honors saved Stable on startup and later checks (automatic download %s)", async (enabled) => {
     const h = await importAutoUpdater({ ...stable, enabled }, { version: running });
     serveVersion(h, "0.12.10");
