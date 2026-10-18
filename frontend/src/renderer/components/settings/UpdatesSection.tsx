@@ -26,7 +26,7 @@ const DEFAULT_SETTINGS: UpdateSettings = { enabled: false, channel: "latest", ni
 // Keep remote error stacks/headers out of Settings, including IPC rejections.
 function displayUpdateError(message: string): string {
 	const line = message.split(/[\r\n]/, 1)[0];
-	return line.length > 300 ? `${line.slice(0, 299)}…` : line;
+	return line.length > 300 ? `${line.slice(0, 297)}...` : line;
 }
 
 const MIN_MANUAL_CHECK_VISIBLE_MS = 1_000;

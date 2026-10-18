@@ -2434,6 +2434,10 @@ export async function returnToHome(
       settleWithoutFailure();
       return;
     }
+    if (failed.phase === "check" && isMissingProductionRelease(err)) {
+      settleMissingProductionRelease(requestId);
+      return;
+    }
     broadcast({
       state: "error",
       message:

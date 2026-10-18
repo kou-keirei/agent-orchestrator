@@ -4444,3 +4444,55 @@ describe("missing GitHub production release", () => {
     expect(module.getUpdateStatus().state).toBe("error");
   });
 });
+
+describe("returnToHome missing production release", () => {
+  it.each([false, true])("preserves the informational outcome and request owner (event=%s)", async event => {
+    const { module, autoUpdater, updaterEvents, statusMessages } = await importAutoUpdater();
+    await module.checkForUpdatesNow(stateDir);
+    updaterEvents.get("update-not-available")?.();
+    const checkedAt = module.getUpdateStatus().checkedAt;
+    autoUpdater.checkForUpdates.mockImplementationOnce(() => {
+      if (event) updaterEvents.get("error")?.(noProductionRelease());
+      return Promise.reject(noProductionRelease());
+    });
+    const before = statusMessages().length;
+    await module.returnToHome(stateDir, "return-home-no-release");
+    expect(module.getUpdateStatus()).toEqual({
+      state: "release-unavailable", checkedAt, requestId: "return-home-no-release",
+      message: "No stable release is published for this update source.",
+    });
+    const statuses = statusMessages().slice(before).map(message => message.payload);
+    expect(statuses.every(status => status.requestId === "return-home-no-release")).toBe(true);
+    expect(statuses.some(status => status.state === "error")).toBe(false);
+  });
+
+  it.each([false, true])("retains genuine check failures and ownership (event=%s)", async event => {
+    const { module, autoUpdater, updaterEvents } = await importAutoUpdater();
+    for (const error of [
+      new Error("HttpError: 406 Not Acceptable"),
+      Object.assign(new Error(noProductionRelease().message.replace("406", "401")), { code: "ERR_UPDATER_LATEST_VERSION_NOT_FOUND" }),
+      new Error("net::ERR_FAILED"),
+      new Error("signature verification failed"),
+    ]) {
+      autoUpdater.checkForUpdates.mockImplementationOnce(() => {
+        if (event) updaterEvents.get("error")?.(error);
+        return Promise.reject(error);
+      });
+      await module.returnToHome(stateDir, "return-home-real-error");
+      expect(module.getUpdateStatus()).toMatchObject({
+        state: "error", message: error.message, requestId: "return-home-real-error",
+      });
+    }
+  });
+
+  it("retains a return-home download rejection with the same provider text", async () => {
+    const { module, autoUpdater } = await importAutoUpdater();
+    autoUpdater.checkForUpdates.mockImplementationOnce(() => Promise.resolve({
+      downloadPromise: Promise.reject(noProductionRelease()),
+    }));
+    await module.returnToHome(stateDir, "return-home-download-error");
+    expect(module.getUpdateStatus()).toMatchObject({
+      state: "error", message: noProductionRelease().message, requestId: "return-home-download-error",
+    });
+  });
+});

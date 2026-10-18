@@ -100,8 +100,8 @@ it("shows unavailable production releases neutrally without claiming latest", as
 it("bounds unexpected error text and omits stack and header lines", async () => {
   updGetStatus.mockResolvedValue({ state: "error", message: "x".repeat(1000) + "\nHeaders: hidden", checkError: "y".repeat(1000) + "\n    at hidden" });
   renderUpdates();
-  const line = await screen.findByText("x".repeat(299) + "…");
+  const line = await screen.findByText("x".repeat(297) + "...");
   expect(line.closest(".text-error")).not.toBeNull();
-  expect(await screen.findByText("y".repeat(299) + "…")).toBeInTheDocument();
+  expect(await screen.findByText("y".repeat(297) + "...")).toBeInTheDocument();
   expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
 });
