@@ -128,6 +128,53 @@ func TestListBatchesKanbanReads(t *testing.T) {
 	}
 }
 
+type coldReadCommander struct {
+	fakeCommander
+	restores int
+}
+
+func (f *coldReadCommander) RestoreWithMode(context.Context, domain.SessionID) (sessionmanager.RestoreResult, error) {
+	f.restores++
+	return sessionmanager.RestoreResult{}, errors.New("passive read attempted restore")
+}
+
+func TestColdSessionListAndGetDoNotStartOrRestore(t *testing.T) {
+	st := newFakeStore()
+	for _, id := range []domain.SessionID{"cold-target", "cold-neighbor"} {
+		st.sessions[id] = domain.SessionRecord{
+			ID: id, ProjectID: "mer", Kind: domain.KindWorker, Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+			Activity: domain.Activity{State: domain.ActivityIdle},
+			Metadata: domain.SessionMetadata{
+				WorkspacePath: "/fixture/" + string(id), Branch: "ao/" + string(id),
+				ProviderConversationID: string(id) + "-thread", ControllerGeneration: string(id) + "-generation",
+			},
+		}
+	}
+	commander := &coldReadCommander{}
+	svc := NewWithDeps(Deps{Manager: commander, Store: st})
+	for range 3 {
+		for _, filter := range []ListFilter{{}, {ProjectID: "mer"}} {
+			list, err := svc.List(context.Background(), filter)
+			if err != nil || len(list) != 2 {
+				t.Fatalf("cold list = %+v, err=%v", list, err)
+			}
+			for _, item := range list {
+				got, err := svc.Get(context.Background(), item.ID)
+				want := st.sessions[item.ID]
+				if err != nil || got.ID != want.ID || got.Metadata.WorkspacePath != want.Metadata.WorkspacePath ||
+					got.Metadata.ProviderConversationID != want.Metadata.ProviderConversationID || got.Metadata.ControllerGeneration != want.Metadata.ControllerGeneration ||
+					item.Metadata.ProviderConversationID != want.Metadata.ProviderConversationID || item.Metadata.ControllerGeneration != want.Metadata.ControllerGeneration ||
+					item.StatusReadiness != "ready" || got.StatusReadiness != "ready" || got.IsTerminated || item.ChatProviderPreserved || got.ChatProviderPreserved {
+					t.Fatalf("passive cold projection changed: list=%+v get=%+v err=%v", item, got, err)
+				}
+			}
+		}
+	}
+	if commander.spawnCalls != 0 || commander.restores != 0 || len(commander.resumed) != 0 || len(commander.ready) != 0 || len(commander.sent) != 0 {
+		t.Fatalf("passive reads entered command path: %+v", commander)
+	}
+}
+
 func (f *fakeStore) GetActiveAgentSwitch(_ context.Context, id domain.SessionID) (domain.AgentSwitch, bool, error) {
 	if f.activeSwitchGetErr != nil {
 		return domain.AgentSwitch{}, false, f.activeSwitchGetErr
