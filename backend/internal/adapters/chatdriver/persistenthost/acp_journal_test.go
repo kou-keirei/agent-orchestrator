@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -20,7 +21,9 @@ func TestACPPromptJournalReplaysResetsAndEnforcesQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows confidentiality is asserted against the native protected DACL in
+	// TestACPPromptJournalWindowsDACLConfidentiality, not synthesized mode bits.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("journal permissions = %v", info.Mode().Perm())
 	}
 	var spans []acpJournalSpan
