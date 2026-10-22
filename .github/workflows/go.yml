@@ -99,6 +99,27 @@ jobs:
       - name: Test Goose readiness and inventory
         run: go test -race -count=1 -timeout=10m -run '^Test(FindInstalledBinary|WarmReadinessAndFindInstalled|PresslyGoose|Refresh|Probe|ReadinessCoordinator)' ./internal/service/agent
 
+  windows-journal:
+    runs-on: windows-latest
+    # Time/concurrency bounds do not enforce child-process or memory quotas.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Test native Windows ACP prompt journals
+        run: >-
+          go test -v -count=1 -p=1 -parallel=1 -timeout=5m
+          -run '^(TestACPPromptJournalReplaysResetsAndEnforcesQuota|TestACPPromptJournalWindowsDACLConfidentiality|TestACPPromptJournalWindowsRetainedReaderBlocksOpen|TestACPPromptJournalWindowsSecurityFailureReturnsNoJournal)$'
+          ./internal/adapters/chatdriver/persistenthost
+
   cloud-build-test:
     runs-on: ubuntu-latest
     defaults:
