@@ -132,14 +132,17 @@ func testPrivateWindowsJournal(t *testing.T, path string) {
 				sid.String(), domain, account, ace.Mask)
 		}
 	}
-	// Exercise the current user's effective read/write access through a new
-	// handle, rather than inferring authorization from a single allow ACE.
-	reopened, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatalf("current user journal read/write access: %v", err)
-	}
-	if err := reopened.Close(); err != nil {
-		t.Fatal(err)
+	// Even an authorized owner's concurrent reader must be excluded while new
+	// provider frames can be written through the secured journal handle.
+	for _, flags := range []int{os.O_RDONLY, os.O_WRONLY, os.O_RDWR} {
+		reopened, err := os.OpenFile(path, flags, 0)
+		if reopened != nil {
+			_ = reopened.Close()
+			t.Fatalf("concurrent open with flags %d unexpectedly succeeded", flags)
+		}
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+			t.Fatalf("concurrent open with flags %d: %v, want native sharing violation", flags, err)
+		}
 	}
 	info, err := journal.file.Stat()
 	if err != nil || info.Size() != 0 {
@@ -160,6 +163,67 @@ func testPrivateWindowsJournal(t *testing.T, path string) {
 	if _, err := journal.append(context.Background(), []byte("overflow")); !errors.Is(err, errACPJournalFull) {
 		t.Fatalf("private journal quota: %v", err)
 	}
+	// Once the secured handle closes, the owner can open the existing file
+	// normally. Cleanup still removes it through the journal's usual lifecycle.
+	if err := journal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("owner reopen after secured handle closes: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestACPPromptJournalWindowsRetainedReaderBlocksOpen(t *testing.T) {
+	dir := t.TempDir()
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setJournalFixtureDACL(t, dir, "D:P(A;OICI;FA;;;"+user.User.Sid.String()+")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;WD)")
+	path := filepath.Join(dir, "retained-reader.journal")
+	const original = "old journal frames"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This read handle permits the old implementation's read/write open. Its
+	// granted data-read rights would survive replacing the file's inherited ACL.
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := os.NewFile(uintptr(handle), path)
+	defer reader.Close()
+	journal, err := openACPPromptJournal(context.Background(), path)
+	if journal != nil {
+		_ = journal.file.Close()
+		t.Fatal("journal open succeeded while an old reader retained access")
+	}
+	if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("retained reader open: %v, want native sharing violation", err)
+	}
+	got := make([]byte, len(original))
+	if n, err := reader.ReadAt(got, 0); err != nil || n != len(original) || string(got) != original {
+		t.Fatalf("rejected open changed previous frames: %q, n=%d, err=%v", got, n, err)
+	}
+	info, err := reader.Stat()
+	if err != nil || info.Size() != int64(len(original)) {
+		t.Fatalf("rejected open changed journal size: info=%v, err=%v", info, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Only after the retained reader is gone may AO secure/truncate and append.
+	// Reuse all protected-DACL, sharing, replay/reset/quota and owner checks.
+	testPrivateWindowsJournal(t, path)
 }
 
 // An existing journal whose ACL forbids WRITE_DAC must not be returned or

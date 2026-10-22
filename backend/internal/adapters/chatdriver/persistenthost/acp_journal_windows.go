@@ -33,9 +33,11 @@ func openACPJournalFile(path string) (*os.File, error) {
 	attributes := windows.SecurityAttributes{
 		Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd,
 	}
+	// Acquire exclusive access before changing the DACL or truncating. A DACL
+	// update cannot revoke an old reader's handle to this file's future frames.
 	handle, err := windows.CreateFile(name,
 		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, &attributes, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		0, &attributes, windows.OPEN_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		return nil, err
 	}
