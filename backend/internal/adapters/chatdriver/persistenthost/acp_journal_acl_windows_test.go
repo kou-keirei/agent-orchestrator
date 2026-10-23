@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -32,9 +33,7 @@ func TestACPPromptJournalWindowsDACLConfidentiality(t *testing.T) {
 			setJournalFixtureDACL(t, dir, "D:P(A;OICI;FA;;;"+user.User.Sid.String()+")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;WD)")
 			path := filepath.Join(dir, "prompt.journal")
 			if existing {
-				if err := os.WriteFile(path, []byte("old content"), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writeSameOwnerJournalFixture(t, path, "old content")
 				sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 				if err != nil {
 					t.Fatal(err)
@@ -186,9 +185,7 @@ func TestACPPromptJournalWindowsRetainedReaderBlocksOpen(t *testing.T) {
 	setJournalFixtureDACL(t, dir, "D:P(A;OICI;FA;;;"+user.User.Sid.String()+")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;WD)")
 	path := filepath.Join(dir, "retained-reader.journal")
 	const original = "old journal frames"
-	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSameOwnerJournalFixture(t, path, original)
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
@@ -231,9 +228,7 @@ func TestACPPromptJournalWindowsRetainedReaderBlocksOpen(t *testing.T) {
 func TestACPPromptJournalWindowsSecurityFailureReturnsNoJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unsecurable.journal")
 	const original = "existing private data"
-	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeSameOwnerJournalFixture(t, path, original)
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		t.Fatal(err)
@@ -252,6 +247,59 @@ func TestACPPromptJournalWindowsSecurityFailureReturnsNoJournal(t *testing.T) {
 		t.Fatalf("security failure changed original data: %q, err=%v", got, err)
 	}
 	t.Log("native ACL prevents securing journal; no journal returned and original bytes preserved")
+}
+
+// os.WriteFile uses the token's default owner, which need not be TOKEN_USER
+// (for example, an elevated token may default to Administrators). These fixtures
+// exercise securing a same-user existing journal, not accepting group owners.
+func writeSameOwnerJournalFixture(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil {
+		t.Fatalf("fixture owner: owner=%v, err=%v", owner, err)
+	}
+	t.Logf("existing fixture before owner setup: TOKEN_USER=%s OWNER=%s", user.User.Sid.String(), owner.String())
+	if !owner.Equals(user.User.Sid) {
+		// Keep the real default-owner mismatch as a negative case before
+		// assigning the owner required by the positive fixture's contract.
+		journal, err := openACPPromptJournal(context.Background(), path)
+		if journal != nil {
+			_ = journal.file.Close()
+			t.Fatal("foreign-owner fixture returned a journal")
+		}
+		if err == nil || !strings.Contains(err.Error(), "owner is not current user") {
+			t.Fatalf("foreign-owner fixture: %v, want owner rejection", err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != content {
+			t.Fatalf("owner rejection changed original data: %q, err=%v", got, err)
+		}
+	}
+	// Set only the owner; preserve the inherited broad DACL used by the tests.
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION, user.User.Sid, nil, nil, nil); err != nil {
+		t.Fatalf("set same-user fixture owner: %v", err)
+	}
+	sd, err = windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err = sd.Owner()
+	if err != nil || owner == nil || !owner.Equals(user.User.Sid) {
+		t.Fatalf("fixture owner must be TOKEN_USER: owner=%v, err=%v", owner, err)
+	}
+	t.Logf("existing fixture after owner setup: TOKEN_USER=%s OWNER=%s", user.User.Sid.String(), owner.String())
 }
 
 func setJournalFixtureDACL(t *testing.T, path, sddl string) {
