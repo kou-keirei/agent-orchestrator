@@ -20,7 +20,22 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Preserve the existing required check as the gate for every backend test.
   build-test:
+    needs: [backend-checks, sqlite-race]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require backend checks and every SQLite race shard
+        env:
+          BACKEND_RESULT: ${{ needs.backend-checks.result }}
+          SQLITE_RESULT: ${{ needs.sqlite-race.result }}
+        run: |
+          set -euo pipefail
+          test "$BACKEND_RESULT" = success
+          test "$SQLITE_RESULT" = success
+
+  backend-checks:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -50,11 +65,106 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        # The complete SQLite migration suite exceeded 15m under the race
-        # detector on the shared runner. Keep a bounded per-package timeout
-        # with headroom for the full upgrade matrix; no tests are excluded.
-        run: go test -race -timeout=20m ./...
+      - name: Test backend packages outside the SQLite race matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          sqlite_package=$(go list ./internal/storage/sqlite)
+          package_list=$(go list ./...)
+          mapfile -t packages <<< "$package_list"
+          other_packages=()
+          sqlite_count=0
+          for package in "${packages[@]}"; do
+            if [[ "$package" == "$sqlite_package" ]]; then
+              sqlite_count=$((sqlite_count + 1))
+            else
+              other_packages+=("$package")
+            fi
+          done
+          test "$sqlite_count" -eq 1
+          test "${#other_packages[@]}" -gt 0
+          go test -race -timeout=20m "${other_packages[@]}"
+
+  sqlite-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Partition every discovered SQLite test exactly once
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          go test -race -p=1 -parallel=1 -timeout=2m -list '^(Test|Example|Fuzz)' ./internal/storage/sqlite > sqlite-test-list.txt
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          lines = Path("sqlite-test-list.txt").read_text().splitlines()
+          names = sorted(line for line in lines if re.fullmatch(r"(?:Test|Example|Fuzz)\w*", line))
+          shards = [names[index::4] for index in range(4)]
+          counts = Counter(name for shard in shards for name in shard)
+          unmatched = sorted(set(names) - counts.keys())
+          overlaps = sorted(name for name, count in counts.items() if count != 1)
+          report = {"names": names, "shards": shards, "unmatched": unmatched, "overlaps": overlaps}
+          Path("sqlite-partition.json").write_text(json.dumps(report, indent=2) + "\n")
+          assert names and all(shards), "empty SQLite inventory or shard"
+          assert not unmatched and not overlaps, "SQLite partition is not exhaustive and disjoint"
+          selected = shards[int(os.environ["SHARD"])]
+          Path("sqlite-run-pattern.txt").write_text("^(" + "|".join(selected) + ")$")
+          print(f"SQLite shard {os.environ['SHARD']}: {len(selected)}/{len(names)} top-level cases")
+          PY
+
+      - name: Run SQLite race shard and verify nonzero complete execution
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          go test -race -p=1 -parallel=1 -count=1 -timeout=20m -json -run "$(cat sqlite-run-pattern.txt)" ./internal/storage/sqlite | tee sqlite-results.jsonl
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads(Path("sqlite-partition.json").read_text())
+          selected = report["shards"][int(os.environ["SHARD"])]
+          events = [json.loads(line) for line in Path("sqlite-results.jsonl").read_text().splitlines()]
+          executed = [event["Test"] for event in events if event["Action"] == "run" and "/" not in event.get("Test", "/")]
+          missing = sorted(set(selected) - set(executed))
+          unexpected = sorted(set(executed) - set(selected))
+          report.update(executed=executed, missing=missing, unexpected=unexpected)
+          Path("sqlite-partition.json").write_text(json.dumps(report, indent=2) + "\n")
+          assert executed and not missing and not unexpected, "SQLite shard execution differs from selection"
+          PY
+
+      - name: Preserve SQLite selection and execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-race-${{ matrix.shard }}
+          path: |
+            backend/sqlite-test-list.txt
+            backend/sqlite-partition.json
+            backend/sqlite-run-pattern.txt
+            backend/sqlite-results.jsonl
+          if-no-files-found: error
 
   # The suite above only ever runs on Linux, so the packages whose behaviour is
   # genuinely platform-specific have never been exercised on Windows: worktree
