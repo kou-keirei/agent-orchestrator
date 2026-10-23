@@ -506,6 +506,7 @@ func Run() error {
 	}
 	sessionSvc.SetChatProviderPreserver(chatSvc.PreservesProviderOnRestart)
 	sessMgr = wiredSessMgr
+	chatSvc.SetSessionInputAdmission(sessMgr.AcquireSessionInput)
 	if restorer, ok := sessMgr.(interface {
 		EnsureChatController(context.Context, domain.SessionID) error
 	}); ok {

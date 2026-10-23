@@ -264,7 +264,58 @@ func (m *Manager) sendChat(ctx context.Context, id domain.SessionID, message, cl
 		return true, fmt.Errorf("send %s: %w", id, ErrTerminated)
 	}
 	var relayErr error
-	if clientMessageID != "" {
+	if ordered, ok := m.chat.(interface {
+		RelayChatTurnWithAdmission(context.Context, domain.SessionID, string, string, func() (func(), error)) (string, error)
+	}); ok {
+		// Join Chat's input order before taking a manager lease: restoring a
+		// cold controller must first be able to drain those same leases.
+		_, relayErr = ordered.RelayChatTurnWithAdmission(ctx, id, message, clientMessageID, func() (func(), error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// Snapshot after restoration, then revalidate across admission. A
+			// completed operation in between must not redirect this acceptance
+			// to a replacement owner or workspace.
+			restored, found, err := m.store.GetSession(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, ErrNotFound
+			}
+			release, admitted := m.AcquireSessionInput(id)
+			if !admitted {
+				return nil, ErrSwitchInProgress
+			}
+			// The pre-restore record is stale. Recheck manual-send eligibility
+			// under admission; busy/waiting input is still allowed. Chat owns
+			// controller selection and durable message-id deduplication.
+			current, found, err := m.store.GetSession(ctx, id)
+			if err == nil {
+				switch {
+				case ctx.Err() != nil:
+					err = ctx.Err()
+				case !found:
+					err = ErrNotFound
+				case domain.NormalizeSessionMode(current.Mode) != domain.SessionModeChat:
+					err = ErrSwitchInProgress
+				case current.IsTerminated:
+					err = ErrTerminated
+				case current.ID != id || restored.ID != id ||
+					current.ControllerOwner() != restored.ControllerOwner() ||
+					current.Metadata.RuntimeHandleID != restored.Metadata.RuntimeHandleID ||
+					current.Metadata.WorkspacePath != restored.Metadata.WorkspacePath ||
+					current.Metadata.WorkspaceRepoPath != restored.Metadata.WorkspaceRepoPath:
+					err = ErrSwitchInProgress
+				}
+			}
+			if err != nil {
+				release()
+				return nil, err
+			}
+			return release, nil
+		})
+	} else if clientMessageID != "" {
 		_, relayErr = m.chat.RelayChatTurnWithID(ctx, id, message, clientMessageID)
 	} else {
 		_, relayErr = m.chat.RelayChatTurn(ctx, id, message)

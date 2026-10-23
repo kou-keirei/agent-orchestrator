@@ -1392,6 +1392,14 @@ func mapSessionError(err error) error {
 			})
 		}
 		return apierr.Conflict("SESSION_MODE_UNSUPPORTED", err.Error(), nil)
+	case errors.Is(err, ports.ErrChatRecoveryInconclusive):
+		return apierr.Conflict("CHAT_RECOVERY_INCONCLUSIVE", "Native conversation recovery is inconclusive", nil)
+	case errors.Is(err, ports.ErrChatResumeFailed):
+		return apierr.Conflict("CHAT_RESUME_FAILED", "The agent could not resume its saved native conversation", nil)
+	case errors.Is(err, ports.ErrChatHistoryUnavailable):
+		return apierr.Conflict("CHAT_HISTORY_UNAVAILABLE", "Native conversation history cannot be replayed", nil)
+	case errors.Is(err, ports.ErrChatHistoryUnsettled):
+		return apierr.Conflict("CHAT_HISTORY_UNSETTLED", "Native conversation history is not settled", nil)
 	case errors.Is(err, ports.ErrChatDriverUnavailable):
 		return apierr.Conflict("CHAT_DRIVER_UNAVAILABLE", err.Error(), nil)
 	case errors.Is(err, ports.ErrChatDriverIncompatible):
