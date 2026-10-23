@@ -563,8 +563,7 @@ func (m *Manager) executeChatAgentSwitch(
 	}
 	recorder.durable(result)
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.chat.RelayChatTurnWithID(
-		ctx, id, aoTargetActivationPrompt, chatSwitchActivationMessageID(result.ID)); err != nil {
+	if err := m.relayChatSwitchContinuation(ctx, store, result); err != nil {
 		return result, fmt.Errorf("switch Chat agent %s: deliver continuation: %w", id, err)
 	}
 	acknowledgedAt := m.clock()
@@ -609,6 +608,70 @@ func chatSwitchProviderBoundaryID(switchID domain.AgentSwitchID) string {
 
 func chatSwitchActivationMessageID(switchID domain.AgentSwitchID) string {
 	return "agent-switch:" + string(switchID) + ":activation"
+}
+
+// The switch already owns the exclusive operation gate. Re-entering ordinary
+// input admission would reject its own continuation. Use Chat's existing ordered
+// callback instead, admitting only this switch's committed target. External
+// sends still acquire a manager input lease and remain excluded.
+func (m *Manager) relayChatSwitchContinuation(ctx context.Context, store ports.AgentSwitchStore, sw domain.AgentSwitch) error {
+	if sw.State != domain.AgentSwitchDelivering || sw.TargetNativeSessionRef == nil {
+		return ErrSwitchInProgress
+	}
+	ordered, ok := m.chat.(interface {
+		RelayChatTurnWithAdmission(context.Context, domain.SessionID, string, string, func() (func(), error)) (string, error)
+	})
+	if !ok {
+		return fmt.Errorf("switch Chat continuation: %w", ErrInterfaceHandoffUnsupported)
+	}
+	turnID, err := ordered.RelayChatTurnWithAdmission(ctx, sw.SessionID, aoTargetActivationPrompt,
+		chatSwitchActivationMessageID(sw.ID), func() (func(), error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			m.agentOpMu.Lock()
+			ownsGate := m.agentOperations[sw.SessionID] == agentOperationSwitch
+			m.agentOpMu.Unlock()
+			if !ownsGate {
+				return nil, ErrSwitchInProgress
+			}
+			current, found, err := store.GetActiveAgentSwitch(ctx, sw.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			if !found || current.ID != sw.ID || current.SessionID != sw.SessionID || current.State != domain.AgentSwitchDelivering ||
+				current.TargetAcknowledgedAt != nil || current.TargetGenerationID == "" ||
+				current.SourceGenerationID != sw.SourceGenerationID || current.TargetGenerationID != sw.TargetGenerationID ||
+				current.TargetHarness != sw.TargetHarness || current.TargetNativeSessionRef == nil ||
+				*current.TargetNativeSessionRef != *sw.TargetNativeSessionRef {
+				return nil, ErrSwitchInProgress
+			}
+			rec, found, err := m.store.GetSession(ctx, sw.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			if !found || rec.ID != sw.SessionID || rec.IsTerminated || domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat {
+				return nil, ErrSwitchInProgress
+			}
+			recoverable, err := m.chatTargetNativeIdentityRecoverable(ctx, store, rec, current)
+			if err != nil {
+				return nil, err
+			}
+			if !recoverable {
+				return nil, ErrSwitchInProgress
+			}
+			// No second lease: the switch retains its exclusion through target ACK.
+			return func() {}, nil
+		})
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(turnID) == "" {
+		// Queueing or duplicate acceptance is not a positive target response to
+		// this call. In particular, never manufacture an ACK after a lost reply.
+		return ErrSwitchDeliveryUnconfirmed
+	}
+	return nil
 }
 
 func (m *Manager) abortChatAgentSwitchHandoff(rec domain.SessionRecord) {
@@ -809,8 +872,7 @@ func (m *Manager) recoverActivatedChatAgentSwitch(
 		return false, err
 	}
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.chat.RelayChatTurnWithID(
-		ctx, rec.ID, aoTargetActivationPrompt, chatSwitchActivationMessageID(current.ID)); err != nil {
+	if err := m.relayChatSwitchContinuation(ctx, store, current); err != nil {
 		recorder.userImpact = domain.AgentSwitchUserImpactDeliveryUnknown
 		_, failErr := m.failAgentSwitchWithRecorder(ctx, store, current, domain.AgentSwitchErrorDeliveryUnconfirmed, recorder)
 		return failErr == nil, failErr

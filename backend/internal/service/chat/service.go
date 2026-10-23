@@ -1953,6 +1953,9 @@ func (s *Service) RelayChatTurnWithID(
 // RelayChatTurnWithAdmission retains automation's position in the same input
 // order as human sends. Admission rechecks manager facts and acquires its input
 // lease after restoration, holding it until the durable send has completed.
+// A nonempty returned ID additionally proves this call received a provider turn
+// ID. Queued and duplicate inputs remain successful durable admissions, but do
+// not supply a positive dispatch result to callers waiting for target ACK.
 func (s *Service) RelayChatTurnWithAdmission(
 	ctx context.Context,
 	id domain.SessionID,
@@ -1962,6 +1965,9 @@ func (s *Service) RelayChatTurnWithAdmission(
 	turn, err := s.sendWithAdmission(ctx, id, ports.ChatUserMessage{
 		Text: text, ClientMessageID: clientMessageID, Origin: domain.MessageOriginAutomation,
 	}, admit)
+	if err == nil && turn.ProviderTurnID == "" {
+		return "", nil
+	}
 	return turn.ID, err
 }
 
