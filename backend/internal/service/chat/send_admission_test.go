@@ -206,3 +206,28 @@ func TestW168AdmissionRefusesControllerStoppedDuringLease(t *testing.T) {
 		t.Fatalf("stopped selection dispatched: calls=%d messages=%d turns=%d err=%v", calls, len(rows.Messages), len(rows.Turns), err)
 	}
 }
+
+func TestW186OrderedRelayReturnsPositiveIDOnlyForProviderDispatch(t *testing.T) {
+	svc, provider, st, _, ctrl := w168AdmissionFixture(t)
+	admit := func() (func(), error) { return func() {}, nil }
+	id, err := svc.RelayChatTurnWithAdmission(context.Background(), testSession, "first", "w186-first", admit)
+	if err != nil || id == "" {
+		t.Fatalf("positive provider result: id=%q err=%v", id, err)
+	}
+	for _, tc := range []struct{ text, key string }{
+		{"first", "w186-first"},   // Duplicate: no positive result for this call.
+		{"queued", "w186-queued"}, // Durable admission while busy is not provider ACK.
+	} {
+		id, err := svc.RelayChatTurnWithAdmission(context.Background(), testSession, tc.text, tc.key, admit)
+		if err != nil || id != "" {
+			t.Fatalf("%s returned positive dispatch: id=%q err=%v", tc.key, id, err)
+		}
+	}
+	provider.mu.Lock()
+	calls := provider.sendCalls
+	provider.mu.Unlock()
+	rows, err := st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+	if err != nil || calls != 1 || len(rows.Messages) != 2 || len(rows.Turns) != 2 {
+		t.Fatalf("durable admission changed: calls=%d messages=%d turns=%d err=%v", calls, len(rows.Messages), len(rows.Turns), err)
+	}
+}
