@@ -6,6 +6,7 @@ import "time"
 // imply that a worker's task completed.
 type OrchestrationEventKind string
 
+// Orchestration event kinds identify worker and PR facts.
 const (
 	OrchestrationWorkerTurnSettled OrchestrationEventKind = "worker_turn_settled"
 	OrchestrationWorkerBlocked     OrchestrationEventKind = "worker_blocked"
@@ -14,9 +15,11 @@ const (
 	OrchestrationPRMerged          OrchestrationEventKind = "pr_merged"
 )
 
+// OrchestrationDeliveryState identifies an event's delivery stage.
 type OrchestrationDeliveryState string
 
 const (
+	// OrchestrationPending marks an event waiting for delivery.
 	OrchestrationPending      OrchestrationDeliveryState = "pending"
 	OrchestrationLeased       OrchestrationDeliveryState = "leased"
 	OrchestrationSubmitted    OrchestrationDeliveryState = "submitted"
