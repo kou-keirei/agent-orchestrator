@@ -515,6 +515,11 @@ type Project struct {
 	Kind          string
 }
 
+type ProjectDispatchHold struct {
+	ProjectID string
+	Held      int64
+}
+
 type Review struct {
 	ID                    string
 	SessionID             domain.SessionID

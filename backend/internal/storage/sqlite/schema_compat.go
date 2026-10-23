@@ -23,7 +23,7 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	version, err := goose.GetDBVersionContext(ctx, db)
-	if err != nil || version <= 156 {
+	if err != nil || version <= 157 {
 		return err
 	}
 	for v := 150; v <= 156; v++ {
@@ -36,6 +36,26 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	plan := map[int64]bool{}
+	// A foreign journal claim for 157 cannot establish this table's effects.
+	// Inspect before any repair; never replace a colliding foreign object.
+	var holdObjects int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='project_dispatch_hold' COLLATE NOCASE`).Scan(&holdObjects); err != nil {
+		return err
+	}
+	plan[157] = holdObjects == 0
+	if holdObjects != 0 {
+		var ddl string
+		if holdObjects != 1 {
+			return fmt.Errorf("desktop schema compatibility: conflicting dispatch hold objects")
+		}
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name='project_dispatch_hold' AND type='table'`).Scan(&ddl); err != nil {
+			return err
+		}
+		const want = `CREATE TABLE project_dispatch_hold (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, held INTEGER NOT NULL CHECK (held IN (0, 1)))`
+		if desktop169SQL(ddl) != desktop169SQL(want) {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold declaration")
+		}
+	}
 	for _, feature := range []struct {
 		version  int64
 		table    string

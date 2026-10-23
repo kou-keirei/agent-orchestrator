@@ -3,7 +3,9 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
@@ -912,5 +915,328 @@ func TestDispatcherAcceptsSynchronousTUIHookAcknowledgement(t *testing.T) {
 	events, err := s.ListOrchestrationEvents(ctx, "p", 10)
 	if err != nil || len(events) != 1 || events[0].State != domain.OrchestrationAcknowledged {
 		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
+func seedDispatchHoldProject(t *testing.T, s *sqlite.Store, project string) (domain.SessionRecord, domain.OrchestrationEvent) {
+	t.Helper()
+	ctx := context.Background()
+	seedProject(t, s, project)
+	w, err := s.CreateSession(ctx, sampleRecord(project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := sampleRecord(project)
+	o.Kind = domain.KindOrchestrator
+	o.Mode = domain.SessionModeChat
+	o.Activity.State = domain.ActivityIdle
+	o.FirstSignalAt = time.Now()
+	o, err = s.CreateSession(ctx, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	e := domain.OrchestrationEvent{ID: project + "-event", ProjectID: domain.ProjectID(project), WorkerID: w.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "original", EnqueuedAt: now, NextAttemptAt: now}
+	if _, err := s.EnqueueOrchestrationEvent(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	return o, e
+}
+func TestDispatchHoldPersistenceScopeAndExplicitRelease(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	o, e := seedDispatchHoldProject(t, s, "ecp")
+	seedDispatchHoldProject(t, s, "other")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE orchestration_events SET attempt_count=2,attention_required_at=?,last_error='original retry' WHERE id=?`, time.Now().UTC(), e.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.ListOrchestrationEvents(ctx, "ecp", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOrchestrationDispatchHold(ctx, "ecp", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LeaseOrchestrationEvents(ctx, []string{e.ID}, "forbidden", o.ID, time.Now().Add(time.Minute)); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+		t.Fatalf("lease err=%v", err)
+	}
+	tr := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+	d := &orchestrationevents.Dispatcher{Store: s, Transport: tr}
+	if err := d.DispatchProject(ctx, "ecp"); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+		t.Fatalf("dispatch err=%v", err)
+	}
+	if len(tr.batches) != 0 {
+		t.Fatal("held project submitted")
+	}
+	if err := d.DispatchProject(ctx, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.batches) != 1 {
+		t.Fatal("other project did not submit")
+	}
+	if _, err := s.ReclaimOrchestrationEventLeases(ctx, time.Now().Add(40*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkOrchestrationRetentionOverflow(ctx, time.Now().Add(40*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.ListOrchestrationEvents(ctx, "ecp", 10)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("held backlog changed: %v %v", after, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, n, err := s.ReadOrchestrationDispatchHold(ctx, "ecp")
+	if err != nil || !held || n != 0 {
+		t.Fatalf("restart held=%v outstanding=%d err=%v", held, n, err)
+	}
+	d.Store = s
+	if err := d.DispatchProject(ctx, "ecp"); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+		t.Fatalf("restart dispatch=%v", err)
+	}
+	if err := s.SetOrchestrationDispatchHold(ctx, "ecp", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.batches) != 1 {
+		t.Fatal("release itself submitted")
+	}
+	if err := d.DispatchProject(ctx, "ecp"); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.batches) != 2 {
+		t.Fatal("explicit release did not permit dispatch")
+	}
+	if _, err := s.OrchestrationDispatchHeld(ctx, "missing"); err == nil {
+		t.Fatal("unknown project admitted")
+	}
+	if err := s.SetOrchestrationDispatchHold(ctx, "missing", false); err == nil {
+		t.Fatal("unknown project released")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := s.OrchestrationDispatchHeld(ctx, "ecp"); err == nil || !held {
+		t.Fatal("storage failure did not fail closed")
+	}
+}
+
+type holdAfterLeaseStore struct{ *sqlite.Store }
+
+func (s holdAfterLeaseStore) LeaseOrchestrationEvents(ctx context.Context, ids []string, token string, dest domain.SessionID, expiry time.Time) error {
+	if err := s.Store.LeaseOrchestrationEvents(ctx, ids, token, dest, expiry); err != nil {
+		return err
+	}
+	return s.SetOrchestrationDispatchHold(ctx, "ecp", true)
+}
+func TestDispatchHoldWinsAfterLeasePreservesOutstanding(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	_, e := seedDispatchHoldProject(t, s, "ecp")
+	tr := &capturedOrchestrationTransport{}
+	err := (&orchestrationevents.Dispatcher{Store: holdAfterLeaseStore{s}, Transport: tr}).DispatchProject(ctx, "ecp")
+	if !errors.Is(err, orchestrationevents.ErrDispatchHeld) || len(tr.batches) != 0 {
+		t.Fatalf("err=%v sends=%d", err, len(tr.batches))
+	}
+	held, n, err := s.ReadOrchestrationDispatchHold(ctx, "ecp")
+	if err != nil || !held || n != 1 {
+		t.Fatalf("held=%v n=%d err=%v", held, n, err)
+	}
+	before, err := s.ListOrchestrationEvents(ctx, "ecp", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].ID != e.ID || before[0].AttemptCount != 0 || before[0].State != domain.OrchestrationLeased {
+		t.Fatalf("%+v", before)
+	}
+	if _, err := s.ReclaimOrchestrationEventLeases(ctx, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.ListOrchestrationEvents(ctx, "ecp", 10)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("lease changed while held: %v %v", after, err)
+	}
+}
+
+type blockedHoldTransport struct{ entered, finish chan struct{} }
+
+func (b blockedHoldTransport) Submit(ctx context.Context, _ domain.SessionRecord, _ orchestrationevents.Batch) (orchestrationevents.Submission, error) {
+	close(b.entered)
+	select {
+	case <-ctx.Done():
+		return orchestrationevents.Submission{}, ctx.Err()
+	case <-b.finish:
+		return orchestrationevents.Submission{Submitted: true}, nil
+	}
+}
+func TestDispatchHoldWaitsForInFlightSubmissionAndLeavesOtherProjectOperational(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s := newTestStore(t)
+	seedDispatchHoldProject(t, s, "ecp")
+	seedDispatchHoldProject(t, s, "other")
+	tr := blockedHoldTransport{make(chan struct{}), make(chan struct{})}
+	sent := make(chan error, 1)
+	go func() { sent <- (&orchestrationevents.Dispatcher{Store: s, Transport: tr}).DispatchProject(ctx, "ecp") }()
+	select {
+	case <-tr.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	holdCtx, holdCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	if err := s.SetOrchestrationDispatchHold(holdCtx, "ecp", true); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("in-flight hold claimed success: %v", err)
+	}
+	holdCancel()
+	other := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+	if err := (&orchestrationevents.Dispatcher{Store: s, Transport: other}).DispatchProject(ctx, "other"); err != nil || len(other.batches) != 1 {
+		t.Fatalf("other project blocked: %v", err)
+	}
+	heldDone := make(chan error, 1)
+	go func() { heldDone <- s.SetOrchestrationDispatchHold(ctx, "ecp", true) }()
+	close(tr.finish)
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case err := <-heldDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	held, n, err := s.ReadOrchestrationDispatchHold(ctx, "ecp")
+	if err != nil || !held || n != 1 {
+		t.Fatalf("lost submitted truth: %v %d %v", held, n, err)
+	}
+	if err := (&orchestrationevents.Dispatcher{Store: s, Transport: other}).DispatchProject(ctx, "ecp"); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+		t.Fatalf("held err=%v", err)
+	}
+}
+
+func TestDispatchHoldForeign169AdoptionAndCollision(t *testing.T) {
+	for _, collision := range []bool{false, true} {
+		t.Run(strconv.FormatBool(collision), func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedProject(t, s, "ecp")
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for v := 158; v <= 169; v++ {
+				if _, err := db.Exec(`INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, v); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.Exec(`DROP TABLE project_dispatch_hold`); err != nil {
+				t.Fatal(err)
+			}
+			if collision {
+				if _, err := db.Exec(`CREATE TABLE project_dispatch_hold(project_id TEXT, foreign_data TEXT)`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = sqlite.Open(dir)
+			if collision {
+				if err == nil {
+					_ = s.Close()
+					t.Fatal("foreign table admitted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if err := s.SetOrchestrationDispatchHold(context.Background(), "ecp", true); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDispatchHoldUnknownStateAndOutstandingReadback(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dir)
+	o, e := seedDispatchHoldProject(t, s, "ecp")
+	other, _ := seedDispatchHoldProject(t, s, "other")
+	if err := s.LeaseOrchestrationEvents(ctx, []string{e.ID}, "wrong-project", other.ID, time.Now()); err == nil {
+		t.Fatal("wrong-project destination leased event")
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := s.SetOrchestrationDispatchHold(ctx, "ecp", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE project_dispatch_hold SET held=2 WHERE project_id='ecp'`); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := s.OrchestrationDispatchHeld(ctx, "ecp"); err == nil || !held {
+		t.Fatal("invalid state admitted")
+	}
+	if err := s.LeaseOrchestrationEvents(ctx, []string{e.ID}, "invalid-state", o.ID, time.Now()); err == nil {
+		t.Fatal("invalid state leased")
+	}
+	if err := s.SetOrchestrationDispatchHold(ctx, "ecp", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		state, token string
+		submitted    bool
+		count        int
+	}{
+		{"pending", "", false, 0}, {"leased", "batch", false, 1}, {"submitted", "batch", true, 1},
+		{"pending", "batch", true, 1}, {"dead_letter", "batch", true, 1}, {"acknowledged", "batch", true, 0},
+	} {
+		var at any
+		if tc.submitted {
+			at = time.Now().UTC()
+		}
+		if _, err := db.Exec(`UPDATE orchestration_events SET state=?,lease_token=?,submitted_at=? WHERE id=?`, tc.state, tc.token, at, e.ID); err != nil {
+			t.Fatal(err)
+		}
+		held, n, err := s.ReadOrchestrationDispatchHold(ctx, "ecp")
+		if err != nil || !held || n != tc.count {
+			t.Fatalf("%s: held=%v outstanding=%d err=%v", tc.state, held, n, err)
+		}
 	}
 }
