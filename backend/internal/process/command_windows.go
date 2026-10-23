@@ -3,14 +3,150 @@
 package process
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// WindowsCommandBudget bounds a single AO-created command job, including its
+// ordinary descendants. MaxProcesses includes the root; CommitBytes is the
+// job-wide committed-memory limit, not a working-set or physical-memory limit.
+type WindowsCommandBudget struct {
+	MaxProcesses uint32
+	CommitBytes  uintptr
+}
+
+// RunWindowsCommand runs an explicitly admitted, non-interactive command in a
+// fresh Windows job. It requires a deadline, inherits the environment and working
+// directory, and does not inherit handles or connect standard streams. Callers
+// needing exec.Cmd's I/O contract must continue to use CommandContext.
+//
+// This is an opt-in primitive, not an installed policy for existing AO launches
+// or evidence of containment of provider-internal Codex/ACP tool subprocesses.
+// Windows 10+ job-list admission must succeed; there is no uncontained fallback.
+func RunWindowsCommand(ctx context.Context, budget WindowsCommandBudget, name string, args ...string) (err error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("Windows command budget requires a context deadline")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	job, err := newWindowsCommandJob(budget)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, windows.CloseHandle(job)) }()
+	child, err := createWindowsJobCommand(job, name, args)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// This exact job is ours, and is never inherited by the child. Terminate
+		// remaining descendants even when the root exited successfully.
+		err = errors.Join(err, windows.TerminateJobObject(job, 1))
+		state, waitErr := windows.WaitForSingleObject(child.Process, 5000)
+		err = errors.Join(err, waitErr)
+		if waitErr == nil && state != windows.WAIT_OBJECT_0 {
+			err = errors.Join(err, errors.New("Windows command cleanup wait timed out"))
+		}
+		err = errors.Join(err, windows.CloseHandle(child.Thread), windows.CloseHandle(child.Process))
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := windows.ResumeThread(child.Thread); err != nil {
+		return fmt.Errorf("resume admitted Windows command: %w", err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		state, err := windows.WaitForSingleObject(child.Process, 10)
+		if err != nil {
+			return fmt.Errorf("wait for Windows command: %w", err)
+		}
+		if state == uint32(windows.WAIT_TIMEOUT) {
+			continue
+		}
+		if state != windows.WAIT_OBJECT_0 {
+			return fmt.Errorf("unexpected Windows command wait state: %d", state)
+		}
+		var code uint32
+		if err := windows.GetExitCodeProcess(child.Process, &code); err != nil {
+			return err
+		}
+		if code != 0 {
+			return fmt.Errorf("Windows command exited with code %d", code)
+		}
+		return nil
+	}
+}
+
+func newWindowsCommandJob(budget WindowsCommandBudget) (windows.Handle, error) {
+	if budget.MaxProcesses == 0 || budget.CommitBytes == 0 {
+		return 0, errors.New("Windows command budget requires positive process and commit limits")
+	}
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create Windows command job: %w", err)
+	}
+	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{JobMemoryLimit: budget.CommitBytes}
+	limits.BasicLimitInformation.ActiveProcessLimit = budget.MaxProcesses
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+		windows.JOB_OBJECT_LIMIT_JOB_MEMORY | windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		return 0, errors.Join(fmt.Errorf("set Windows command job limits: %w", err), windows.CloseHandle(job))
+	}
+	return job, nil
+}
+
+func createWindowsJobCommand(job windows.Handle, name string, args []string) (windows.ProcessInformation, error) {
+	var child windows.ProcessInformation
+	invocation := prepareCommand(name, args)
+	path, err := exec.LookPath(invocation.name)
+	if err != nil {
+		return child, err
+	}
+	app, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return child, err
+	}
+	line := windows.ComposeCommandLine(append([]string{path}, invocation.args...))
+	if invocation.commandLine != "" {
+		line = windows.EscapeArg(path) + " " + invocation.commandLine
+	}
+	commandLine, err := windows.UTF16PtrFromString(line)
+	if err != nil {
+		return child, err
+	}
+	attributes, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return child, err
+	}
+	defer attributes.Delete()
+	// PROC_THREAD_ATTRIBUTE_JOB_LIST (Windows 10+): admission is part of
+	// CreateProcess, before any child code executes. No post-start PID attach.
+	const jobListAttribute = 0x0002000d
+	if err := attributes.Update(jobListAttribute, unsafe.Pointer(&job), unsafe.Sizeof(job)); err != nil {
+		return child, fmt.Errorf("configure Windows command job admission: %w", err)
+	}
+	startup := windows.StartupInfoEx{ProcThreadAttributeList: attributes.List()}
+	startup.Cb = uint32(unsafe.Sizeof(startup))
+	flags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW)
+	if err := windows.CreateProcess(app, commandLine, nil, nil, false, flags, nil, nil, &startup.StartupInfo, &child); err != nil {
+		return child, fmt.Errorf("create admitted Windows command: %w", err)
+	}
+	return child, nil
+}
 
 type commandInvocation struct {
 	name        string
