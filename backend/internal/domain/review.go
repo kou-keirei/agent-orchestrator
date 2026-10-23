@@ -105,6 +105,7 @@ type ReviewerCleanupObligation struct {
 type ReviewerCleanupObligationStatus string
 
 const (
+	// ReviewerCleanupUnresolved marks a runtime whose cleanup is not yet confirmed.
 	ReviewerCleanupUnresolved ReviewerCleanupObligationStatus = "unresolved"
 	ReviewerCleanupCleared    ReviewerCleanupObligationStatus = "cleared"
 )
@@ -134,6 +135,7 @@ type ReviewTargetBinding struct {
 type ReviewEvidenceLevel string
 
 const (
+	// ReviewEvidenceRequested identifies settings requested for a review.
 	ReviewEvidenceRequested         ReviewEvidenceLevel = "REQUESTED"
 	ReviewEvidenceConfigured        ReviewEvidenceLevel = "CONFIGURED"
 	ReviewEvidenceAOResolved        ReviewEvidenceLevel = "AO_RESOLVED"

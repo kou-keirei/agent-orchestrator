@@ -8,6 +8,7 @@ import "github.com/aoagents/agent-orchestrator/backend/internal/domain"
 type ChatDispatchConformanceStatus string
 
 const (
+	// ChatDispatchConformanceVerified means native dispatch evidence matches the request.
 	ChatDispatchConformanceVerified       ChatDispatchConformanceStatus = "VERIFIED"
 	ChatDispatchConfigMismatch            ChatDispatchConformanceStatus = "DISPATCH_CONFIG_MISMATCH"
 	ChatDispatchEvidenceMissing           ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
@@ -25,6 +26,7 @@ const (
 type ChatDispatchEvidenceProvenance string
 
 const (
+	// ChatDispatchProvenanceAORequested identifies values requested through AO.
 	ChatDispatchProvenanceAORequested               ChatDispatchEvidenceProvenance = "ao.requested"
 	ChatDispatchProvenanceAOConfigured              ChatDispatchEvidenceProvenance = "ao.configured"
 	ChatDispatchProvenanceAODispatched              ChatDispatchEvidenceProvenance = "ao.dispatched"
@@ -67,6 +69,7 @@ type ChatDispatchVariantObservation struct {
 }
 
 const (
+	// ChatDispatchVariantNone records that no dispatch variant was selected.
 	ChatDispatchVariantNone     = "none"
 	ChatDispatchNotApplicable   = "not-applicable"
 	ChatDispatchVariantMetadata = "ao.dispatch-metadata"
