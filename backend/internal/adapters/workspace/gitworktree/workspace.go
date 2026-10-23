@@ -1639,7 +1639,7 @@ func (w *Workspace) resolveExecutionBase(ctx context.Context, repo, requested st
 	}
 	sha, err := w.revParse(ctx, repo, target+"^{commit}")
 	if err != nil {
-		return "", fmt.Errorf("%w: target %q is not a resolvable commit: %v", ports.ErrWorkspaceExecutionBaseMismatch, target, err)
+		return "", fmt.Errorf("%w: target %q is not a resolvable commit: %s", ports.ErrWorkspaceExecutionBaseMismatch, target, err.Error())
 	}
 	return sha, nil
 }
@@ -1657,7 +1657,7 @@ func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.Workspac
 		var err error
 		repo, err = w.repoPath(info.ProjectID)
 		if err != nil {
-			return fmt.Errorf("%w: resolve repository: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+			return fmt.Errorf("%w: resolve repository: %s", ports.ErrWorkspaceExecutionBaseMismatch, err.Error())
 		}
 	}
 	canonical, err := w.resolveExecutionBase(ctx, repo, target)
@@ -1666,7 +1666,7 @@ func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.Workspac
 	}
 	head, err := w.revParse(ctx, info.Path, "HEAD")
 	if err != nil {
-		return fmt.Errorf("%w: read HEAD: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+		return fmt.Errorf("%w: read HEAD: %s", ports.ErrWorkspaceExecutionBaseMismatch, err.Error())
 	}
 	if head != canonical {
 		return fmt.Errorf("%w: HEAD=%s, want %s", ports.ErrWorkspaceExecutionBaseMismatch, head, canonical)
@@ -1679,7 +1679,7 @@ func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.Workspac
 	}
 	status, err := w.run(ctx, w.binary, statusUntrackedAllArgs(info.Path)...)
 	if err != nil {
-		return fmt.Errorf("%w: read status: %v", ports.ErrWorkspaceExecutionBaseMismatch, err)
+		return fmt.Errorf("%w: read status: %s", ports.ErrWorkspaceExecutionBaseMismatch, err.Error())
 	}
 	if strings.TrimSpace(string(status)) != "" {
 		return fmt.Errorf("%w: worktree has tracked or untracked changes", ports.ErrWorkspaceExecutionBaseMismatch)
@@ -1695,7 +1695,7 @@ func (w *Workspace) requireDiffClean(ctx context.Context, worktree, target strin
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return fmt.Errorf("%w: %s differs from %s", ports.ErrWorkspaceExecutionBaseMismatch, label, target)
 		}
-		return fmt.Errorf("%w: inspect %s: %v", ports.ErrWorkspaceExecutionBaseMismatch, label, err)
+		return fmt.Errorf("%w: inspect %s: %s", ports.ErrWorkspaceExecutionBaseMismatch, label, err.Error())
 	}
 	return nil
 }
