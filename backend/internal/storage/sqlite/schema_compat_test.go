@@ -114,6 +114,9 @@ func TestLegacy169Compatibility(t *testing.T) {
 		if rows.Next() {
 			t.Fatal("foreign key violation")
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -185,6 +188,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 	var tables []string
 	for rows.Next() {
 		var kind, name, owner, ddl string
@@ -207,6 +211,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		columns, err := rows.Columns()
 		if err != nil {
 			t.Fatal(err)
@@ -529,6 +534,7 @@ func TestLegacy169BackupCopy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		var columns []string
 		for rows.Next() {
 			var name string
@@ -554,6 +560,7 @@ func TestLegacy169BackupCopy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer rows.Close()
 			columns, err := rows.Columns()
 			if err != nil {
 				t.Fatal(err)
