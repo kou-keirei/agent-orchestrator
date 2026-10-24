@@ -472,6 +472,10 @@ var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names
 	"ProjectUpdateSettingsInput":        "UpdateProjectSettingsInput",
 	"ProjectWorkspaceRepo":              "WorkspaceRepo",
 	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
+
+	// Project dispatch hold controls.
+	"ControllersSetOrchestrationDispatchHoldRequest": "SetOrchestrationDispatchHoldRequest",
+	"ControllersOrchestrationDispatchHoldResponse":   "OrchestrationDispatchHoldResponse",
 }
 
 // markRequestBodyRequired sets requestBody.required: true on the operation's
@@ -1509,6 +1513,16 @@ func devOperations() []operation {
 
 func notificationOperations() []operation {
 	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/projects/{id}/orchestration-dispatch-hold", id: "getOrchestrationDispatchHold", tag: "notifications", summary: "Read project automatic dispatch hold; does not prove provider turn quiescence",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			resps:      []respUnit{{http.StatusOK, controllers.OrchestrationDispatchHoldResponse{}}, {http.StatusInternalServerError, envelope.APIError{}}, {http.StatusServiceUnavailable, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}},
+		},
+		{
+			method: http.MethodPut, path: "/api/v1/projects/{id}/orchestration-dispatch-hold", id: "setOrchestrationDispatchHold", tag: "notifications", summary: "Explicitly hold or release project automatic dispatch without waking a session",
+			pathParams: []any{controllers.ProjectIDParam{}}, reqBody: controllers.SetOrchestrationDispatchHoldRequest{},
+			resps: []respUnit{{http.StatusOK, controllers.OrchestrationDispatchHoldResponse{}}, {http.StatusBadRequest, envelope.APIError{}}, {http.StatusInternalServerError, envelope.APIError{}}, {http.StatusServiceUnavailable, envelope.APIError{}}, {http.StatusNotImplemented, envelope.APIError{}}},
+		},
 		{
 			method: http.MethodGet, path: "/api/v1/projects/{id}/orchestration-events", id: "listOrchestrationEvents", tag: "notifications",
 			summary:    "List daemon orchestration delivery state",

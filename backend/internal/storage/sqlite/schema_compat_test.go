@@ -104,8 +104,12 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatalf("repeat startup: %v", err)
 	}
 	var journalAfter string
-	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version WHERE version_id<=169`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
 		t.Fatalf("journal changed: %v", err)
+	}
+	var native170 int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE version_id=170 AND is_applied=1`).Scan(&native170); err != nil || native170 != 1 {
+		t.Fatalf("native migration 170 count=%d err=%v", native170, err)
 	}
 	if rows, err := db.Query(`PRAGMA foreign_key_check`); err != nil {
 		t.Fatal(err)
@@ -827,5 +831,59 @@ func TestLegacy169HistoricalCDCTransactionalReplacement(t *testing.T) {
 	}
 	if err := migrate(db); err != nil {
 		t.Fatalf("retry after rollback: %v", err)
+	}
+}
+
+func TestDispatchHold170AdoptsCanonicalCandidateAndRejectsCollision(t *testing.T) {
+	for _, collision := range []bool{false, true} {
+		t.Run(strconv.FormatBool(collision), func(t *testing.T) {
+			db := openTestDB(t)
+			upTo(t, db, 156)
+			mustExec(t, db, `INSERT INTO projects(id,path,registered_at) VALUES ('existing','/existing',CURRENT_TIMESTAMP)`)
+			if collision {
+				mustExec(t, db, `CREATE TABLE project_dispatch_hold(project_id TEXT,foreign_data TEXT)`)
+			} else {
+				mustExec(t, db, `CREATE TABLE project_dispatch_hold (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, held INTEGER NOT NULL CHECK (held IN (0, 1)))`)
+				mustExec(t, db, `INSERT INTO project_dispatch_hold VALUES ('existing',0)`)
+				mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (157,1)`)
+			}
+			before := desktop169Snapshot(t, db)
+			err := migrate(db)
+			if collision {
+				if err == nil {
+					t.Fatal("foreign hold table admitted")
+				}
+				if after := desktop169Snapshot(t, db); after != before {
+					t.Fatal("collision changed database")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var held int
+			if err := db.QueryRow(`SELECT held FROM project_dispatch_hold WHERE project_id='existing'`).Scan(&held); err != nil || held != 0 {
+				t.Fatalf("explicit release lost: %d %v", held, err)
+			}
+			snapshot := desktop169Snapshot(t, db)
+			if err := migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			if desktop169Snapshot(t, db) != snapshot {
+				t.Fatal("restart changed candidate state")
+			}
+		})
+	}
+}
+
+func TestDispatchHold170RejectsUnjournaledCollision(t *testing.T) {
+	db := openTestDB(t)
+	mustExec(t, db, `CREATE TABLE project_dispatch_hold(project_id TEXT,foreign_data TEXT)`)
+	before := desktop169Snapshot(t, db)
+	if err := migrate(db); err == nil {
+		t.Fatal("unjournaled collision admitted")
+	}
+	if after := desktop169Snapshot(t, db); after != before {
+		t.Fatal("collision changed database")
 	}
 }

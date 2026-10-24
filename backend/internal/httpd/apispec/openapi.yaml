@@ -2205,6 +2205,97 @@ paths:
       summary: Replace a project's per-project config
       tags:
       - projects
+  /api/v1/projects/{id}/orchestration-dispatch-hold:
+    get:
+      operationId: getOrchestrationDispatchHold
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrchestrationDispatchHoldResponse'
+          description: OK
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Read project automatic dispatch hold; does not prove provider turn
+        quiescence
+      tags:
+      - notifications
+    put:
+      operationId: setOrchestrationDispatchHold
+      parameters:
+      - description: Project identifier (registry key).
+        in: path
+        name: id
+        required: true
+        schema:
+          description: Project identifier (registry key).
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetOrchestrationDispatchHoldRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrchestrationDispatchHoldResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Explicitly hold or release project automatic dispatch without waking
+        a session
+      tags:
+      - notifications
   /api/v1/projects/{id}/orchestration-events:
     get:
       operationId: listOrchestrationEvents
@@ -10690,6 +10781,26 @@ components:
             cmd, or a custom executable path. Ignored on macOS and Linux.'
           type: string
       type: object
+    OrchestrationDispatchHoldResponse:
+      properties:
+        held:
+          type: boolean
+        outstandingEventCount:
+          type: integer
+        projectId:
+          type: string
+        state:
+          enum:
+          - UNHELD
+          - HELD
+          - OUTSTANDING_DELIVERY
+          type: string
+      required:
+      - projectId
+      - held
+      - outstandingEventCount
+      - state
+      type: object
     OrchestrationEventResponse:
       properties:
         acknowledgedAt:
@@ -12102,6 +12213,13 @@ components:
           type:
           - "null"
           - string
+      type: object
+    SetOrchestrationDispatchHoldRequest:
+      properties:
+        held:
+          type: boolean
+      required:
+      - held
       type: object
     SetProjectConfigInput:
       properties:

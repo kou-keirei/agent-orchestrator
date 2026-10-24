@@ -18,13 +18,40 @@ import (
 // absent effects of the unchanged embedded migrations are eligible for replay.
 // Inspect the entire plan before writing; partial/colliding shapes need review.
 func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
+	// Inspect before historical repair or the native 170 migration can write.
+	// A pre-170 table may come from the unshipped candidate; adopt only its
+	// canonical declaration without replacing any operator hold/release rows.
+	var holdObjects int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='project_dispatch_hold' COLLATE NOCASE`).Scan(&holdObjects); err != nil {
+		return err
+	}
+
+	if holdObjects != 0 {
+		var ddl string
+		if holdObjects != 1 {
+			return fmt.Errorf("desktop schema compatibility: conflicting dispatch hold objects")
+		}
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name='project_dispatch_hold' AND type='table'`).Scan(&ddl); err != nil {
+			return err
+		}
+		const want = `CREATE TABLE project_dispatch_hold (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, held INTEGER NOT NULL CHECK (held IN (0, 1)))`
+		if desktop169SQL(ddl) != desktop169SQL(want) {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold declaration")
+		}
+	}
 	var journal int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='goose_db_version' AND type='table'`).Scan(&journal); err != nil || journal == 0 {
 		return err
 	}
 	version, err := goose.GetDBVersionContext(ctx, db)
-	if err != nil || version <= 156 {
+	if err != nil {
 		return err
+	}
+	if version >= 170 && holdObjects == 0 {
+		return fmt.Errorf("desktop schema compatibility: migration 170 claimed without dispatch hold table")
+	}
+	if version <= 156 {
+		return nil
 	}
 	for v := 150; v <= 156; v++ {
 		var applied int
@@ -479,7 +506,7 @@ func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissi
 	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='sessions' AND name='sessions_cdc_update'`).Scan(&actual); err != nil {
 		return err
 	}
-	knownHistorical := journalVersion == 169 && !hiddenMissing && provisioning != 0 && desktop169SQL(actual) == desktop169SQL(historical150)
+	knownHistorical := (journalVersion == 169 || journalVersion == 170) && !hiddenMissing && provisioning != 0 && desktop169SQL(actual) == desktop169SQL(historical150)
 	if desktop169SQL(actual) != desktop169SQL(canonical) && !knownHistorical {
 		return fmt.Errorf("desktop schema compatibility: foreign session CDC behavior; refusing replacement")
 	}

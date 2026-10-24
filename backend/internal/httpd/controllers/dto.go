@@ -1628,6 +1628,19 @@ type ListOrchestrationEventsQuery struct {
 type RetryOrchestrationEventResponse struct {
 	Retried bool `json:"retried"`
 }
+
+type SetOrchestrationDispatchHoldRequest struct {
+	Held *bool `json:"held" required:"true" nullable:"false"`
+}
+
+// HELD describes local automatic dispatch only, never provider/native-turn
+// quiescence. OUTSTANDING_DELIVERY requires separate operator reconciliation.
+type OrchestrationDispatchHoldResponse struct {
+	ProjectID             domain.ProjectID `json:"projectId"`
+	Held                  bool             `json:"held"`
+	OutstandingEventCount int              `json:"outstandingEventCount"`
+	State                 string           `json:"state" enum:"UNHELD,HELD,OUTSTANDING_DELIVERY"`
+}
 type OrchestrationEventIDParam struct {
 	EventID string `path:"eventId"`
 }
