@@ -93,6 +93,9 @@ jobs:
       - name: Test Windows mobile tunnel subprocesses
         run: go test -race -run 'Cloudflared|Tunnel|Command' ./internal/mobilebridge/ ./internal/process/
 
+      - name: Test Windows bounded command runner and process admission
+        run: go test -race -count=1 -p=1 -parallel=1 -timeout=3m -v -run '^Test(AdapterRunWindows|WindowsCapabilityProbe|WindowsCommand(Budget|Files)|CommandContextHidesConsoleWindow)' ./internal/adapters/systemexec/ ./internal/process/
+
       - name: Test native Goose identity
         run: go test -race -count=1 -timeout=10m ./internal/adapters/agent/binaryutil ./internal/adapters/agent/goose
 
