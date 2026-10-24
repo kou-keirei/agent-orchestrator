@@ -1152,7 +1152,10 @@ func TestDispatchHoldForeign169AdoptionAndCollision(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for v := 158; v <= 169; v++ {
+			if _, err := db.Exec(`DELETE FROM goose_db_version WHERE version_id=170`); err != nil {
+				t.Fatal(err)
+			}
+			for v := 157; v <= 169; v++ {
 				if _, err := db.Exec(`INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, v); err != nil {
 					t.Fatal(err)
 				}
@@ -1238,5 +1241,198 @@ func TestDispatchHoldUnknownStateAndOutstandingReadback(t *testing.T) {
 		if err != nil || !held || n != tc.count {
 			t.Fatalf("%s: held=%v outstanding=%d err=%v", tc.state, held, n, err)
 		}
+	}
+}
+
+func TestDispatchHoldInitializationPrecedesRecoveryAndPreservesRelease(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	_, e := seedDispatchHoldProject(t, s, "target")
+	seedDispatchHoldProject(t, s, "other")
+	before, err := s.ListOrchestrationEvents(ctx, "target", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InitializeOrchestrationDispatchHold(ctx, "target"); err != nil {
+		t.Fatal(err)
+	}
+	tr := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+	d := &orchestrationevents.Dispatcher{Store: s, Transport: tr}
+	if err := orchestrationevents.Recover(ctx, s, d); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.batches) != 1 || len(tr.batches[0].EventIDs) != 1 || tr.batches[0].EventIDs[0] == e.ID {
+		t.Fatalf("startup submitted target: %+v", tr.batches)
+	}
+	after, err := s.ListOrchestrationEvents(ctx, "target", 10)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("target backlog changed: %+v %v", after, err)
+	}
+	if err := s.SetOrchestrationDispatchHold(ctx, "target", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InitializeOrchestrationDispatchHold(ctx, "target"); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := s.OrchestrationDispatchHeld(ctx, "target"); err != nil || held {
+		t.Fatalf("restart undid explicit release: %v %v", held, err)
+	}
+	if err := s.InitializeOrchestrationDispatchHold(ctx, "missing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OrchestrationDispatchHeld(ctx, "missing"); err == nil {
+		t.Fatal("initialization invented missing project")
+	}
+}
+
+func TestDispatchHoldInitializationReadbackRollback(t *testing.T) {
+	for _, mutation := range []string{`UPDATE project_dispatch_hold SET held=0 WHERE project_id=NEW.project_id;`, `DELETE FROM project_dispatch_hold WHERE project_id=NEW.project_id;`} {
+		t.Run(mutation, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			s := sqlitetest.MustOpenAt(t, dir)
+			seedProject(t, s, "execution-control-plane")
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`CREATE TRIGGER fail_hold_readback AFTER INSERT ON project_dispatch_hold BEGIN ` + mutation + ` END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InitializeOrchestrationDispatchHold(ctx, "execution-control-plane"); err == nil {
+				t.Fatal("invalid readback admitted startup")
+			}
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM project_dispatch_hold`).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("initialization did not roll back: %d %v", n, err)
+			}
+			if _, err := db.Exec(`DROP TRIGGER fail_hold_readback`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InitializeOrchestrationDispatchHold(ctx, "execution-control-plane"); err != nil {
+				t.Fatal(err)
+			}
+			if held, err := s.OrchestrationDispatchHeld(ctx, "execution-control-plane"); err != nil || !held {
+				t.Fatalf("retry: %v %v", held, err)
+			}
+			if _, err := db.Exec(`PRAGMA ignore_check_constraints=ON; UPDATE project_dispatch_hold SET held=2`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InitializeOrchestrationDispatchHold(ctx, "execution-control-plane"); err == nil {
+				t.Fatal("corrupt prior override admitted startup")
+			}
+		})
+	}
+}
+
+func TestDispatchHoldSyntheticUpgradeBeforeRecovery(t *testing.T) {
+	for _, legacy169 := range []bool{false, true} {
+		t.Run(strconv.FormatBool(legacy169), func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			s, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const target = "execution-control-plane"
+			_, event := seedDispatchHoldProject(t, s, target)
+			aliases := []string{"ecp", "execution-control-plane-copy", "EXECUTION-CONTROL-PLANE"}
+			for _, id := range aliases {
+				seedDispatchHoldProject(t, s, id)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`DROP TABLE project_dispatch_hold; DELETE FROM goose_db_version WHERE version_id=170; UPDATE orchestration_events SET attempt_count=3,last_error='keep retry',attention_required_at=CURRENT_TIMESTAMP WHERE project_id=?`, target); err != nil {
+				t.Fatal(err)
+			}
+			if legacy169 {
+				for v := 157; v <= 169; v++ {
+					if _, err := db.Exec(`INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, v); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			before, err := s.ListOrchestrationEvents(ctx, target, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.InitializeOrchestrationDispatchHold(ctx, target); err != nil {
+				t.Fatal(err)
+			}
+			held, _, err := s.ReadOrchestrationDispatchHold(ctx, target)
+			if err != nil || !held {
+				t.Fatalf("pre-recovery readback: %v %v", held, err)
+			}
+			tr := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			d := &orchestrationevents.Dispatcher{Store: s, Transport: tr}
+			if err := orchestrationevents.Recover(ctx, s, d); err != nil {
+				t.Fatal(err)
+			}
+			if len(tr.batches) != len(aliases) {
+				t.Fatalf("other projects: %d", len(tr.batches))
+			}
+			for _, b := range tr.batches {
+				for _, id := range b.EventIDs {
+					if id == event.ID {
+						t.Fatal("target submitted at first recovery")
+					}
+				}
+			}
+			after, err := s.ListOrchestrationEvents(ctx, target, 10)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("upgrade recovery changed backlog: %v %v", after, err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.Store = s
+			if err := s.InitializeOrchestrationDispatchHold(ctx, target); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.DispatchProject(ctx, target); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+				t.Fatalf("held restart admitted dispatch: %v", err)
+			}
+			if err := s.SetOrchestrationDispatchHold(ctx, target, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.Store = s
+			if err := s.InitializeOrchestrationDispatchHold(ctx, target); err != nil {
+				t.Fatal(err)
+			}
+			if held, err := s.OrchestrationDispatchHeld(ctx, target); err != nil || held {
+				t.Fatalf("restart undid explicit release: %v %v", held, err)
+			}
+			if err := d.DispatchProject(ctx, target); err != nil {
+				t.Fatal(err)
+			}
+			if len(tr.batches) != len(aliases)+1 {
+				t.Fatal("explicit release did not permit delivery")
+			}
+		})
 	}
 }

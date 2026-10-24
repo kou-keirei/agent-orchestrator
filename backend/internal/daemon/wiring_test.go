@@ -3,10 +3,14 @@ package daemon
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1050,5 +1054,94 @@ func writeFakeExecutable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake executable %s: %v", path, err)
+	}
+}
+
+// Check the real startup ordering without booting runtimes, HTTP, or providers.
+// Disposable store tests separately exercise the transaction and recovery.
+func TestWiringDispatchHoldPrecedesStartupRecovery(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "daemon.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var run *ast.FuncDecl
+	for _, decl := range f.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "Run" {
+			run = fn
+		}
+	}
+	if run == nil {
+		t.Fatal("Run not found")
+	}
+	var opened, initialized token.Pos
+	var recovery []token.Pos
+	count := 0
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "sqlite" && sel.Sel.Name == "Open" {
+			opened = call.Pos()
+		}
+		if sel.Sel.Name == "InitializeOrchestrationDispatchHold" {
+			count++
+			initialized = call.Pos()
+			if len(call.Args) != 2 {
+				t.Fatal("bootstrap arguments changed")
+			}
+			literal, ok := call.Args[1].(*ast.BasicLit)
+			if !ok {
+				t.Fatal("bootstrap must bind exact project ID")
+			}
+			project, err := strconv.Unquote(literal.Value)
+			if err != nil || project != "execution-control-plane" {
+				t.Fatalf("bootstrap project=%q err=%v", project, err)
+			}
+		}
+		if sel.Sel.Name == "Recover" || sel.Sel.Name == "Start" || sel.Sel.Name == "Run" {
+			recovery = append(recovery, call.Pos())
+		}
+		return true
+	})
+	if count != 1 || opened == 0 || initialized <= opened {
+		t.Fatalf("open=%d initialization=%d count=%d", opened, initialized, count)
+	}
+	if len(recovery) == 0 {
+		t.Fatal("no recovery/start boundaries checked")
+	}
+	for _, pos := range recovery {
+		if initialized >= pos {
+			t.Fatal("startup work precedes durable bootstrap")
+		}
+	}
+	// The initializer is a startup error gate, not a best-effort invocation.
+	gated := false
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		stmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		assign, ok := stmt.Init.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 {
+			return true
+		}
+		if assign.Rhs[0].Pos() != initialized {
+			return true
+		}
+		ast.Inspect(stmt.Body, func(n ast.Node) bool {
+			if _, ok := n.(*ast.ReturnStmt); ok {
+				gated = true
+			}
+			return true
+		})
+		return true
+	})
+	if !gated {
+		t.Fatal("bootstrap error does not abort startup")
 	}
 }

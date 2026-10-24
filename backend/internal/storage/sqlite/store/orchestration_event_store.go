@@ -91,6 +91,41 @@ func (s *Store) SetOrchestrationDispatchHold(ctx context.Context, project domain
 	})
 }
 
+// InitializeOrchestrationDispatchHold runs before startup recovery for an
+// explicitly selected project. It initializes an existing project's missing
+// override once; an operator's prior hold or release always survives restart.
+func (s *Store) InitializeOrchestrationDispatchHold(ctx context.Context, project domain.ProjectID) error {
+	return withDispatchAdmission(ctx, project, func() error {
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return err
+		}
+		defer s.writeMu.Unlock()
+		return s.inTxDB(ctx, "initialize orchestration dispatch hold", func(_ *gen.Queries, db gen.DBTX) error {
+			result, err := db.ExecContext(ctx, `INSERT INTO project_dispatch_hold(project_id,held) SELECT id,1 FROM projects WHERE id=? ON CONFLICT(project_id) DO NOTHING`, project)
+			if err != nil {
+				return err
+			}
+			inserted, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			var held int
+			err = db.QueryRowContext(ctx, `SELECT held FROM project_dispatch_hold WHERE project_id=?`, project).Scan(&held)
+			if err == sql.ErrNoRows && inserted == 0 {
+				// A fresh install may not have registered this project yet.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if (held != 0 && held != 1) || (inserted != 0 && held != 1) {
+				return fmt.Errorf("dispatch hold initialization readback failed for %q", project)
+			}
+			return nil
+		})
+	})
+}
+
 // ReadOrchestrationDispatchHold reports outstanding deliveries conservatively:
 // an old submitted/leased batch is not evidence of provider quiescence.
 func (s *Store) ReadOrchestrationDispatchHold(ctx context.Context, project domain.ProjectID) (held bool, outstanding int, err error) {
