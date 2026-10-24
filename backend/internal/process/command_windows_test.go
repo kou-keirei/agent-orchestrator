@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -100,8 +102,9 @@ func TestWindowsCommandBudgetRun(t *testing.T) {
 			if code == "0" && err != nil {
 				t.Fatal(err)
 			}
-			if code == "7" && (err == nil || !strings.Contains(err.Error(), "code 7")) {
-				t.Fatalf("exit error = %v, want code 7", err)
+			var exitErr *exec.ExitError
+			if code == "7" && (!errors.As(err, &exitErr) || exitErr.ExitCode() != 7) {
+				t.Fatalf("exit error = %v, want ExitError code 7", err)
 			}
 		})
 	}
@@ -154,4 +157,138 @@ func windowsTestCommand(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return filepath.Join(dir, "cmd.exe")
+}
+
+func TestWindowsCommandFilesCaptureAndEnvironment(t *testing.T) {
+	t.Setenv("AO_W187_PROCESS_ENV", "inherited-value")
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "stream contract.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\necho %AO_W187_PROCESS_ENV%\r\necho diagnostic 1>&2\r\nexit /b 7\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.Create(filepath.Join(dir, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	diagnostic, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer diagnostic.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err = RunWindowsCommandFiles(ctx, WindowsCommandBudget{MaxProcesses: 1, CommitBytes: 64 << 20}, nil, out, diagnostic, shim)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("exit = %v, want ExitError 7", err)
+	}
+	for _, check := range []struct{ file, want string }{{out.Name(), "inherited-value\r\n"}, {diagnostic.Name(), "diagnostic \r\n"}} {
+		got, err := os.ReadFile(check.file)
+		if err != nil || string(got) != check.want {
+			t.Fatalf("%s = %q, error=%v, want %q", check.file, got, err, check.want)
+		}
+	}
+}
+
+func TestWindowsCommandFilesCancellationSubtreeAndSurvivor(t *testing.T) {
+	// The unrelated process never executes: it is suspended in a different
+	// test-owned job, and must remain alive after the target job is canceled.
+	survivorJob, err := newWindowsCommandJob(WindowsCommandBudget{MaxProcesses: 1, CommitBytes: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(survivorJob)
+	survivor, err := createWindowsJobCommand(survivorJob, windowsTestCommand(t), []string{"/d", "/c", "exit 0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		windows.TerminateJobObject(survivorJob, 1)
+		windows.WaitForSingleObject(survivor.Process, 5000)
+		windows.CloseHandle(survivor.Thread)
+		windows.CloseHandle(survivor.Process)
+	}()
+	dir, err := windows.GetSystemDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := filepath.Join(dir, "WindowsPowerShell", "v1.0", "powershell.exe")
+	pidFile := filepath.Join(t.TempDir(), "owned-pids")
+	// Fixed depth one: one PowerShell root starts exactly one sleeping child.
+	// Both scripts have finite lifetimes even if the cleanup implementation fails.
+	script := "$child = Start-Process -FilePath '" + strings.ReplaceAll(ps, "'", "''") +
+		"' -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 15' -PassThru; " +
+		"[IO.File]::WriteAllText('" + strings.ReplaceAll(pidFile+".tmp", "'", "''") + "', [string]$PID + ',' + [string]$child.Id); " +
+		"Move-Item -LiteralPath '" + strings.ReplaceAll(pidFile+".tmp", "'", "''") + "' -Destination '" + strings.ReplaceAll(pidFile, "'", "''") + "'; Start-Sleep -Seconds 15"
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RunWindowsCommand(ctx, WindowsCommandBudget{MaxProcesses: 2, CommitBytes: 512 << 20},
+			ps, "-NoProfile", "-NonInteractive", "-Command", script)
+	}()
+	// Always join the runner before the test returns, including failure paths.
+	joined := false
+	defer func() {
+		cancel()
+		if !joined {
+			select {
+			case <-done:
+			case <-time.After(6 * time.Second):
+				t.Error("runner did not settle after cancellation")
+			}
+		}
+	}()
+	var pids []string
+	readyBy := time.Now().Add(5 * time.Second)
+	for time.Now().Before(readyBy) {
+		data, _ := os.ReadFile(pidFile)
+		pids = strings.Split(string(data), ",")
+		if len(pids) == 2 && pids[0] != "" && pids[1] != "" {
+			break
+		}
+		select {
+		case err := <-done:
+			joined = true
+			t.Fatalf("runner exited before child readiness: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if len(pids) != 2 {
+		t.Fatal("fixed child did not report readiness within five seconds")
+	}
+	var handles []windows.Handle
+	for _, value := range pids {
+		pid, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(pid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer windows.CloseHandle(handle)
+		handles = append(handles, handle)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		joined = true
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel result = %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("cancel did not return within cleanup bound")
+	}
+	for _, handle := range handles {
+		state, err := windows.WaitForSingleObject(handle, 5000)
+		if err != nil || state != windows.WAIT_OBJECT_0 {
+			t.Fatalf("owned subtree did not exit: state=%d err=%v", state, err)
+		}
+	}
+	state, err := windows.WaitForSingleObject(survivor.Process, 0)
+	if err != nil || state != uint32(windows.WAIT_TIMEOUT) {
+		t.Fatalf("unrelated suspended survivor changed: state=%d err=%v", state, err)
+	}
 }

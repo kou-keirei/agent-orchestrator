@@ -26,13 +26,22 @@ type WindowsCommandBudget struct {
 
 // RunWindowsCommand runs an explicitly admitted, non-interactive command in a
 // fresh Windows job. It requires a deadline, inherits the environment and working
-// directory, and does not inherit handles or connect standard streams. Callers
-// needing exec.Cmd's I/O contract must continue to use CommandContext.
+// directory, and connects standard streams to NUL. Use RunWindowsCommandFiles
+// to supply explicit file streams.
 //
-// This is an opt-in primitive, not an installed policy for existing AO launches
-// or evidence of containment of provider-internal Codex/ACP tool subprocesses.
+// Only explicitly integrated AO callers are covered; this is not evidence of
+// containment of provider-internal Codex/ACP tool subprocesses.
 // Windows 10+ job-list admission must succeed; there is no uncontained fallback.
 func RunWindowsCommand(ctx context.Context, budget WindowsCommandBudget, name string, args ...string) (err error) {
+	return RunWindowsCommandFiles(ctx, budget, nil, nil, nil, name, args...)
+}
+
+// RunWindowsCommandFiles is RunWindowsCommand with explicit standard streams.
+// Nil streams use NUL. Only duplicates of these three file handles are inherited;
+// the job handle is never inherited. Files remain owned by the caller. The
+// environment and working directory are inherited unchanged, as in exec.Cmd
+// with nil Env and empty Dir. No arbitrary writer goroutines run in this layer.
+func RunWindowsCommandFiles(ctx context.Context, budget WindowsCommandBudget, stdin, stdout, stderr *os.File, name string, args ...string) (err error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return errors.New("Windows command budget requires a context deadline")
 	}
@@ -44,7 +53,7 @@ func RunWindowsCommand(ctx context.Context, budget WindowsCommandBudget, name st
 		return err
 	}
 	defer func() { err = errors.Join(err, windows.CloseHandle(job)) }()
-	child, err := createWindowsJobCommand(job, name, args)
+	child, err := createWindowsJobCommandFiles(job, stdin, stdout, stderr, name, args)
 	if err != nil {
 		return err
 	}
@@ -79,12 +88,18 @@ func RunWindowsCommand(ctx context.Context, budget WindowsCommandBudget, name st
 		if state != windows.WAIT_OBJECT_0 {
 			return fmt.Errorf("unexpected Windows command wait state: %d", state)
 		}
-		var code uint32
-		if err := windows.GetExitCodeProcess(child.Process, &code); err != nil {
+		// Wait on a Go-owned duplicate only after the native wait signaled, so
+		// callers retain the usual *exec.ExitError and ProcessState contract.
+		process, err := os.FindProcess(int(child.ProcessId))
+		if err != nil {
 			return err
 		}
-		if code != 0 {
-			return fmt.Errorf("Windows command exited with code %d", code)
+		processState, err := process.Wait()
+		if err != nil {
+			return err
+		}
+		if !processState.Success() {
+			return &exec.ExitError{ProcessState: processState}
 		}
 		return nil
 	}
@@ -110,8 +125,18 @@ func newWindowsCommandJob(budget WindowsCommandBudget) (windows.Handle, error) {
 }
 
 func createWindowsJobCommand(job windows.Handle, name string, args []string) (windows.ProcessInformation, error) {
+	return createWindowsJobCommandFiles(job, nil, nil, nil, name, args)
+}
+
+func createWindowsJobCommandFiles(job windows.Handle, stdin, stdout, stderr *os.File, name string, args []string) (windows.ProcessInformation, error) {
 	var child windows.ProcessInformation
-	invocation := prepareCommand(name, args)
+	// Resolve first: an extensionless name such as npm may select npm.cmd.
+	// Shim preparation must see that resolved extension, as in systemexec.
+	resolved, err := exec.LookPath(name)
+	if err != nil {
+		return child, err
+	}
+	invocation := prepareCommand(resolved, args)
 	path, err := exec.LookPath(invocation.name)
 	if err != nil {
 		return child, err
@@ -128,7 +153,7 @@ func createWindowsJobCommand(job windows.Handle, name string, args []string) (wi
 	if err != nil {
 		return child, err
 	}
-	attributes, err := windows.NewProcThreadAttributeList(1)
+	attributes, err := windows.NewProcThreadAttributeList(2)
 	if err != nil {
 		return child, err
 	}
@@ -141,8 +166,36 @@ func createWindowsJobCommand(job windows.Handle, name string, args []string) (wi
 	}
 	startup := windows.StartupInfoEx{ProcThreadAttributeList: attributes.List()}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
+	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return child, err
+	}
+	defer null.Close()
+	var inherited []windows.Handle
+	defer func() {
+		for _, handle := range inherited {
+			windows.CloseHandle(handle)
+		}
+	}()
+	for _, file := range []*os.File{stdin, stdout, stderr} {
+		if file == nil {
+			file = null
+		}
+		var duplicate windows.Handle
+		if err := windows.DuplicateHandle(windows.CurrentProcess(), windows.Handle(file.Fd()),
+			windows.CurrentProcess(), &duplicate, 0, true, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return child, err
+		}
+		inherited = append(inherited, duplicate)
+	}
+	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&inherited[0]),
+		uintptr(len(inherited))*unsafe.Sizeof(inherited[0])); err != nil {
+		return child, err
+	}
+	startup.Flags = windows.STARTF_USESTDHANDLES
+	startup.StdInput, startup.StdOutput, startup.StdErr = inherited[0], inherited[1], inherited[2]
 	flags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW)
-	if err := windows.CreateProcess(app, commandLine, nil, nil, false, flags, nil, nil, &startup.StartupInfo, &child); err != nil {
+	if err := windows.CreateProcess(app, commandLine, nil, nil, true, flags, nil, nil, &startup.StartupInfo, &child); err != nil {
 		return child, fmt.Errorf("create admitted Windows command: %w", err)
 	}
 	return child, nil

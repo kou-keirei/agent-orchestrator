@@ -3,18 +3,91 @@
 package systemexec
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
+
+func init() {
+	capabilityCommandOutput = windowsCapabilityCommandOutput
+}
+
+// Only the fixed, non-interactive Settings capability probes use this budget.
+// Installers, Adapter.Run and provider-internal tools are not covered here.
+func windowsCapabilityCommandOutput(parent context.Context, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	stdout, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer stdout.Close()
+	defer stdoutWriter.Close()
+	stderr, stderrWriter, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer stderr.Close()
+	defer stderrWriter.Close()
+	type capture struct {
+		data []byte
+		err  error
+	}
+	read := func(file *os.File) <-chan capture {
+		done := make(chan capture, 1)
+		go func() {
+			const outputLimit = 256 << 10
+			var buffer bytes.Buffer
+			_, err := io.CopyN(&buffer, file, outputLimit+1)
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			if buffer.Len() > outputLimit {
+				err = errors.New("Windows capability probe output exceeds 256 KiB stream limit")
+				cancel()
+			}
+			done <- capture{data: buffer.Bytes(), err: err}
+		}()
+		return done
+	}
+	outDone, errDone := read(stdout), read(stderr)
+	// Allows a shim, its interpreter and small fixed probe fan-out. This is
+	// committed memory, not Node's much larger reserved virtual address space.
+	err = aoprocess.RunWindowsCommandFiles(ctx, aoprocess.WindowsCommandBudget{
+		MaxProcesses: 4, CommitBytes: 512 << 20,
+	}, nil, stdoutWriter, stderrWriter, name, args...)
+	stdoutWriter.Close()
+	stderrWriter.Close()
+	// Normal job teardown closes descendant pipe writers. Bound capture even
+	// if an external process acquired a writer outside this supported subtree.
+	timer := time.AfterFunc(5*time.Second, func() {
+		stdout.Close()
+		stderr.Close()
+	})
+	out, diagnostic := <-outDone, <-errDone
+	timer.Stop()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		exitErr.Stderr = diagnostic.data
+	}
+	if captureErr := errors.Join(out.err, diagnostic.err); captureErr != nil {
+		err = errors.Join(err, fmt.Errorf("capture Windows capability probe: %w", captureErr))
+	}
+	return out.data, err
+}
 
 func commandContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
 	resolved, err := exec.LookPath(name)
