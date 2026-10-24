@@ -122,6 +122,89 @@ afterEach(() => {
 });
 
 describe("notification cache helpers", () => {
+	it.each([undefined, 0])("uses loaded attention as a lower bound with an older daemon count %s", async (unresolvedCount) => {
+		apiGetMock.mockResolvedValue({ data: {
+			notifications: [notification({ type: "orchestration_attention" })], unresolvedCount,
+		} });
+		expect((await fetchNotificationsPage("all")).unresolvedCount).toBe(1);
+	});
+
+	it("restores an unseen resolved event without guessing global count changes on replay", () => {
+		const qc = queryClient();
+		mergeUnreadNotification(qc, notification({ id: "still-open", type: "orchestration_attention" }));
+		const resolved = notification({ id: "missed", type: "orchestration_attention", resolvedAt: "2026-06-16T11:00:00Z" });
+		applyResolvedNotification(qc, resolved);
+		applyResolvedNotification(qc, resolved);
+		const cache = qc.getQueryData<NotificationsCache>(unreadNotificationsQueryKey);
+		expect(getCachedNotifications(cache)).toHaveLength(2);
+		expect(getCachedUnreadCount(cache)).toBe(1);
+		expect(cache?.pages[0].unresolvedCount).toBe(1);
+	});
+
+	it.each(["unread", "read"] as const)("preserves paginated global counts on unknown %s resolution until refetch", async (status) => {
+		const qc = queryClient();
+		const loaded = Array.from({ length: NOTIFICATION_PAGE_SIZE }, (_, index) => notification({ id: `loaded-${index}` }));
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			qc.setQueryData<NotificationsCache>(key, {
+				pageParams: ["", "older"],
+				pages: [
+					{ notifications: loaded.slice(0, 50), nextCursor: "older", unreadCount: 101, unresolvedCount: 101 },
+					{ notifications: loaded.slice(50), nextCursor: "off-page", unreadCount: 101, unresolvedCount: 101 },
+				],
+			});
+		}
+		const resolved = notification({ id: "off-page", status, resolvedAt: "2026-06-16T11:00:00Z" });
+		applyResolvedNotification(qc, resolved);
+		applyResolvedNotification(qc, resolved);
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			const cache = qc.getQueryData<NotificationsCache>(key)!;
+			expect(cache.pages.map((page) => [page.unreadCount, page.unresolvedCount])).toEqual([[101, 101], [101, 101]]);
+			expect(cache.pages[1].nextCursor).toBe("off-page");
+			expect(qc.getQueryState(key)?.isInvalidated).toBe(true);
+		}
+		expect(getCachedNotifications(qc.getQueryData<NotificationsCache>(recentNotificationsQueryKey)))
+			.toContainEqual(expect.objectContaining({ id: "off-page", resolvedAt: resolved.resolvedAt }));
+		// Only the daemon can determine whether an unknown transition was
+		// already included in the global counters on unloaded pages.
+		const authoritativeUnread = status === "read" ? 100 : 101;
+		apiGetMock.mockResolvedValue({ data: {
+			notifications: loaded, nextCursor: "off-page", unreadCount: authoritativeUnread, unresolvedCount: 100,
+		} });
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			await qc.fetchQuery({ queryKey: key, queryFn: async () => ({
+				pageParams: [""], pages: [await fetchNotificationsPage(key === unreadNotificationsQueryKey ? "unread" : "all")],
+			}) });
+			const page = qc.getQueryData<NotificationsCache>(key)!.pages[0];
+			expect([page.unreadCount, page.unresolvedCount]).toEqual([authoritativeUnread, 100]);
+		}
+		// Refetch can evict the restored row again. Another copy of the same
+		// unknown resolution must still leave authoritative totals intact.
+		applyResolvedNotification(qc, resolved);
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			const page = qc.getQueryData<NotificationsCache>(key)!.pages[0];
+			expect([page.unreadCount, page.unresolvedCount]).toEqual([authoritativeUnread, 100]);
+		}
+	});
+
+	it("updates known resolution counters exactly once across all loaded pages", () => {
+		const qc = queryClient();
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			qc.setQueryData<NotificationsCache>(key, {
+				pageParams: ["", "older"], pages: [
+					{ notifications: [notification()], unreadCount: 101, unresolvedCount: 101 },
+					{ notifications: [], unreadCount: 101, unresolvedCount: 101 },
+				],
+			});
+		}
+		const resolved = notification({ resolvedAt: "2026-06-16T11:00:00Z" });
+		applyResolvedNotification(qc, resolved);
+		applyResolvedNotification(qc, resolved);
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			expect(qc.getQueryData<NotificationsCache>(key)!.pages.map((page) => [page.unreadCount, page.unresolvedCount]))
+				.toEqual([[101, 100], [101, 100]]);
+		}
+	});
+
 	it.each([
 		{ cursor: "previous", nextCursor: "older", status: "all" as const, unreadCount: 4 },
 		{ cursor: "", nextCursor: undefined, status: "unread" as const, unreadCount: 1 },
@@ -379,6 +462,150 @@ describe("notification cache helpers", () => {
 });
 
 describe("createNotificationsTransport", () => {
+	it.each([
+		{ retainedKey: unreadNotificationsQueryKey, missingKey: recentNotificationsQueryKey },
+		{ retainedKey: recentNotificationsQueryKey, missingKey: unreadNotificationsQueryKey },
+	].flatMap((keys) => [
+		{ ...keys, status: "read" as const, resolvedAt: undefined },
+		{ ...keys, status: "unread" as const, resolvedAt: "2026-06-16T11:00:00Z" },
+		{ ...keys, status: "read" as const, resolvedAt: "2026-06-16T11:00:00Z" },
+	]))("preserves $status/$resolvedAt state from either cache after the other is evicted: $retainedKey", ({ retainedKey, missingKey, status, resolvedAt }) => {
+		setWindowState({ focused: false, visible: true });
+		const qc = queryClient();
+		const stop = createNotificationsTransport(qc).connect();
+		const source = EventSourceStub.instances[0];
+		const saved = notification({ status, resolvedAt });
+		const unreadCount = status === "unread" ? 1 : 0;
+		const unresolvedCount = resolvedAt ? 0 : 1;
+		qc.setQueryData<NotificationsCache>(retainedKey, {
+			pageParams: [""], pages: [{ notifications: [saved], unreadCount, unresolvedCount }],
+		});
+		// Exercise both a never-loaded cache and one removed by GC/eviction.
+		for (let replay = 0; replay < 2; replay++) {
+			source.dispatch("notification_created", notification());
+			const recent = getCachedNotifications(qc.getQueryData<NotificationsCache>(recentNotificationsQueryKey));
+			expect(recent).toEqual([saved]);
+			for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+				const cache = qc.getQueryData<NotificationsCache>(key);
+				expect(getCachedUnreadCount(cache)).toBe(unreadCount);
+				if (cache) expect(cache.pages[0].unresolvedCount).toBe(unresolvedCount);
+			}
+			qc.removeQueries({ queryKey: missingKey, exact: true });
+		}
+		expect(showNotificationMock).not.toHaveBeenCalled();
+		stop();
+	});
+
+	it("preserves resolved-but-unseen state when recent history is absent during stale create replay", () => {
+		const qc = queryClient();
+		const stop = createNotificationsTransport(qc).connect();
+		const saved = notification({ resolvedAt: "2026-06-16T11:00:00Z" });
+		qc.setQueryData<NotificationsCache>(unreadNotificationsQueryKey, {
+			pageParams: [""], pages: [{ notifications: [saved], unreadCount: 101, unresolvedCount: 100 }],
+		});
+		EventSourceStub.instances[0].dispatch("notification_created", notification());
+		expect(getCachedNotifications(qc.getQueryData<NotificationsCache>(recentNotificationsQueryKey))).toEqual([saved]);
+		expect(qc.getQueryData<NotificationsCache>(unreadNotificationsQueryKey)!.pages[0].unresolvedCount).toBe(100);
+		expect(showNotificationMock).not.toHaveBeenCalled();
+		stop();
+	});
+
+	it("coalesces by project across reconnect/replay, retaining every worker and distinct alert", () => {
+		setWindowState({ focused: false, visible: true });
+		const qc = queryClient();
+		const stop = createNotificationsTransport(qc).connect();
+		const first = EventSourceStub.instances[0];
+		const attention = notification({ type: "orchestration_attention" });
+		first.dispatch("notification_created", attention);
+		first.dispatch("notification_created", { ...attention, id: "worker-2", sessionId: "mer-2" });
+		getApiBaseUrlMock.mockReturnValue("http://127.0.0.1:4555");
+		(subscribeApiBaseUrlMock.mock.calls[0][0] as () => void)();
+		const source = EventSourceStub.instances[1];
+		source.dispatch("notification_created", attention);
+		source.dispatch("notification_created", { ...attention, id: "worker-3", sessionId: "mer-3" });
+		expect(showNotificationMock).toHaveBeenCalledTimes(1);
+		source.dispatch("notification_created", { ...attention, id: "other-project", projectId: "other" });
+		for (const type of ["needs_input", "ready_to_merge", "pr_merged", "pr_closed_unmerged"] as const) {
+			source.dispatch("notification_created", notification({ id: type, type }));
+		}
+		expect(showNotificationMock).toHaveBeenCalledTimes(6);
+		for (const key of [unreadNotificationsQueryKey, recentNotificationsQueryKey]) {
+			const cache = qc.getQueryData<NotificationsCache>(key);
+			expect(getCachedNotifications(cache)).toHaveLength(8);
+			expect(getCachedUnreadCount(cache)).toBe(8);
+			expect(cache?.pages[0].unresolvedCount).toBe(6);
+		}
+		stop();
+	});
+
+	it("does not let read/resolved replay restore a toast or undo acknowledgement", () => {
+		setWindowState({ focused: false, visible: true });
+		const qc = queryClient();
+		const stop = createNotificationsTransport(qc).connect();
+		const source = EventSourceStub.instances[0];
+		const attention = notification({ type: "orchestration_attention" });
+		source.dispatch("notification_created", attention);
+		markAllCachedNotificationsRead(qc, []);
+		source.dispatch("notification_created", attention);
+		source.dispatch("notification_resolved", { ...attention, resolvedAt: "2026-06-16T11:00:00Z" });
+		source.dispatch("notification_resolved", { ...attention, resolvedAt: "2026-06-16T11:00:00Z" });
+		source.dispatch("notification_created", attention);
+		expect(showNotificationMock).toHaveBeenCalledTimes(1);
+		expect(getCachedUnreadCount(qc.getQueryData<NotificationsCache>(unreadNotificationsQueryKey))).toBe(0);
+		expect(qc.getQueryData<NotificationsCache>(unreadNotificationsQueryKey)?.pages[0].unresolvedCount).toBe(0);
+		const cache = qc.getQueryData<NotificationsCache>(recentNotificationsQueryKey);
+		expect(getCachedNotifications(cache)).toEqual([expect.objectContaining({ status: "read", resolvedAt: "2026-06-16T11:00:00Z" })]);
+		expect(cache?.pages[0].unresolvedCount).toBe(0);
+		stop();
+	});
+
+	it("restores unseen resolution events without offering desktop toasts", () => {
+		const qc = queryClient();
+		const stop = createNotificationsTransport(qc).connect();
+		EventSourceStub.instances[0].dispatch("notification_resolved", notification({
+			type: "orchestration_attention", resolvedAt: "2026-06-16T11:00:00Z",
+		}));
+		expect(getCachedUnreadCount(qc.getQueryData<NotificationsCache>(unreadNotificationsQueryKey))).toBe(1);
+		expect(showNotificationMock).not.toHaveBeenCalled();
+		stop();
+	});
+
+	it("preserves the first background warning and permits expiry or clock rollback", () => {
+		const clock = vi.spyOn(Date, "now").mockReturnValue(100_000_000);
+		setWindowState({ focused: true, visible: true });
+		const stop = createNotificationsTransport(queryClient()).connect();
+		const source = EventSourceStub.instances[0];
+		const send = (id: string) => source.dispatch("notification_created", notification({ id, type: "orchestration_attention" }));
+		send("focused");
+		expect(showNotificationMock).not.toHaveBeenCalled();
+		setWindowState({ focused: false, visible: true });
+		send("first-background");
+		send("repeated");
+		expect(showNotificationMock).toHaveBeenCalledTimes(1);
+		clock.mockReturnValue(100_000_000 + 6 * 60 * 60 * 1000);
+		send("expired");
+		expect(showNotificationMock).toHaveBeenCalledTimes(2);
+		clock.mockReturnValue(99_000_000);
+		send("clock-rollback");
+		expect(showNotificationMock).toHaveBeenCalledTimes(3);
+		stop();
+	});
+
+	it("does not group unknown projects or drop future notification types during version skew", () => {
+		setWindowState({ focused: false, visible: true });
+		const stop = createNotificationsTransport(queryClient()).connect();
+		for (const [id, type, projectId] of [
+			["missing-1", "orchestration_attention", undefined],
+			["missing-2", "orchestration_attention", ""],
+			["future", "future_type", "mer"],
+		] as const) {
+			// Model a version-skewed wire payload without widening the DTO fixture.
+			EventSourceStub.instances[0].dispatch("notification_created", { ...notification({ id, projectId }), type });
+		}
+		expect(showNotificationMock).toHaveBeenCalledTimes(3);
+		stop();
+	});
+
 	it("opens the notification stream and invalidates unread notifications on open", () => {
 		const qc = queryClient();
 		const invalidateSpy = vi.spyOn(qc, "invalidateQueries");
