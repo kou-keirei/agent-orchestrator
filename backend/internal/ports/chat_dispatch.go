@@ -9,7 +9,8 @@ type ChatDispatchConformanceStatus string
 
 const (
 	// ChatDispatchConformanceVerified means native dispatch evidence matches the request.
-	ChatDispatchConformanceVerified       ChatDispatchConformanceStatus = "VERIFIED"
+	ChatDispatchConformanceVerified ChatDispatchConformanceStatus = "VERIFIED"
+	// ChatDispatchConfigMismatch indicates dispatch configuration differs from the requested values.
 	ChatDispatchConfigMismatch            ChatDispatchConformanceStatus = "DISPATCH_CONFIG_MISMATCH"
 	ChatDispatchEvidenceMissing           ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
 	ChatDispatchEvidenceStale             ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_STALE"
@@ -27,7 +28,8 @@ type ChatDispatchEvidenceProvenance string
 
 const (
 	// ChatDispatchProvenanceAORequested identifies values requested through AO.
-	ChatDispatchProvenanceAORequested               ChatDispatchEvidenceProvenance = "ao.requested"
+	ChatDispatchProvenanceAORequested ChatDispatchEvidenceProvenance = "ao.requested"
+	// ChatDispatchProvenanceAOConfigured identifies values obtained from AO configuration.
 	ChatDispatchProvenanceAOConfigured              ChatDispatchEvidenceProvenance = "ao.configured"
 	ChatDispatchProvenanceAODispatched              ChatDispatchEvidenceProvenance = "ao.dispatched"
 	ChatDispatchProvenanceCodexThreadStartResponse  ChatDispatchEvidenceProvenance = "codex.thread/start.response"
@@ -70,7 +72,8 @@ type ChatDispatchVariantObservation struct {
 
 const (
 	// ChatDispatchVariantNone records that no dispatch variant was selected.
-	ChatDispatchVariantNone     = "none"
+	ChatDispatchVariantNone = "none"
+	// ChatDispatchNotApplicable indicates a dispatch metadata value does not apply.
 	ChatDispatchNotApplicable   = "not-applicable"
 	ChatDispatchVariantMetadata = "ao.dispatch-metadata"
 )

@@ -20,7 +20,8 @@ type OrchestrationDeliveryState string
 
 const (
 	// OrchestrationPending marks an event waiting for delivery.
-	OrchestrationPending      OrchestrationDeliveryState = "pending"
+	OrchestrationPending OrchestrationDeliveryState = "pending"
+	// OrchestrationLeased marks an event leased temporarily for delivery.
 	OrchestrationLeased       OrchestrationDeliveryState = "leased"
 	OrchestrationSubmitted    OrchestrationDeliveryState = "submitted"
 	OrchestrationAcknowledged OrchestrationDeliveryState = "acknowledged"
