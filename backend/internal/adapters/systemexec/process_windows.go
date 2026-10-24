@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,10 +24,93 @@ import (
 
 func init() {
 	capabilityCommandOutput = windowsCapabilityCommandOutput
+	commandRun = windowsCommandRun
+}
+
+// windowsCommandRun admits only the non-interactive CommandRunner boundary.
+// Parent deadlines are preserved up to a 30-second command ceiling; output is
+// limited to 256 KiB per stream to bound caller-owned capture buffers. As with
+// exec.Cmd, supplied writers must return from Write; arbitrary blocked writer
+// implementations cannot be canceled by closing the command's pipe handles.
+func windowsCommandRun(parent context.Context, argv []string, stdout, stderr io.Writer) error {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	out, outWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	defer outWriter.Close()
+	diagnostic, errWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer diagnostic.Close()
+	defer errWriter.Close()
+	// Serialize both streams, including when the caller supplies one shared
+	// bytes.Buffer or another writer that is not safe for concurrent writes.
+	var outputMu sync.Mutex
+	copyStream := func(reader *os.File, writer io.Writer) <-chan error {
+		done := make(chan error, 1)
+		if writer == nil {
+			writer = io.Discard
+		}
+		go func() {
+			buffer := make([]byte, 32<<10)
+			total := 0
+			for {
+				n, readErr := reader.Read(buffer)
+				if n > 0 {
+					total += n
+					if total > 256<<10 {
+						cancel()
+						done <- errors.New("Windows command output exceeds 256 KiB stream limit")
+						return
+					}
+					outputMu.Lock()
+					written, writeErr := writer.Write(buffer[:n])
+					outputMu.Unlock()
+					if writeErr == nil && written != n {
+						writeErr = io.ErrShortWrite
+					}
+					if writeErr != nil {
+						cancel()
+						done <- writeErr
+						return
+					}
+				}
+				if readErr != nil {
+					if errors.Is(readErr, io.EOF) {
+						readErr = nil
+					}
+					done <- readErr
+					return
+				}
+			}
+		}()
+		return done
+	}
+	outDone, errDone := copyStream(out, stdout), copyStream(diagnostic, stderr)
+	err = aoprocess.RunWindowsCommandFiles(ctx, aoprocess.WindowsCommandBudget{
+		MaxProcesses: 4, CommitBytes: 512 << 20,
+	}, nil, outWriter, errWriter, argv[0], argv[1:]...)
+	outWriter.Close()
+	errWriter.Close()
+	// Job teardown closes inherited writers even when the root exits first.
+	// Retain exec.Cmd's finite pipe-drain allowance for handles retained outside
+	// the supported subtree. This does not attest to provider-internal tools.
+	timer := time.AfterFunc(5*time.Second, func() {
+		out.Close()
+		diagnostic.Close()
+	})
+	outErr, diagnosticErr := <-outDone, <-errDone
+	timer.Stop()
+	return errors.Join(err, outErr, diagnosticErr)
 }
 
 // Only the fixed, non-interactive Settings capability probes use this budget.
-// Installers, Adapter.Run and provider-internal tools are not covered here.
+// Installers and provider-internal tools are not covered here. Adapter.Run has
+// its own streaming admission path above.
 func windowsCapabilityCommandOutput(parent context.Context, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()

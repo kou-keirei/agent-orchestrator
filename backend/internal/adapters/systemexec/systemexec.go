@@ -186,6 +186,18 @@ func pathWritable(ctx context.Context, path string) (bool, error) {
 
 // Run executes argv with ctx and connects its output to the supplied writers.
 func (Adapter) Run(ctx context.Context, argv []string, stdout, stderr io.Writer) error {
+	if len(argv) == 0 || argv[0] == "" {
+		return errors.New("systemexec: command argv is empty")
+	}
+	return commandRun(ctx, argv, stdout, stderr)
+}
+
+// Windows selects its Job-admitted runner at package initialization. This
+// boundary has no terminal input or PTY; interactive/provider launches use
+// different adapters and are not covered by this policy.
+var commandRun = defaultCommandRun
+
+func defaultCommandRun(ctx context.Context, argv []string, stdout, stderr io.Writer) error {
 	cmd, err := commandContext(ctx, argv[0], argv[1:]...)
 	if err != nil {
 		return err

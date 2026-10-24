@@ -77,8 +77,9 @@ func TestWindowsCapabilityProbeCapture(t *testing.T) {
 
 func TestWindowsCapabilityProbeOutputLimit(t *testing.T) {
 	shim := filepath.Join(t.TempDir(), "finite output.cmd")
-	// Fixed 10,000 built-in echo operations; no subprocess or recursive fixture.
-	script := "@echo off\r\nfor /L %%i in (1,1,10000) do @echo 012345678901234567890123456789012345678901234567890123456789012345\r\n"
+	// Fixed 300 built-in echo operations; exceed the same byte fence without
+	// making the negative test depend on thousands of interpreter iterations.
+	script := "@echo off\r\nfor /L %%i in (1,1,300) do @echo " + strings.Repeat("x", 1024) + "\r\n"
 	if err := os.WriteFile(shim, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
