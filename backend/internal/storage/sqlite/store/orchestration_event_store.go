@@ -112,7 +112,14 @@ func (s *Store) InitializeOrchestrationDispatchHold(ctx context.Context, project
 			var held int
 			err = db.QueryRowContext(ctx, `SELECT held FROM project_dispatch_hold WHERE project_id=?`, project).Scan(&held)
 			if err == sql.ErrNoRows && inserted == 0 {
-				// A fresh install may not have registered this project yet.
+				var exists bool
+				if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)`, project).Scan(&exists); err != nil {
+					return err
+				}
+				if exists {
+					return fmt.Errorf("dispatch hold missing after initialization for existing project %q", project)
+				}
+				// Only a genuinely unregistered project is a safe no-op.
 				return nil
 			}
 			if err != nil {

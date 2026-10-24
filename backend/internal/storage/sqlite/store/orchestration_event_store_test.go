@@ -1436,3 +1436,89 @@ func TestDispatchHoldSyntheticUpgradeBeforeRecovery(t *testing.T) {
 		})
 	}
 }
+
+func TestDispatchHoldInitializationRejectsIgnoredInsertForExistingProject(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dir)
+	const target = "execution-control-plane"
+	seedDispatchHoldProject(t, s, target)
+	seedDispatchHoldProject(t, s, "other")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ao.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE orchestration_events SET attempt_count=3,attention_required_at=CURRENT_TIMESTAMP,last_error='preserve retry' WHERE project_id=?`, target); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.ListOrchestrationEvents(ctx, target, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ignore = `CREATE TRIGGER ignore_initial_hold BEFORE INSERT ON project_dispatch_hold WHEN NEW.project_id='execution-control-plane' BEGIN SELECT RAISE(IGNORE); END`
+	if _, err := db.Exec(ignore); err != nil {
+		t.Fatal(err)
+	}
+	// Startup must receive an error before it can invoke recovery.
+	if err := s.InitializeOrchestrationDispatchHold(ctx, target); err == nil {
+		t.Fatal("ignored insert admitted existing project without a hold")
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM project_dispatch_hold WHERE project_id=?`, target).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("unexpected hold after ignored insert: %d %v", n, err)
+	}
+	after, err := s.ListOrchestrationEvents(ctx, target, 10)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed initialization changed backlog: %+v %v", after, err)
+	}
+	if err := s.InitializeOrchestrationDispatchHold(ctx, "missing"); err != nil {
+		t.Fatalf("absent project: %v", err)
+	}
+	if _, err := s.OrchestrationDispatchHeld(ctx, "missing"); err == nil {
+		t.Fatal("absent project was invented")
+	}
+	tr := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+	d := &orchestrationevents.Dispatcher{Store: s, Transport: tr}
+	if err := d.DispatchProject(ctx, "other"); err != nil || len(tr.batches) != 1 {
+		t.Fatalf("other project affected: sends=%d err=%v", len(tr.batches), err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER ignore_initial_hold`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InitializeOrchestrationDispatchHold(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	held, outstanding, err := s.ReadOrchestrationDispatchHold(ctx, target)
+	if err != nil || !held || outstanding != 0 {
+		t.Fatalf("retry readback: held=%v outstanding=%d err=%v", held, outstanding, err)
+	}
+	if err := d.DispatchProject(ctx, target); !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+		t.Fatalf("held dispatch: %v", err)
+	}
+	if len(tr.batches) != 1 {
+		t.Fatal("target submitted after hold")
+	}
+	// A skipped insert must still accept an already-persisted operator override.
+	for _, want := range []bool{true, false} {
+		if err := s.SetOrchestrationDispatchHold(ctx, target, want); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(ignore); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.InitializeOrchestrationDispatchHold(ctx, target); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.OrchestrationDispatchHeld(ctx, target); err != nil || got != want {
+			t.Fatalf("operator override changed: got=%v want=%v err=%v", got, want, err)
+		}
+		if _, err := db.Exec(`DROP TRIGGER ignore_initial_hold`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err = s.ListOrchestrationEvents(ctx, target, 10)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("initialization changed backlog: %+v %v", after, err)
+	}
+}
