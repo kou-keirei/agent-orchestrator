@@ -22,6 +22,10 @@ describe("shouldToast", () => {
 		expect(shouldToast({}, true)).toBe(false);
 		expect(shouldToast({ title: "needs input" }, false)).toBe(false);
 	});
+
+	it("accepts title-only toast requests without requiring grouping IPC fields", () => {
+		expect(shouldToast({ title: "Future notification" }, true)).toBe(true);
+	});
 });
 
 describe("shouldSignalAttention", () => {

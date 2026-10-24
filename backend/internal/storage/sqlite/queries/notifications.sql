@@ -23,7 +23,7 @@ LIMIT sqlc.arg(page_limit);
 SELECT *
 FROM notifications
 WHERE resolved_at IS NULL
-  AND type IN ('needs_input', 'ready_to_merge')
+  AND type IN ('needs_input', 'ready_to_merge', 'orchestration_attention')
   AND (
     CAST(sqlc.arg(before_id) AS TEXT) = ''
     OR created_at < sqlc.arg(before_created_at)
@@ -52,7 +52,7 @@ WHERE status = 'unread';
 SELECT COUNT(*)
 FROM notifications
 WHERE resolved_at IS NULL
-  AND type IN ('needs_input', 'ready_to_merge');
+  AND type IN ('needs_input', 'ready_to_merge', 'orchestration_attention');
 
 -- name: MarkNotificationRead :one
 UPDATE notifications

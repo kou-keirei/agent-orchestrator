@@ -14,6 +14,8 @@ export const recentNotificationsQueryKey = ["notifications", "history", "all"] a
 export const NOTIFICATION_PAGE_SIZE = 100;
 
 const EVENTSOURCE_CLOSED = 2;
+// Keep every worker's record, but interrupt the desktop once per project/window.
+const ORCHESTRATION_ATTENTION_TOAST_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 /**
  * These kinds describe something still waiting on the user or operator.
@@ -49,7 +51,9 @@ export async function fetchNotificationsPage(status: NotificationListStatus, cur
 		notifications,
 		nextCursor: data?.nextCursor,
 		unreadCount: data?.unreadCount ?? notifications.filter((item) => item.status === "unread").length,
-		unresolvedCount: data?.unresolvedCount ?? notifications.filter(isUnresolved).length,
+		// Loaded actionable rows are a lower bound even with an older daemon
+		// whose count query did not include orchestration attention.
+		unresolvedCount: Math.max(data?.unresolvedCount ?? 0, notifications.filter(isUnresolved).length),
 	};
 }
 
@@ -69,14 +73,27 @@ export async function markAllNotificationsRead(ids: string[]): Promise<number> {
 }
 
 export function mergeUnreadNotification(queryClient: QueryClient, notification: NotificationDTO): boolean {
-	if (notification.status !== "unread") return false;
+	notification = preserveKnownState(notification, findCachedNotification(queryClient, notification.id));
+	if (notification.status !== "unread") {
+		const existing = getCachedNotifications(queryClient.getQueryData<NotificationsCache>(unreadNotificationsQueryKey)).some(
+			(item) => item.id === notification.id,
+		);
+		if (existing) mergeNotificationIntoCache(queryClient, unreadNotificationsQueryKey, notification);
+		return false;
+	}
 	const inserted = mergeNotificationIntoCache(queryClient, unreadNotificationsQueryKey, notification);
 	rebaseOversizedFirstPage(queryClient, unreadNotificationsQueryKey);
 	return inserted;
 }
 
-function mergeRecentNotification(queryClient: QueryClient, notification: NotificationDTO): boolean {
-	const inserted = mergeNotificationIntoCache(queryClient, recentNotificationsQueryKey, notification);
+function mergeRecentNotification(
+	queryClient: QueryClient,
+	notification: NotificationDTO,
+	previous: NotificationDTO | undefined,
+): boolean {
+	const inserted = mergeNotificationIntoCache(queryClient, recentNotificationsQueryKey, notification, {
+		notification: previous,
+	});
 	rebaseOversizedFirstPage(queryClient, recentNotificationsQueryKey);
 	return inserted;
 }
@@ -86,26 +103,77 @@ function mergeRecentNotification(queryClient: QueryClient, notification: Notific
  * caches; the seen state is a separate axis and is deliberately left untouched.
  */
 export function applyResolvedNotification(queryClient: QueryClient, notification: NotificationDTO): void {
+	const known = findCachedNotification(queryClient, notification.id);
+	notification = preserveKnownState(notification, known);
+	// API counters cover unloaded pages too. An unknown row is not evidence
+	// of an unread increment or of a resolution not already counted by AO.
 	for (const queryKey of [unreadNotificationsQueryKey, recentNotificationsQueryKey] as const) {
 		queryClient.setQueryData<NotificationsCache>(queryKey, (current) => {
-			if (!current) return current;
-			return {
-				...current,
-				pages: current.pages.map((page) => ({
-					...page,
-					notifications: page.notifications.map((item) => (item.id === notification.id ? notification : item)),
-					unresolvedCount: Math.max(0, page.unresolvedCount - 1),
-				})),
-			};
+			const include = queryKey === recentNotificationsQueryKey || notification.status === "unread";
+			if (!current || current.pages.length === 0) {
+				if (!include) return current;
+				// No authoritative snapshot exists yet; retain the unseen row as
+				// a local lower bound until the requested refetch completes.
+				return {
+					pageParams: [""],
+					pages: [{
+						notifications: [notification],
+						unreadCount: Number(notification.status === "unread"),
+						unresolvedCount: Number(isUnresolved(notification)),
+					}],
+				};
+			}
+			const existing = getCachedNotifications(current).find((item) => item.id === notification.id);
+			const previous = existing ?? known;
+			const unreadDelta = previous ? Number(notification.status === "unread") - Number(previous.status === "unread") : 0;
+			const unresolvedDelta = previous ? Number(isUnresolved(notification)) - Number(isUnresolved(previous)) : 0;
+			const pages = current.pages.map((page) => ({
+				...page,
+				notifications: page.notifications.map((item) => (item.id === notification.id ? notification : item)),
+				unreadCount: Math.max(0, page.unreadCount + unreadDelta),
+				unresolvedCount: Math.max(0, page.unresolvedCount + unresolvedDelta),
+			}));
+			if (!existing && include) {
+				pages[0] = { ...pages[0], notifications: sortNotifications([notification, ...pages[0].notifications]) };
+			}
+			return { ...current, pages };
 		});
+		rebaseOversizedFirstPage(queryClient, queryKey);
+		void queryClient.invalidateQueries({ queryKey });
 	}
+}
+
+// Either cache may outlive the other. Read and resolved are monotone facts for
+// a notification ID, so a stale payload cannot undo them during reconstruction.
+function findCachedNotification(queryClient: QueryClient, id: string): NotificationDTO | undefined {
+	let known: NotificationDTO | undefined;
+	for (const queryKey of [unreadNotificationsQueryKey, recentNotificationsQueryKey] as const) {
+		const row = getCachedNotifications(queryClient.getQueryData<NotificationsCache>(queryKey)).find(
+			(item) => item.id === id,
+		);
+		if (row) known = preserveKnownState(row, known);
+	}
+	return known;
+}
+
+function preserveKnownState(notification: NotificationDTO, known: NotificationDTO | undefined): NotificationDTO {
+	return {
+		...notification,
+		status: known?.status === "read" ? "read" : notification.status,
+		resolvedAt: known?.resolvedAt || notification.resolvedAt,
+	};
 }
 
 function mergeNotificationIntoCache(
 	queryClient: QueryClient,
 	queryKey: NotificationsQueryKey,
 	notification: NotificationDTO,
+	beforeEvent?: { notification: NotificationDTO | undefined },
 ): boolean {
+	// Both merges for one event must use the state captured before either
+	// cache changed, so the second cache still counts genuinely new creates.
+	const known = beforeEvent ? beforeEvent.notification : findCachedNotification(queryClient, notification.id);
+	notification = preserveKnownState(notification, known);
 	let inserted = false;
 	queryClient.setQueryData<NotificationsCache>(queryKey, (current) => {
 		if (!current || current.pages.length === 0) {
@@ -123,9 +191,10 @@ function mergeNotificationIntoCache(
 		}
 
 		const existing = getCachedNotifications(current).find((item) => item.id === notification.id);
-		const unreadDelta = (notification.status === "unread" ? 1 : 0) - (existing?.status === "unread" ? 1 : 0);
+		const previous = existing ?? known;
+		const unreadDelta = (notification.status === "unread" ? 1 : 0) - (previous?.status === "unread" ? 1 : 0);
 		const unresolvedDelta =
-			(isUnresolved(notification) ? 1 : 0) - (existing && isUnresolved(existing) ? 1 : 0);
+			(isUnresolved(notification) ? 1 : 0) - (previous && isUnresolved(previous) ? 1 : 0);
 		const pages = current.pages.map((page) => ({
 			...page,
 			notifications: page.notifications.map((item) => (item.id === notification.id ? notification : item)),
@@ -285,6 +354,21 @@ export function createNotificationsTransport(
 	/** The session whose agent terminal is currently on screen, if any. */
 	getVisibleAgentSessionId: () => string | undefined = () => undefined,
 ) {
+	// Presentation-only state survives stream reconnects on this transport.
+	// Keep the existing main-process IPC contract; no grouping fields are needed.
+	const lastAttentionToastByProject = new Map<string, number>();
+	const shouldOfferDesktopToast = (notification: NotificationDTO): boolean => {
+		if (notification.type !== "orchestration_attention") return true;
+		const projectId = notification.projectId;
+		if (!projectId?.trim()) return true; // No safe project grouping key.
+		if (!notification.title || (document.visibilityState === "visible" && document.hasFocus())) return false;
+		const now = Date.now();
+		const last = lastAttentionToastByProject.get(projectId);
+		if (last !== undefined && now >= last && now - last < ORCHESTRATION_ATTENTION_TOAST_COOLDOWN_MS) return false;
+		lastAttentionToastByProject.set(projectId, now);
+		return true;
+	};
+
 	return {
 		connect() {
 			let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -329,11 +413,17 @@ export function createNotificationsTransport(
 						if (source?.readyState === EVENTSOURCE_CLOSED) scheduleRetry();
 					};
 					source.addEventListener("notification_created", (event) => {
-						const notification = parseNotificationEvent(event);
-						if (!notification) return;
+						const parsed = parseNotificationEvent(event);
+						if (!parsed) return;
+						const known = findCachedNotification(queryClient, parsed.id);
+						const notification = preserveKnownState(parsed, known);
 						const inserted = mergeUnreadNotification(queryClient, notification);
-						mergeRecentNotification(queryClient, notification);
-						if (inserted && !suppressToastForWatchedSession(notification, getVisibleAgentSessionId())) {
+						mergeRecentNotification(queryClient, notification, known);
+						if (
+							inserted && !known && !notification.resolvedAt
+							&& !suppressToastForWatchedSession(notification, getVisibleAgentSessionId())
+							&& shouldOfferDesktopToast(notification)
+						) {
 							void aoBridge.notifications.show({
 								id: notification.id,
 								title: notification.title,
