@@ -28,6 +28,23 @@ import (
 
 var ctx = context.Background()
 
+// Match the daemon launcher's optional ordered-admission capability. The fake
+// has no restore work; tests needing it supply a before-admission hook instead.
+func (l *recordingLauncher) RelayChatTurnWithAdmission(
+	ctx context.Context, id domain.SessionID, text, clientMessageID string,
+	admit func() (func(), error),
+) (string, error) {
+	release, err := admit()
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	if clientMessageID != "" {
+		return l.RelayChatTurnWithID(ctx, id, text, clientMessageID)
+	}
+	return l.RelayChatTurn(ctx, id, text)
+}
+
 func TestEffectiveAgentConfigGuardsRoleEffortByHarness(t *testing.T) {
 	cfg := domain.ProjectConfig{
 		AgentConfig: domain.AgentConfig{Effort: "medium"},

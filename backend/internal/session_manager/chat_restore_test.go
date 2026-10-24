@@ -109,7 +109,62 @@ func lazyChatFixture(t *testing.T) (*Manager, *chatsvc.Service, *sqlite.Store, *
 		LookPath: func(string) (string, error) { return "/bin/true", nil }, Logger: slog.New(slog.DiscardHandler),
 	})
 	svc.SetControllerRestorer(manager.EnsureChatController)
+	svc.SetSessionInputAdmission(manager.AcquireSessionInput)
 	return manager, svc, st, driver, rec
+}
+
+// Exercise the real manager/service restore and admission chain, including the
+// direct HTTP-facing service path. No provider process is launched.
+func TestW168ColdPlainAndDirectSendAdmission(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		t.Run(fmt.Sprintf("direct=%v", direct), func(t *testing.T) {
+			m, svc, st, driver, rec := lazyChatFixture(t)
+			driver.entered = make(chan struct{}, 1)
+			driver.release = make(chan struct{})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				if direct {
+					_, err := svc.Send(ctx, rec.ID, ports.ChatUserMessage{Text: "direct", ClientMessageID: "w168-direct"})
+					done <- err
+				} else {
+					done <- m.Send(ctx, rec.ID, "plain", nil)
+				}
+			}()
+			select {
+			case <-driver.entered:
+			case <-ctx.Done():
+				t.Fatal("restore did not begin: ", ctx.Err())
+			}
+			m.agentOpMu.Lock()
+			leases := m.inputLeases[rec.ID]
+			m.agentOpMu.Unlock()
+			close(driver.release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if leases != 0 || driver.resumes.Load() != 1 {
+				t.Fatalf("restore held input leases=%d, resumes=%d", leases, driver.resumes.Load())
+			}
+			if err := m.beginAgentOperation(ctx, rec.ID, agentOperationReconcile); err != nil {
+				t.Fatal("send leaked lease: ", err)
+			}
+			defer m.endAgentOperation(rec.ID, agentOperationReconcile)
+			_, err := svc.Send(ctx, rec.ID, ports.ChatUserMessage{Text: "refused", ClientMessageID: "w168-refused"})
+			if !errors.Is(err, chatsvc.ErrControllerHandoff) {
+				t.Fatalf("exclusive operation did not refuse direct send: %v", err)
+			}
+			conv, err := st.ConversationForSession(ctx, rec.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows, err := st.LoadConversationSnapshot(ctx, conv.ID)
+			if err != nil || len(rows.Messages) != 1 {
+				t.Fatalf("refusal changed durable input: messages=%d err=%v", len(rows.Messages), err)
+			}
+		})
+	}
 }
 
 func TestStartupIdleChatSessionsStayCold(t *testing.T) {
