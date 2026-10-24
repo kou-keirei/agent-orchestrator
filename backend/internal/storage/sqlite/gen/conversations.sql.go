@@ -947,8 +947,12 @@ func (q *Queries) InsertConversationMessage(ctx context.Context, arg InsertConve
 
 const insertConversationProviderEvent = `-- name: InsertConversationProviderEvent :execrows
 INSERT OR IGNORE INTO conversation_provider_events (
-    conversation_id, session_id, provider_event_id, method, payload_json, received_at
-) VALUES (?, ?, ?, ?, ?, ?)
+    conversation_id, session_id, provider_event_id, method, payload_json, received_at, branch_id
+) VALUES (
+    ?1, ?2, ?3,
+    ?4, ?5, ?6,
+    COALESCE((SELECT active_branch_id FROM conversations WHERE id = ?1), '')
+)
 `
 
 type InsertConversationProviderEventParams struct {
