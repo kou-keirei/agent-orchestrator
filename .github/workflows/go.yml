@@ -23,7 +23,7 @@ jobs:
   # Preserve the existing required check as the gate for every backend test.
   build-test:
     needs: [backend-checks, sqlite-race]
-    if: ${{ !cancelled() }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Require backend checks and every SQLite race shard
