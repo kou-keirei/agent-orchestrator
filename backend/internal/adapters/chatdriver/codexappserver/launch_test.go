@@ -25,7 +25,7 @@ func TestLaunchContractMergesEnvironmentAndInvalidatesIdentity(t *testing.T) {
 		t.Fatalf("CODEX_HOME = %q", got)
 	}
 
-	changedPath, err := contract.withEnvironment(context.Background(), map[string]string{"PATH": `C:\other\bin`})
+	changedPath, err := contract.withEnvironment(context.Background(), map[string]string{"PATH": `C:\alternate\bin`})
 	if err != nil {
 		t.Fatalf("withEnvironment: %v", err)
 	}
@@ -35,7 +35,7 @@ func TestLaunchContractMergesEnvironmentAndInvalidatesIdentity(t *testing.T) {
 
 	changedHome, err := contract.withEnvironment(context.Background(), map[string]string{
 		"PATH":       `C:\workspace\node_modules\.bin;C:\Windows\System32`,
-		"CODEX_HOME": `C:\other\codex-home`,
+		"CODEX_HOME": `C:\alternate\codex-home`,
 	})
 	if err != nil {
 		t.Fatalf("withEnvironment with changed Codex home: %v", err)

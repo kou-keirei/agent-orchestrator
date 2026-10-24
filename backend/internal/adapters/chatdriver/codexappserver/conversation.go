@@ -310,23 +310,6 @@ func (c *conversation) setNativeEvidence(requested ports.PermissionMode, approva
 	c.mu.Unlock()
 }
 
-// invalidateNativeEvidence clears the last provider-confirmed effective posture
-// when a turn supplies a new approval/sandbox policy. The turn/start response
-// carries only the turn id, so retaining thread-start evidence would claim the
-// old posture was still effective for the new turn.
-func (c *conversation) invalidateNativeEvidence(requested ports.PermissionMode) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.preventiveReadOnly = false
-	c.nativeEvidence.ProviderTurnID = ""
-	c.nativeEvidence.RequestedPermission = string(requested)
-	c.nativeEvidence.EffectivePermission = "unknown"
-	c.nativeEvidence.ApprovalPolicy = "unknown"
-	c.nativeEvidence.TurnSandbox = "unknown"
-	c.nativeEvidence.PreventiveCapability = false
-	c.nativeEvidence.ProofStatus = "UNPROVEN"
-}
-
 // beginTurnNativeEvidence fences the previous turn before every new turn. A
 // successful fixed read-only turn may restore the posture, but a provider
 // error or an empty turn id must leave it unproven instead of reusing stale

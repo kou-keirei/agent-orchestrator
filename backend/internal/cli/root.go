@@ -184,6 +184,10 @@ func (d Deps) withDefaults() Deps {
 	return d
 }
 
+type commandContext struct {
+	deps Deps
+}
+
 func (c *commandContext) resolveCodexBinary(ctx context.Context) (string, error) {
 	if c.deps.ResolveCodexBinary != nil {
 		return c.deps.ResolveCodexBinary(ctx)
@@ -247,10 +251,6 @@ func NewRootCommand(deps Deps) *cobra.Command {
 	root.AddCommand(newVersionCommand())
 
 	return root
-}
-
-type commandContext struct {
-	deps Deps
 }
 
 func shouldEmitCLIInvocation(cmd *cobra.Command) bool {
