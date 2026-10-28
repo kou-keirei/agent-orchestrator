@@ -20,13 +20,32 @@ import (
 
 type lazyChatDriver struct {
 	integrationChatDriver
+	starts        atomic.Int64
 	resumes       atomic.Int64
 	entered       chan struct{}
 	release       chan struct{}
 	err           error
+	sendErr       error
 	mu            sync.Mutex
 	configs       []ports.ChatResumeConfig
 	conversations []*integrationChatConversation
+}
+
+func (d *lazyChatDriver) Start(context.Context, ports.ChatStartConfig) (ports.ChatConversation, error) {
+	d.starts.Add(1)
+	return nil, errors.New("cold fixture must resume its saved provider thread")
+}
+
+type uncertainColdConversation struct {
+	*integrationChatConversation
+	err error
+}
+
+func (c uncertainColdConversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) (ports.ChatTurnRef, error) {
+	// Model acceptance with a lost acknowledgement, rather than a definite
+	// rejection before provider delivery.
+	_, _ = c.integrationChatConversation.SendTurn(ctx, msg)
+	return ports.ChatTurnRef{}, c.err
 }
 
 type chatRestoreWaitContext struct {
@@ -62,10 +81,18 @@ func (d *lazyChatDriver) Resume(ctx context.Context, cfg ports.ChatResumeConfig)
 	d.mu.Lock()
 	d.conversations = append(d.conversations, conversation)
 	d.mu.Unlock()
+	if d.sendErr != nil {
+		return uncertainColdConversation{conversation, d.sendErr}, nil
+	}
 	return conversation, nil
 }
 
 func lazyChatFixture(t *testing.T) (*Manager, *chatsvc.Service, *sqlite.Store, *lazyChatDriver, domain.SessionRecord) {
+	t.Helper()
+	return lazyChatFixtureWithPermission(t, "")
+}
+
+func lazyChatFixtureWithPermission(t *testing.T, permission ports.PermissionMode) (*Manager, *chatsvc.Service, *sqlite.Store, *lazyChatDriver, domain.SessionRecord) {
 	t.Helper()
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -78,7 +105,7 @@ func lazyChatFixture(t *testing.T) (*Manager, *chatsvc.Service, *sqlite.Store, *
 	rec, err := st.CreateSession(ctx, domain.SessionRecord{
 		ProjectID: chatTestProject, Kind: domain.KindWorker, Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
 		Activity: domain.Activity{State: domain.ActivityIdle}, FirstSignalAt: time.Now(), CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		Metadata: domain.SessionMetadata{WorkspacePath: dataDir, Branch: "ao/lazy", ProviderConversationID: "saved-thread", ControllerGeneration: "old-generation"},
+		Metadata: domain.SessionMetadata{WorkspacePath: dataDir, Branch: "ao/lazy", ProviderConversationID: "saved-thread", ControllerGeneration: "old-generation", Permissions: permission},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -100,6 +127,13 @@ func lazyChatFixture(t *testing.T) (*Manager, *chatsvc.Service, *sqlite.Store, *
 		Reader: chatsvc.SnapshotReaderFunc(func(ctx context.Context, id string) (chatsvc.ConversationRows, error) {
 			rows, err := st.LoadConversationSnapshot(ctx, id)
 			return chatsvc.ConversationRows{Conversation: rows.Conversation, Turns: rows.Turns, Messages: rows.Messages, Activities: rows.Activities}, err
+		}),
+		PageReader: chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, id string, before, limit int64) (chatsvc.ConversationRows, error) {
+			rows, err := st.LoadConversationSnapshotPage(ctx, id, before, limit)
+			return chatsvc.ConversationRows{
+				Conversation: rows.Conversation, Turns: rows.Turns, Messages: rows.Messages, Activities: rows.Activities,
+				OldestSequence: rows.OldestSequence, HasMoreBefore: rows.HasMoreBefore,
+			}, err
 		}),
 	})
 	t.Cleanup(func() { svc.StopAll(context.Background()) })
@@ -161,6 +195,297 @@ func TestStartupIdleChatSessionsStayCold(t *testing.T) {
 	}
 	if driver.resumes.Load() != 0 || len(m.workspace.(*fakeWorkspace).restoreConfigs) != 0 {
 		t.Fatal("idle startup performed provider or workspace I/O")
+	}
+}
+
+func TestColdHistoryPaginationDoesNotWakeProvider(t *testing.T) {
+	m, svc, st, driver, rec := lazyChatFixture(t)
+	ctx := context.Background()
+	conversation, err := st.ConversationForSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		id := fmt.Sprintf("history-%d", i)
+		if _, err := st.AppendUserMessage(ctx, conversation.ID, rec.ID, rec.Metadata.ControllerGeneration,
+			domain.ConversationMessage{ID: id, Text: id, Origin: domain.MessageOriginHuman}, id+"-turn", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SettleTurnByID(ctx, id+"-turn", domain.TurnStateCompleted, "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	var before int64
+	for pageNumber := range 3 {
+		page, err := svc.SnapshotPage(ctx, rec.ID, before, 2)
+		wantCount := 2
+		if pageNumber == 2 {
+			wantCount = 1
+		}
+		if err != nil || page.SessionID != rec.ID || page.Controller != ports.ChatControllerCold || len(page.Messages) != wantCount {
+			t.Fatalf("page %d = %+v, err=%v", pageNumber, page, err)
+		}
+		if page.HasMoreBefore != (pageNumber < 2) || page.OldestSequence <= 0 || (before > 0 && page.OldestSequence >= before) {
+			t.Fatalf("page cursor did not advance: before=%d page=%+v", before, page)
+		}
+		for _, msg := range page.Messages {
+			if seen[msg.ID] || msg.Text != msg.ID {
+				t.Fatalf("repeated or changed history: %+v", msg)
+			}
+			seen[msg.ID] = true
+		}
+		for _, turn := range page.Turns {
+			if turn.State != domain.TurnStateCompleted {
+				t.Fatalf("history read changed completed turn: %+v", turn)
+			}
+		}
+		before = page.OldestSequence
+	}
+	current, found, err := st.GetSession(ctx, rec.ID)
+	if err != nil || !found || len(seen) != 5 || current.Metadata.ControllerGeneration != rec.Metadata.ControllerGeneration ||
+		driver.starts.Load() != 0 || driver.resumes.Load() != 0 || svc.HasLiveChatController(rec.ID) || m.SessionMutationInProgress(rec.ID) {
+		t.Fatalf("history warmed or changed cold session: current=%+v starts=%d resumes=%d err=%v", current, driver.starts.Load(), driver.resumes.Load(), err)
+	}
+}
+
+func TestColdConcurrentWakePreservesTargetAndNeighborIdentity(t *testing.T) {
+	m, svc, st, driver, target := lazyChatFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conversation, err := st.ConversationForSession(ctx, target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendUserMessage(ctx, conversation.ID, target.ID, target.Metadata.ControllerGeneration,
+		domain.ConversationMessage{ID: "target-history", Text: "completed before wake", Origin: domain.MessageOriginHuman}, "target-history-turn", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SettleTurnByID(ctx, "target-history-turn", domain.TurnStateCompleted, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	neighbor := target
+	neighbor.ID = ""
+	neighbor.Metadata.WorkspacePath = t.TempDir()
+	neighbor.Metadata.Branch = "ao/cold-neighbor"
+	neighbor.Metadata.ProviderConversationID = "neighbor-thread"
+	neighbor, err = st.CreateSession(ctx, neighbor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateConversation(ctx, "neighbor-conversation", domain.ConversationScopeSession, neighbor.ProjectID, neighbor.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	driver.entered = make(chan struct{}, 1)
+	driver.release = make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(driver.release) }) }
+	t.Cleanup(unblock)
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- m.EnsureChatController(ctx, target.ID) }()
+	select {
+	case <-driver.entered:
+	case <-ctx.Done():
+		t.Fatal("target restore did not enter provider")
+	}
+	waiterCtx := &chatRestoreWaitContext{Context: ctx, waiting: make(chan struct{})}
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- m.EnsureChatController(waiterCtx, target.ID) }()
+	select {
+	case <-waiterCtx.waiting:
+	case <-ctx.Done():
+		t.Fatal("concurrent wake did not join target restore")
+	}
+	unblock()
+	for _, done := range []<-chan error{ownerDone, waiterDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("shared restore did not finish")
+		}
+	}
+	if driver.starts.Load() != 0 || driver.resumes.Load() != 1 || len(driver.configs) != 1 {
+		t.Fatalf("provider launches: starts=%d resumes=%d configs=%+v", driver.starts.Load(), driver.resumes.Load(), driver.configs)
+	}
+	cfg := driver.configs[0]
+	current, found, err := st.GetSession(ctx, target.ID)
+	if err != nil || !found || current.ID != target.ID || current.Metadata.WorkspacePath != target.Metadata.WorkspacePath ||
+		current.Metadata.Branch != target.Metadata.Branch || current.Metadata.ProviderConversationID != target.Metadata.ProviderConversationID ||
+		cfg.SessionID != target.ID || cfg.WorkspacePath != target.Metadata.WorkspacePath || cfg.ProviderConversationID != target.Metadata.ProviderConversationID ||
+		cfg.ControllerGeneration == "" || cfg.ControllerGeneration == target.Metadata.ControllerGeneration ||
+		cfg.ControllerGeneration != current.Metadata.ControllerGeneration || cfg.RuntimeGeneration != cfg.ControllerGeneration || !svc.HasLiveChatController(target.ID) {
+		t.Fatalf("target continuity changed: target=%+v current=%+v config=%+v err=%v", target, current, cfg, err)
+	}
+	history, err := svc.SnapshotPage(ctx, target.ID, 0, 2)
+	if err != nil || history.Conversation.ID != conversation.ID || len(history.Messages) != 1 || len(history.Turns) != 1 ||
+		history.Messages[0].ID != "target-history" || history.Messages[0].Text != "completed before wake" || history.Turns[0].State != domain.TurnStateCompleted {
+		t.Fatalf("target lost saved history on wake: %+v err=%v", history, err)
+	}
+	current, found, err = st.GetSession(ctx, neighbor.ID)
+	page, pageErr := svc.SnapshotPage(ctx, neighbor.ID, 0, 2)
+	if err != nil || !found || pageErr != nil || current.Metadata.WorkspacePath != neighbor.Metadata.WorkspacePath ||
+		current.Metadata.ProviderConversationID != neighbor.Metadata.ProviderConversationID || current.Metadata.ControllerGeneration != neighbor.Metadata.ControllerGeneration ||
+		current.Activity != neighbor.Activity || current.IsTerminated || svc.HasLiveChatController(neighbor.ID) || m.SessionMutationInProgress(neighbor.ID) ||
+		page.Controller != ports.ChatControllerCold || len(page.Messages) != 0 {
+		t.Fatalf("neighbor changed or woke: current=%+v page=%+v err=%v pageErr=%v", current, page, err, pageErr)
+	}
+	all, err := st.ListAllSessions(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("wake created replacement AO rows: count=%d err=%v", len(all), err)
+	}
+}
+
+func TestColdProviderRefusalLeavesInputUndelivered(t *testing.T) {
+	// The provider owns generation verification. Inject its refusal, then test
+	// posture rejection using the actual capabilities negotiated by the fake.
+	for _, tc := range []struct {
+		name        string
+		err         error
+		permissions ports.PermissionMode
+	}{
+		{name: "generation", err: ports.ErrChatRecoveryInconclusive},
+		{name: "posture", err: ports.ErrChatUnsupported, permissions: ports.PermissionModeReadOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, svc, st, driver, rec := lazyChatFixtureWithPermission(t, tc.permissions)
+			ctx := context.Background()
+			if tc.permissions == "" {
+				driver.err = tc.err
+			}
+			_, err := svc.Send(ctx, rec.ID, ports.ChatUserMessage{Text: "must not deliver", ClientMessageID: "refused"})
+			if !errors.Is(err, ports.ErrChatControllerRestore) || !errors.Is(err, tc.err) {
+				t.Fatalf("provider refusal lost classification: %v", err)
+			}
+			if tc.permissions != "" {
+				var capabilityErr *ports.ChatCapabilityError
+				if !errors.As(err, &capabilityErr) || len(capabilityErr.Missing) != 1 || capabilityErr.Missing[0] != ports.ChatCapabilityPreventiveReadOnly {
+					t.Fatalf("missing preventive posture lost capability details: %v", err)
+				}
+			}
+			current, found, err := st.GetSession(ctx, rec.ID)
+			page, pageErr := svc.SnapshotPage(ctx, rec.ID, 0, 2)
+			if err != nil || !found || pageErr != nil || current.Metadata.ControllerGeneration != rec.Metadata.ControllerGeneration ||
+				current.Metadata.ProviderConversationID != rec.Metadata.ProviderConversationID || current.Metadata.WorkspacePath != rec.Metadata.WorkspacePath ||
+				current.Metadata.Permissions != rec.Metadata.Permissions || current.Activity != rec.Activity || current.IsTerminated || len(page.Messages) != 0 || len(page.Turns) != 0 ||
+				driver.starts.Load() != 0 || driver.resumes.Load() != 1 || svc.HasLiveChatController(rec.ID) || m.SessionMutationInProgress(rec.ID) {
+				t.Fatalf("refusal admitted work or replaced identity: current=%+v page=%+v starts=%d resumes=%d err=%v pageErr=%v", current, page, driver.starts.Load(), driver.resumes.Load(), err, pageErr)
+			}
+			cfg := driver.configs[0]
+			if cfg.SessionID != rec.ID || cfg.ControllerGeneration == "" || cfg.ControllerGeneration == rec.Metadata.ControllerGeneration || cfg.RuntimeGeneration != cfg.ControllerGeneration {
+				t.Fatalf("refused provider received wrong AO fence: %+v", cfg)
+			}
+			for _, provider := range driver.conversations {
+				provider.mu.Lock()
+				sent := len(provider.sent)
+				provider.mu.Unlock()
+				if sent != 0 {
+					t.Fatalf("refused provider received %d inputs", sent)
+				}
+			}
+		})
+	}
+}
+
+func TestColdUncertainSendAndDuplicateClientIDDoNotRedispatch(t *testing.T) {
+	_, svc, st, driver, rec := lazyChatFixture(t)
+	driver.sendErr = errors.New("provider accepted input but acknowledgement was lost")
+	ctx := context.Background()
+	msg := ports.ChatUserMessage{Text: "execute once", ClientMessageID: "uncertain-cold-input"}
+	turn, err := svc.Send(ctx, rec.ID, msg)
+	if !errors.Is(err, driver.sendErr) || turn.ID == "" || turn.State != domain.TurnStateFailed || turn.ProviderTurnID != "" {
+		t.Fatalf("uncertain delivery = %+v, err=%v", turn, err)
+	}
+	for range 3 {
+		duplicate, err := svc.Send(ctx, rec.ID, msg)
+		if err != nil || duplicate.ID != "" {
+			t.Fatalf("duplicate claimed another dispatch: %+v err=%v", duplicate, err)
+		}
+	}
+	if _, err := svc.RetryTurn(ctx, rec.ID, turn.ID); !errors.Is(err, chatsvc.ErrRetryDeliveryUncertain) {
+		t.Fatalf("uncertain delivery could be retried: %v", err)
+	}
+	conversation, err := st.ConversationForSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+	if err != nil || len(rows.Messages) != 1 || len(rows.Turns) != 1 || rows.Messages[0].ClientMessageID != msg.ClientMessageID ||
+		rows.Turns[0].ID != turn.ID || rows.Turns[0].State != domain.TurnStateFailed || rows.Turns[0].ProviderTurnID != "" {
+		t.Fatalf("uncertain delivery history changed: %+v err=%v", rows, err)
+	}
+	provider := driver.conversations[0]
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if driver.starts.Load() != 0 || driver.resumes.Load() != 1 || len(provider.sent) != 1 || provider.sent[0].ClientMessageID != msg.ClientMessageID {
+		t.Fatalf("uncertain input redelivered: starts=%d resumes=%d sent=%+v", driver.starts.Load(), driver.resumes.Load(), provider.sent)
+	}
+}
+
+func TestColdCanceledInputWaiterDoesNotPersistOrDispatch(t *testing.T) {
+	_, svc, st, driver, rec := lazyChatFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	driver.entered = make(chan struct{}, 1)
+	driver.release = make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(driver.release) }) }
+	t.Cleanup(unblock)
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Send(ctx, rec.ID, ports.ChatUserMessage{Text: "owner", ClientMessageID: "owner"})
+		ownerDone <- err
+	}()
+	select {
+	case <-driver.entered:
+	case <-ctx.Done():
+		t.Fatal("owner did not enter cold restore")
+	}
+	waiterBase, cancelWaiter := context.WithCancel(ctx)
+	defer cancelWaiter()
+	waiterCtx := &r4AdmissionContext{Context: waiterBase, waiting: make(chan struct{})}
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Send(waiterCtx, rec.ID, ports.ChatUserMessage{Text: "canceled", ClientMessageID: "canceled"})
+		waiterDone <- err
+	}()
+	select {
+	case <-waiterCtx.waiting:
+	case <-ctx.Done():
+		t.Fatal("input waiter did not reach admission")
+	}
+	cancelWaiter()
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled input error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("canceled input did not return")
+	}
+	unblock()
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("cancellation stalled restore owner")
+	}
+	page, err := svc.SnapshotPage(ctx, rec.ID, 0, 2)
+	if err != nil || len(page.Messages) != 1 || len(page.Turns) != 1 || page.Messages[0].ClientMessageID != "owner" {
+		t.Fatalf("canceled input persisted: %+v err=%v", page, err)
+	}
+	provider := driver.conversations[0]
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if driver.starts.Load() != 0 || driver.resumes.Load() != 1 || len(provider.sent) != 1 || provider.sent[0].ClientMessageID != "owner" {
+		t.Fatalf("canceled input reached provider: starts=%d resumes=%d sent=%+v", driver.starts.Load(), driver.resumes.Load(), provider.sent)
+	}
+	if all, err := st.ListAllSessions(ctx); err != nil || len(all) != 1 {
+		t.Fatalf("cancellation replaced AO session: count=%d err=%v", len(all), err)
 	}
 }
 
