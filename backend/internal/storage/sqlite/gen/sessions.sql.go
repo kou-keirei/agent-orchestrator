@@ -1010,6 +1010,27 @@ func (q *Queries) SetSessionHidden(ctx context.Context, arg SetSessionHiddenPara
 	return result.RowsAffected()
 }
 
+const setSessionHiddenIfRevision = `-- name: SetSessionHiddenIfRevision :execrows
+UPDATE sessions SET hidden_at = ?1
+WHERE id = ?2 AND revision = ?3
+`
+
+type SetSessionHiddenIfRevisionParams struct {
+	HiddenAt         sql.NullTime
+	ID               domain.SessionID
+	ExpectedRevision int64
+}
+
+// The database-owned revision trigger advances the token after a matched write.
+// Keep the predicate and visibility write in one statement for all writers.
+func (q *Queries) SetSessionHiddenIfRevision(ctx context.Context, arg SetSessionHiddenIfRevisionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setSessionHiddenIfRevision, arg.HiddenAt, arg.ID, arg.ExpectedRevision)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setSessionPinned = `-- name: SetSessionPinned :execrows
 UPDATE sessions SET is_pinned = ?, pinned_at = ?, updated_at = ? WHERE id = ?
 `

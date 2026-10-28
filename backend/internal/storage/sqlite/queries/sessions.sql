@@ -236,6 +236,12 @@ UPDATE sessions SET is_pinned = ?, pinned_at = ?, updated_at = ? WHERE id = ?;
 -- still emits an invalidation for this narrow fact without moving archive order.
 UPDATE sessions SET hidden_at = ? WHERE id = ?;
 
+-- name: SetSessionHiddenIfRevision :execrows
+-- The database-owned revision trigger advances the token after a matched write.
+-- Keep the predicate and visibility write in one statement for all writers.
+UPDATE sessions SET hidden_at = sqlc.narg(hidden_at)
+WHERE id = sqlc.arg(id) AND revision = sqlc.arg(expected_revision);
+
 -- name: ClearSessionHiddenIfUnchanged :execrows
 -- A successful activation may clear the state it observed, but must not erase a
 -- newer user hide that raced with activation.
