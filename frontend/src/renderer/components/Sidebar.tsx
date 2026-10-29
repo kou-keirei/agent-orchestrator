@@ -130,6 +130,7 @@ import { ResizeHandle } from "./ResizeHandle";
 import { NAV_ROW_HIGHLIGHT_HOST_CLASS, NavRowHighlight } from "./NavRowHighlight";
 import { isMacPlatform } from "../lib/platform";
 import { useCloudSession } from "../lib/cloud-session";
+import { BulkVisibilityPreview } from "./BulkVisibilityPreview";
 
 // macOS paints framed chrome: the fixed TitlebarNav cluster carries the
 // sidebar toggle + history arrows above this surface. Windows hangs the sidebar
@@ -319,6 +320,17 @@ export const SIDEBAR_MAX_WIDTH = 420;
  *  Collapsed icon rail always shows the full list so projects stay reachable. */
 const SIDEBAR_INITIAL_PROJECT_LIMIT = 12;
 const expandedProjectsStorageKey = "ao.sidebar.expanded-projects";
+const projectOrderStorageKey = "ao.sidebar.project-order";
+
+function readProjectOrder(): string[] {
+	try {
+		const value: unknown = JSON.parse(window.localStorage.getItem(projectOrderStorageKey) ?? "null");
+		if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) return [];
+		return [...new Set(value)].filter((id) => id !== STANDALONE_WORKSPACE_ID);
+	} catch {
+		return [];
+	}
+}
 
 function readExpandedProjectIds(): ReadonlySet<string> {
 	if (typeof window === "undefined" || !window.localStorage) return new Set();
@@ -449,6 +461,11 @@ export function Sidebar({
 	const commandPaletteEnabled = useCommandPaletteEnabled();
 	const setCommandPaletteOpen = useUiStore((s) => s.setCommandPaletteOpen);
 	const [showHidden, setShowHidden] = useState(false);
+	const visibilitySessions = useMemo(() => mergeSessionsById(
+		workspaces.flatMap((workspace) => workspace.sessions),
+		hiddenWorkspaces.flatMap((workspace) => workspace.sessions),
+	), [workspaces, hiddenWorkspaces]);
+	const activeHiddenSession = visibilitySessions.find((session) => session.id === selection.activeSessionId && session.hiddenAt);
 	const sidebarWorkspaces = useMemo(() => {
 		if (!showHidden) return workspaces;
 		const hiddenByWorkspace = new Map(
@@ -580,7 +597,7 @@ export function Sidebar({
 		return () => window.clearTimeout(timer);
 	}, []);
 
-	const [projectOrder, setProjectOrder] = useState<string[]>([]);
+	const [projectOrder, setProjectOrder] = useState<string[]>(readProjectOrder);
 	const orderedWorkspaces = useMemo(
 		() => applyOrder(sidebarWorkspaces, (workspace) => workspace.id, projectOrder, "end"),
 		[projectOrder, sidebarWorkspaces],
@@ -687,7 +704,14 @@ export function Sidebar({
 		if (!activeId || !target) return;
 		event.preventDefault();
 		const next = reorderAtProjectBoundary(projectIds, activeId, target.overId, target.placement);
-		if (next) setProjectOrder(next);
+		if (next) {
+			setProjectOrder(next);
+			try {
+				window.localStorage.setItem(projectOrderStorageKey, JSON.stringify(next));
+			} catch {
+				// Keep the in-memory reorder usable when storage is unavailable or full.
+			}
+		}
 		handleProjectDragEnd();
 	}, [handleProjectDragEnd, projectIds]);
 
@@ -843,6 +867,11 @@ export function Sidebar({
 							</SidebarMenuButton>
 						</SidebarMenuItem>
 					</SidebarMenu>
+				</div>
+
+				<div className="sidebar-expanded-chrome group-data-[collapsible=icon]:hidden">
+					{activeHiddenSession && <p role="status" className="px-2 text-sm">Hidden session: {activeHiddenSession.title}. Show hidden sessions to unhide.</p>}
+					<BulkVisibilityPreview sessions={visibilitySessions} activeId={selection.activeSessionId} showHidden={showHidden} />
 				</div>
 
 				{/* Projects — always open; only the trailing "+" is interactive. */}
@@ -1136,7 +1165,23 @@ const ProjectItem = memo(function ProjectItem({
 		() => applyOrder(visibleSessions, (session) => session.id, sessionOrder, "start"),
 		[sessionOrder, visibleSessions],
 	);
-	const sessionIds = useMemo(() => sessions.map((session) => session.id), [sessions]);
+	// Older worker cards default to a compact, reversible project disclosure.
+	// Always retain selected, pinned, and active/attention sessions in the preview.
+	const [showOlderWorkers, setShowOlderWorkers] = useState(false);
+	const primarySessions = useMemo(() => {
+		// Manual order changes row positions, not which newest workers are folded in.
+		const recent = new Set(visibleSessions.slice(0, 12).map((session) => session.id));
+		return sessions.filter(
+			(session) =>
+				recent.has(session.id) ||
+				session.isPinned ||
+				session.id === selection.activeSessionId ||
+				!["idle", "exited", "merged"].includes(session.status),
+		);
+	}, [sessions, visibleSessions, selection.activeSessionId]);
+	const olderWorkerCount = sessions.length - primarySessions.length;
+	const displayedSessions = showHidden || showOlderWorkers ? sessions : primarySessions;
+	const sessionIds = useMemo(() => displayedSessions.map((session) => session.id), [displayedSessions]);
 	const sessionLayoutDependency = useMemo(() => sessionIds.join("\u0000"), [sessionIds]);
 	// While a project is being dragged, leave the session lists as plain rows:
 	// otherwise every expanded project's DnD context measures its sortable
@@ -1148,8 +1193,12 @@ const ProjectItem = memo(function ProjectItem({
 
 	const commitSessionOrder = useCallback((next: string[] | null) => {
 		if (!next) return;
-		setSessionOrder(next);
-	}, []);
+		// A folded list supplies only displayed IDs. Replace those slots in the
+		// complete order so concealed workers keep their positions and order.
+		const placed = new Set(next);
+		let index = 0;
+		setSessionOrder(sessions.map((session) => placed.has(session.id) ? next[index++] : session.id));
+	}, [sessions]);
 
 	const onSessionDragEnd = useCallback(({ active, over }: DragEndEvent) => {
 		const sessionId = String(active.id);
@@ -1550,7 +1599,7 @@ const ProjectItem = memo(function ProjectItem({
 													className="mx-0 ml-3.5 translate-x-0 gap-px border-l-0 px-0 py-1"
 													data-testid={`session-list-${workspace.id}`}
 												>
-													{sessions.map((session) => (
+													{displayedSessions.map((session) => (
 														<SessionRow
 															key={session.id}
 															session={session}
@@ -1575,7 +1624,7 @@ const ProjectItem = memo(function ProjectItem({
 															className="mx-0 ml-3.5 translate-x-0 gap-px border-l-0 px-0 py-1"
 															data-testid={`session-list-${workspace.id}`}
 														>
-															{sessions.map((session) => (
+															{displayedSessions.map((session) => (
 																<SortableSessionRow
 																	key={session.id}
 																	session={session}
@@ -1597,6 +1646,22 @@ const ProjectItem = memo(function ProjectItem({
 							</motion.div>
 						)}
 					</AnimatePresence>
+					{expanded && !showHidden && olderWorkerCount > 0 && (
+						<button
+							aria-expanded={showOlderWorkers}
+							aria-label={(showOlderWorkers ? "Collapse" : "Expand") + " " + olderWorkerCount + " older workers in " + workspace.name}
+							className="sidebar-expanded-chrome mx-3.5 mb-1 flex items-center gap-1.5 rounded-lg px-2 py-1 text-left text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+							data-testid="older-workers-toggle"
+							onClick={() => setShowOlderWorkers((value) => !value)}
+							type="button"
+						>
+							<ChevronRight
+								aria-hidden="true"
+								className={cn("size-3.5 transition-transform", showOlderWorkers && "rotate-90")}
+							/>
+							<span>{showOlderWorkers ? "Hide" : "Show"} {olderWorkerCount} older workers</span>
+						</button>
+					)}
 					<ConfirmDialog
 						open={confirmOpen}
 						onOpenChange={setConfirmOpen}

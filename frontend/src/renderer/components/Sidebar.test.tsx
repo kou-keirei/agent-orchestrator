@@ -11,7 +11,7 @@ vi.mock("motion/react", async (importOriginal) => {
 		AnimatePresence: ({ children }: { children: React.ReactNode }) => children,
 	};
 });
-import { act, createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "../../api/schema";
@@ -48,6 +48,7 @@ const {
 	dragOvers,
 	dragStarts,
 	downloadUpdateMock,
+	deleteMock,
 	getMock,
 	navigateMock,
 	mockParams,
@@ -69,6 +70,7 @@ const {
 		dragEnds: new Map<string, (event: { active: { id: string }; over: { id: string } | null }) => void>(),
 		dragOvers: new Map<string, (event: DragOverTestEvent) => void>(),
 		dragStarts: new Map<string, (event: { active: { id: string } }) => void>(),
+		deleteMock: vi.fn(),
 		getMock: vi.fn(),
 		postMock: vi.fn(),
 		navigateMock: vi.fn(),
@@ -157,7 +159,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 });
 
 vi.mock("../lib/api-client", () => ({
-	apiClient: { GET: getMock, POST: postMock },
+	apiClient: { GET: getMock, POST: postMock, DELETE: deleteMock },
 	apiErrorMessage: (error: unknown) => {
 		if (error instanceof Error) return error.message;
 		if (typeof error === "object" && error !== null && "message" in error && typeof error.message === "string") {
@@ -402,6 +404,7 @@ beforeEach(() => {
 		provisioningProjectIds: new Set(),
 		restartingProjectIds: new Set(),
 	});
+	deleteMock.mockReset();
 	getMock.mockReset();
 	getMock.mockResolvedValue({
 		data: {
@@ -458,6 +461,30 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+	it("keeps bulk visibility integration disabled and makes no provider or visibility requests", async () => {
+		renderSidebar({ workspaces: [{ ...workspace, sessions: [
+			{ ...session, mode: "chat", isTerminated: true, status: "terminated" },
+			{ ...session, id: "project-orchestrator", title: "Parked parent", kind: "worker", mode: "chat", isTerminated: true, status: "terminated" },
+		] }] });
+		await userEvent.click(screen.getByText("Bulk Hide preview"));
+		await userEvent.click(screen.getByText("Select all shown"));
+		expect(screen.getByText("Run mock preview")).toBeDisabled();
+		expect(screen.getByRole("status")).toHaveTextContent("2 selected, 1 eligible, 1 skipped");
+		expect(postMock).not.toHaveBeenCalled();
+		expect(deleteMock).not.toHaveBeenCalled();
+		expect(spawnMock).not.toHaveBeenCalled();
+	});
+
+	it("labels a hidden deep link even while hidden rows are concealed", () => {
+		mockParams.sessionId = session.id;
+		renderSidebar({ hiddenWorkspaces: [{ ...workspace, sessions: [{ ...session, hiddenAt: "yesterday" }] }] });
+		expect(screen.getByText(`Hidden session: ${session.title}. Show hidden sessions to unhide.`)).toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: `Open ${session.title}` })).not.toBeInTheDocument();
+		expect(postMock).not.toHaveBeenCalled();
+		expect(deleteMock).not.toHaveBeenCalled();
+		expect(spawnMock).not.toHaveBeenCalled();
+	});
+
 	it("reveals unpinned hidden terminated workers only while Show hidden sessions is enabled", async () => {
 		const user = userEvent.setup();
 		const hidden = {
@@ -487,6 +514,7 @@ describe("Sidebar", () => {
 		expect(postMock).not.toHaveBeenCalled();
 		await user.click(screen.getByRole("button", { name: "Hide hidden sessions" }));
 		expect(screen.queryByRole("button", { name: "Open hidden terminated history" })).not.toBeInTheDocument();
+		expect(deleteMock).not.toHaveBeenCalled();
 	});
 
 	it("keeps hidden pinned history out of the default sidebar and reveals it explicitly", async () => {
@@ -683,10 +711,10 @@ describe("Sidebar", () => {
 
 		expect(screen.queryByRole("dialog", { name: "Remove project" })).not.toBeInTheDocument();
 		expect(navigateMock).toHaveBeenCalledWith({ to: "/" });
-		expect(screen.getByRole("status")).toHaveTextContent("Removing Project One");
+		expect(screen.getByText(/Removing Project One/, { selector: '[role="status"]' })).toBeInTheDocument();
 
 		finishRemoval();
-		await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+		await waitFor(() => expect(screen.queryByText(/Removing Project One/, { selector: '[role="status"]' })).not.toBeInTheDocument());
 	});
 
 	it("does not remove the project when cancellation is clicked in the ConfirmDialog", async () => {
@@ -2152,6 +2180,143 @@ describe("Sidebar", () => {
 		expect(dot).not.toHaveClass("animate-status-pulse");
 	});
 
+	it("folds older worker cards while preserving current, pinned, and working sessions", async () => {
+		const user = userEvent.setup();
+		const workers: WorkspaceSession[] = Array.from({ length: 24 }, (_, index) => ({
+			...session,
+			id: "proj-1-" + (index + 1),
+			title: "worker " + (index + 1),
+			status: "idle",
+			updatedAt: new Date(Date.UTC(2026, 5, 30, 0, index)).toISOString(),
+		}));
+		workers[0] = { ...workers[0], status: "working" };
+		workers[1] = { ...workers[1], isPinned: true };
+		mockParams.projectId = workspace.id;
+		mockParams.sessionId = workers[2].id;
+		renderSidebar({ workspaces: [{ ...workspace, sessions: workers }] });
+
+		const rows = () => within(screen.getByTestId("session-list-proj-1"));
+		expect(rows().getByLabelText("Open worker 1")).toBeInTheDocument();
+		expect(rows().getByLabelText("Open worker 2")).toBeInTheDocument();
+		expect(rows().getByLabelText("Open worker 3")).toBeInTheDocument();
+		expect(rows().queryByLabelText("Open worker 4")).not.toBeInTheDocument();
+		expect(rows().getAllByRole("button", { name: /^Open worker/ })).toHaveLength(15);
+		const expand = screen.getByRole("button", { name: "Expand 9 older workers in Project One" });
+		expect(expand).toHaveAttribute("aria-expanded", "false");
+
+		await user.click(expand);
+		expect(rows().getAllByRole("button", { name: /^Open worker/ })).toHaveLength(24);
+		const collapse = screen.getByRole("button", { name: "Collapse 9 older workers in Project One" });
+		expect(collapse).toHaveAttribute("aria-expanded", "true");
+		await user.click(collapse);
+		expect(rows().getAllByRole("button", { name: /^Open worker/ })).toHaveLength(15);
+	});
+
+	it.each([false, true])("keeps the complete folded worker order after drag (retained edges: %s)", async (edges) => {
+		const workers: WorkspaceSession[] = Array.from({ length: 24 }, (_, index) => ({
+			...session,
+			id: `s${index + 1}`,
+			title: `worker ${index + 1}`,
+			status: "idle",
+			updatedAt: new Date(Date.UTC(2026, 5, 30, 0, index)).toISOString(),
+		}));
+		if (edges) {
+			workers[0] = { ...workers[0], status: "needs_input" };
+			workers[1] = { ...workers[1], isPinned: true };
+			mockParams.projectId = workspace.id;
+			mockParams.sessionId = workers[2].id;
+		}
+		const hidden = { ...session, id: "hidden", title: "hidden worker", status: "idle" as const, hiddenAt: "2026-06-30T01:00:00Z" };
+		renderSidebar({ workspaces: [{ ...workspace, sessions: [...workers, hidden] }] });
+		const labels = () => within(screen.getByTestId("session-list-proj-1"))
+			.getAllByRole("button", { name: /^Open / }).map((node) => node.getAttribute("aria-label"));
+		const newest = Array.from({ length: 12 }, (_, index) => `Open worker ${24 - index}`);
+		const oldest = Array.from({ length: 12 }, (_, index) => `Open worker ${12 - index}`);
+		const retained = edges ? oldest.slice(-3) : [];
+		expect(labels()).toEqual([...newest, ...retained]);
+		const drag = (active: string, over: string | null) => act(async () => dragEnds.get("sidebar-sessions-proj-1")!({
+			active: { id: active }, over: over === null ? null : { id: over },
+		}));
+		// Cancelled, same-row, concealed, hidden, and cross-project targets cannot reorder.
+		for (const over of [null, "s24", "s12", "hidden", "other-project-worker"]) await drag("s24", over);
+		expect(labels()).toEqual([...newest, ...retained]);
+		await drag("s24", "s23");
+		const reordered = [newest[1], newest[0], ...newest.slice(2)];
+		expect(labels()).toEqual([...reordered, ...retained]);
+		const olderCount = edges ? 9 : 12;
+		for (let cycle = 0; cycle < 2; cycle++) {
+			await userEvent.click(screen.getByRole("button", { name: `Expand ${olderCount} older workers in Project One` }));
+			expect(labels()).toEqual([...reordered, ...oldest]);
+			expect(new Set(labels()).size).toBe(24);
+			await userEvent.click(screen.getByRole("button", { name: `Collapse ${olderCount} older workers in Project One` }));
+			expect(labels()).toEqual([...reordered, ...retained]);
+		}
+		expect(screen.queryByLabelText("Open hidden worker")).not.toBeInTheDocument();
+		expect(postMock).not.toHaveBeenCalled();
+		expect(spawnMock).not.toHaveBeenCalled();
+	});
+
+	it.each(["selected", "pinned", "attention", "combined"] as const)(
+		"preserves folded membership across retained-boundary drags (%s)", async (variant) => {
+			const workers: WorkspaceSession[] = Array.from({ length: 24 }, (_, index) => ({
+				...session,
+				id: `s${index + 1}`,
+				title: `worker ${index + 1}`,
+				status: "idle",
+				updatedAt: new Date(Date.UTC(2026, 5, 30, 0, index)).toISOString(),
+			}));
+			if (variant === "selected" || variant === "combined") {
+				mockParams.projectId = workspace.id;
+				mockParams.sessionId = variant === "combined" ? "s3" : "s1";
+			}
+			if (variant === "pinned" || variant === "combined") {
+				const index = variant === "combined" ? 1 : 0;
+				workers[index] = { ...workers[index], isPinned: true };
+			}
+			if (variant === "attention" || variant === "combined") {
+				workers[0] = { ...workers[0], status: "needs_input" };
+			}
+			const props = { workspaces: [{ ...workspace, sessions: workers }] };
+			renderSidebar(props);
+			const ids = () => within(screen.getByTestId("session-list-proj-1"))
+				.getAllByRole("button", { name: /^Open worker / })
+				.map((node) => `s${node.getAttribute("aria-label")!.replace("Open worker ", "")}`);
+			const newest = Array.from({ length: 12 }, (_, index) => `s${24 - index}`);
+			const retained = variant === "combined" ? ["s3", "s2", "s1"] : ["s1"];
+			const concealed = Array.from({ length: 12 - retained.length }, (_, index) => `s${12 - index}`);
+			const initial = [...newest, ...retained];
+			expect(ids()).toEqual(initial);
+			const drag = (active: string, over: string) => act(async () => dragEnds.get("sidebar-sessions-proj-1")!({
+				active: { id: active }, over: { id: over },
+			}));
+			const checkFolds = async (expected: string[]) => {
+				expect(ids()).toEqual(expected);
+				expect(new Set(ids())).toEqual(new Set(initial));
+				for (let cycle = 0; cycle < 2; cycle++) {
+					await userEvent.click(screen.getByRole("button", { name: `Expand ${concealed.length} older workers in Project One` }));
+					expect(ids()).toEqual([...expected.slice(0, 12), ...concealed, ...expected.slice(12)]);
+					expect(new Set(ids()).size).toBe(24);
+					await userEvent.click(screen.getByRole("button", { name: `Collapse ${concealed.length} older workers in Project One` }));
+					expect(ids()).toEqual(expected);
+				}
+			};
+			// Newest -> retained: the dragged row must remain among the same 13/15 IDs.
+			await drag("s24", "s1");
+			await checkFolds([...newest.slice(1), ...retained, "s24"]);
+			// Restore, then exercise retained -> newest with the same membership.
+			await drag("s24", "s23");
+			expect(ids()).toEqual(initial);
+			await drag("s1", "s24");
+			await checkFolds(["s1", ...newest, ...retained.slice(0, -1)]);
+			expect(postMock).not.toHaveBeenCalled();
+			expect(spawnMock).not.toHaveBeenCalled();
+			// Worker order remains component-local; remount restores the source order.
+			cleanup();
+			renderSidebar(props);
+			expect(ids()).toEqual(initial);
+		},
+	);
+
 	it("shows sessions on load and hides them once collapsed", async () => {
 		const user = userEvent.setup();
 		const workspaceWithSessions = {
@@ -2478,6 +2643,124 @@ describe("Sidebar", () => {
 		expect(Array.from(document.querySelectorAll("[data-project-label]"), (node) => node.textContent)).toEqual(["Bravo", "Alpha"]);
 	});
 
+	describe("persistent project order", () => {
+		const key = "ao.sidebar.project-order";
+		const projects = [
+			{ ...workspace, id: "alpha", name: "Alpha" },
+			{ ...workspace, id: "bravo", name: "Bravo" },
+		];
+		const labels = () => Array.from(document.querySelectorAll("[data-project-label]"), (node) => node.textContent);
+		const dropBravoBeforeAlpha = () => {
+			fireDrag("dragStart", document.querySelector('[data-project-drag-row][data-project-id="bravo"]')!, {});
+			const target = document.querySelector('li[data-project-drop-target][data-project-id="alpha"]')!;
+			fireDrag("dragOver", target, { clientY: 0 });
+			fireDrag("drop", target, {});
+		};
+
+		it("saves a real drop and restores it on repeated renderer remounts with the ad hoc group", () => {
+			const workspaces = [...projects, {
+				id: STANDALONE_WORKSPACE_ID, name: "Ad hoc agents", kind: STANDALONE_PROJECT_KIND, path: "", sessions: [],
+			}];
+			renderSidebar({ workspaces });
+			expect(window.localStorage.getItem(key)).toBeNull();
+			dropBravoBeforeAlpha();
+			expect(JSON.parse(window.localStorage.getItem(key)!)).toEqual(["bravo", "alpha"]);
+			for (let i = 0; i < 2; i++) {
+				cleanup();
+				renderSidebar({ workspaces });
+				expect(labels()).toEqual(["Bravo", "Alpha", "Ad hoc agents"]);
+				expect(JSON.parse(window.localStorage.getItem(key)!)).toEqual(["bravo", "alpha"]);
+			}
+		});
+
+		it.each([null, "{", "{}", '"bravo"', '["bravo",4]'])("uses the default for absent/malformed storage %s without writing on mount", (stored) => {
+			if (stored !== null) window.localStorage.setItem(key, stored);
+			renderSidebar({ workspaces: projects });
+			expect(labels()).toEqual(["Alpha", "Bravo"]);
+			expect(window.localStorage.getItem(key)).toBe(stored);
+		});
+
+		it("ignores stale and duplicate IDs and appends new projects in input order", () => {
+			window.localStorage.setItem(key, JSON.stringify(["gone", "bravo", "bravo", STANDALONE_WORKSPACE_ID, "alpha"]));
+			renderSidebar({ workspaces: projects });
+			expect(labels()).toEqual(["Bravo", "Alpha"]);
+			cleanup();
+			renderSidebar({ workspaces: [
+				projects[0], { ...workspace, id: "delta", name: "Delta" }, { ...workspace, id: "charlie", name: "Charlie" },
+			] });
+			expect(labels()).toEqual(["Alpha", "Delta", "Charlie"]);
+		});
+
+		it("handles actual storage failures, keeps in-memory order, and rehydrates after recovery", async () => {
+			const storage = window.localStorage;
+			const getItem = storage.getItem.bind(storage);
+			const setItem = storage.setItem.bind(storage);
+			setItem(key, '["bravo"]');
+			const read = vi.spyOn(storage, "getItem").mockImplementation((name) => {
+				if (name === key) throw new Error("storage unavailable");
+				return getItem(name);
+			});
+			const write = vi.spyOn(storage, "setItem").mockImplementation((name, value) => {
+				if (name === key) throw new Error("quota exceeded");
+				setItem(name, value);
+			});
+			renderSidebar({ workspaces: projects });
+			expect(read).toHaveBeenCalledWith(key);
+			expect(labels()).toEqual(["Alpha", "Bravo"]);
+			dropBravoBeforeAlpha();
+			expect(write).toHaveBeenCalledWith(key, '["bravo","alpha"]');
+			expect(getItem(key)).toBe('["bravo"]');
+			expect(labels()).toEqual(["Bravo", "Alpha"]);
+			// A visibility state update must not reset the in-memory fallback.
+			await userEvent.click(screen.getByRole("button", { name: "Show hidden sessions" }));
+			expect(labels()).toEqual(["Bravo", "Alpha"]);
+			read.mockRestore();
+			write.mockRestore();
+			// Recovery reads the valid persisted preference on a real remount.
+			cleanup();
+			renderSidebar({ workspaces: projects });
+			expect(labels()).toEqual(["Bravo", "Alpha"]);
+			// A subsequent successful drop is persisted and survives another mount.
+			fireDrag("dragStart", document.querySelector('[data-project-drag-row][data-project-id="alpha"]')!, {});
+			const target = document.querySelector('li[data-project-drop-target][data-project-id="bravo"]')!;
+			fireDrag("dragOver", target, { clientY: 0 });
+			fireDrag("drop", target, {});
+			expect(getItem(key)).toBe('["alpha","bravo"]');
+			cleanup();
+			renderSidebar({ workspaces: projects });
+			expect(labels()).toEqual(["Alpha", "Bravo"]);
+		});
+
+		it("does not write on no-op, cancelled, or external project drags", () => {
+			renderSidebar({ workspaces: projects });
+			const alpha = document.querySelector('[data-project-drag-row][data-project-id="alpha"]')!;
+			const target = document.querySelector('li[data-project-drop-target][data-project-id="alpha"]')!;
+			fireDrag("drop", target, {});
+			fireDrag("dragStart", alpha, {});
+			fireDrag("dragOver", target, { clientY: 0 });
+			fireDrag("drop", target, {});
+			fireEvent.dragEnd(alpha);
+			expect(window.localStorage.getItem(key)).toBeNull();
+			expect(labels()).toEqual(["Alpha", "Bravo"]);
+		});
+
+		it("preserves pinned ordering and session drags independently of the saved project order", async () => {
+			window.localStorage.setItem(key, '["bravo","alpha"]');
+			renderSidebar({ workspaces: [{ ...projects[0], sessions: [
+				{ ...session, id: "first", title: "First", updatedAt: "2026-06-30T01:00:00Z" },
+				{ ...session, id: "second", title: "Second", updatedAt: "2026-06-30T00:00:00Z" },
+				{ ...session, id: "old-pin", title: "Old pin", isPinned: true, pinnedAt: "2026-06-29T00:00:00Z" },
+			] }, { ...projects[1], sessions: [
+				{ ...session, id: "new-pin", title: "New pin", isPinned: true, pinnedAt: "2026-06-30T00:00:00Z" },
+			] }] });
+			await act(async () => dragEnds.get("sidebar-sessions-alpha")?.({ active: { id: "second" }, over: { id: "first" } }));
+			expect(within(screen.getByTestId("pinned-session-list")).getAllByRole("button", { name: /^Open / }).map((node) => node.getAttribute("aria-label"))).toEqual(["Open New pin", "Open Old pin"]);
+			expect(within(screen.getByTestId("session-list-alpha")).getAllByRole("button", { name: /^Open / }).map((node) => node.getAttribute("aria-label"))).toEqual(["Open Second", "Open First", "Open Old pin"]);
+			expect(labels()).toEqual(["Bravo", "Alpha"]);
+			expect(window.localStorage.getItem(key)).toBe('["bravo","alpha"]');
+		});
+	});
+
 	it("keeps the ad hoc group out of project drag and drop ordering", () => {
 		renderSidebar({
 			workspaces: [
@@ -2532,6 +2815,7 @@ describe("Sidebar", () => {
 			"Open Second",
 			"Open First",
 		]);
+		expect(window.localStorage.getItem("ao.sidebar.project-order")).toBeNull();
 	});
 
 	it.each(["light", "dark"] as const)("uses a visible project drop indicator in the %s theme", (theme) => {
