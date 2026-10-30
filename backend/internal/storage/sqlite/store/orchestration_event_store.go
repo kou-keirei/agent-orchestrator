@@ -195,7 +195,7 @@ func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Ti
 				THEN COALESCE(attention_required_at,?)
 			ELSE attention_required_at
 		END,
-		destination_session_id=NULL,next_attempt_at=?
+		next_attempt_at=?
 		 WHERE state IN ('leased','submitted') AND lease_expires_at<=?`, now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now, now, now)
 	if err != nil {
 		return 0, err
@@ -252,8 +252,22 @@ func (s *Store) ListDueOrchestrationEvents(ctx context.Context, project domain.P
 		if len(events) > limit {
 			return nil, fmt.Errorf("reclaimed orchestration batch exceeds event limit %d", limit)
 		}
+		lostDestination := true
+		for _, event := range events {
+			if event.DestinationSessionID != "" {
+				lostDestination = false
+				break
+			}
+		}
 		for _, event := range events {
 			if event.State != domain.OrchestrationPending {
+				// Baseline reclaim erased destinations and could split a token
+				// across pending/dead_letter at the per-event age limit. Return
+				// its complete membership for the dispatcher's lost-destination
+				// HOLD. Never replay a subset or admit an acknowledged member.
+				if lostDestination && event.State == domain.OrchestrationDeadLetter {
+					continue
+				}
 				return nil, fmt.Errorf("reclaimed orchestration batch contains non-pending event %q", event.ID)
 			}
 		}
@@ -300,7 +314,7 @@ func (s *Store) ClearOrchestrationAttention(ctx context.Context, ids []string) e
 func (s *Store) RetryDeadLetterOrchestrationEvent(ctx context.Context, project domain.ProjectID, id string, now time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='pending',attempt_count=0,next_attempt_at=?,lease_expires_at=NULL,destination_session_id=NULL,submitted_at=NULL,acknowledged_at=NULL,attention_required_at=NULL,last_error=''
+	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='pending',attempt_count=0,next_attempt_at=?,lease_expires_at=NULL,submitted_at=NULL,acknowledged_at=NULL,attention_required_at=NULL,last_error=''
 		WHERE project_id=? AND state='dead_letter' AND (
 			id=? OR (lease_token IS NOT NULL AND lease_token=(SELECT lease_token FROM orchestration_events WHERE id=? AND project_id=? AND state='dead_letter'))
 		)`, now, project, id, id, project)
@@ -312,8 +326,17 @@ func (s *Store) RetryDeadLetterOrchestrationEvent(ctx context.Context, project d
 }
 
 func (s *Store) LeaseOrchestrationEvents(ctx context.Context, ids []string, token string, destination domain.SessionID, expires time.Time) error {
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(token) != token || strings.TrimSpace(string(destination)) == "" {
+		return fmt.Errorf("missing orchestration batch token or destination")
+	}
 	return s.updateOrchestrationBatch(ctx, "lease orchestration events", ids, func(db gen.DBTX, id string) (sql.Result, error) {
-		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='leased',lease_token=?,lease_expires_at=?,destination_session_id=? WHERE id=? AND state='pending'`, token, expires, destination, id)
+		// The transaction fences stale due reads as well as direct callers. Only
+		// untouched work may acquire a binding; retries may only renew their pair.
+		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='leased',lease_token=?,lease_expires_at=?,destination_session_id=?
+		 WHERE id=? AND state='pending' AND (
+			(lease_token IS NULL AND destination_session_id IS NULL AND attempt_count=0 AND submitted_at IS NULL)
+			OR (lease_token=? AND destination_session_id=?)
+		 ) AND EXISTS (SELECT 1 FROM sessions WHERE id=? AND project_id=orchestration_events.project_id AND kind='orchestrator' AND is_terminated=0)`, token, expires, destination, id, token, destination, destination)
 	})
 }
 
