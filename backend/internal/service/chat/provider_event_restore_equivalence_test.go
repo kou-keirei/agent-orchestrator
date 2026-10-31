@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -203,6 +204,53 @@ func ao16History() []ports.ChatEvent {
 	}
 }
 
+// Fixed semantic expectations are independent of the archive and provider replay
+// objects. Check every projected message, its native item/turn identity, ordering,
+// owner and settled state after each fake Resume, including repeated imports.
+func ao16AssertResumeProjection(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query(`SELECT m.id,m.conversation_id,m.turn_id,m.sequence,m.role,m.origin,m.text,m.provider_item_id,m.branch_id,m.streaming,t.provider_turn_id,t.handled_by_session_id,t.state,t.branch_id FROM conversation_messages m JOIN conversation_turns t ON t.id=m.turn_id WHERE m.conversation_id='ao16' ORDER BY m.sequence,m.id`)
+	ao16Must(t, err)
+	var got [][]string
+	for rows.Next() {
+		cells := make([]string, 14)
+		pointers := make([]any, len(cells))
+		for i := range cells {
+			pointers[i] = &cells[i]
+		}
+		ao16Must(t, rows.Scan(pointers...))
+		got = append(got, cells)
+	}
+	ao16Must(t, rows.Err())
+	ao16Must(t, rows.Close())
+	want := [][]string{
+		{"user", "ao16", "settled", "1", "user", "human", "question", "native-user", "ao16:root", "0", "native-turn-1", "p1-1", "completed", "ao16:root"},
+		{"answer", "ao16", "settled", "2", "assistant", "provider", "answer", "native-answer", "ao16:root", "0", "native-turn-1", "p1-1", "completed", "ao16:root"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("fake Resume changed projected semantic history: got %#v want %#v", got, want)
+	}
+	var project, session, current, branch, owner, native string
+	var sequence int64
+	ao16Must(t, db.QueryRow(`SELECT c.project_id,c.session_id,c.current_session_id,c.active_branch_id,c.latest_sequence,b.session_id,b.provider_conversation_id FROM conversations c JOIN conversation_branches b ON b.id=c.active_branch_id WHERE c.id='ao16'`).Scan(&project, &session, &current, &branch, &sequence, &owner, &native))
+	if project != "p1" || session != "p1-1" || current != "p1-1" || branch != "ao16:root" || sequence != 2 || owner != "p1-1" || native != "thread-1" {
+		t.Fatalf("fake Resume changed conversation/owner binding: %s %s %s %s %d %s %s", project, session, current, branch, sequence, owner, native)
+	}
+}
+
+func ao16ResumeRowFingerprint(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var tables []ao16Table
+	for _, name := range []string{"conversation_turns", "conversation_messages", "conversation_activities", "conversation_provider_events"} {
+		table, err := ao16ReadTable(db, name)
+		ao16Must(t, err)
+		tables = append(tables, table)
+	}
+	raw, err := json.Marshal(tables)
+	ao16Must(t, err)
+	return string(raw)
+}
+
 // Test-only fake Resume/history admission is separate from native provider
 // continuation. In particular the serialized raw archive is not ReadHistory.
 func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, continuation bool) {
@@ -214,16 +262,27 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 		t.Fatal("restored session missing")
 	}
 	events := ao16History()
+	var wantMismatches []ports.ChatHistoryMismatchDimension
 	switch variant {
+	case "matching":
 	case "missing history":
 		events = nil
+		wantMismatches = []ports.ChatHistoryMismatchDimension{ports.ChatHistoryMismatchTrustedTurn, ports.ChatHistoryMismatchTrustedUserText, ports.ChatHistoryMismatchTrustedAssistantText, ports.ChatHistoryMismatchAOHighWater}
 	case "mismatched checkpoint":
 		rec.Metadata.ConversationCheckpointNativeID = "other-thread"
-	case "missing checkpoint":
+		wantMismatches = []ports.ChatHistoryMismatchDimension{ports.ChatHistoryMismatchNativeIdentity}
+	case "missing checkpoint", "missing checkpoint with matching history":
 		rec.Metadata.ConversationCheckpointState = ""
 		rec.Metadata.ConversationCheckpointGeneration = ""
 		rec.Metadata.ConversationCheckpointNativeID = ""
-		rec.Metadata.LatestUserPrompt = "unproven prompt absent from native history"
+		// Preserve the original combined negative, while the matching-history
+		// control below proves that checkpoint absence alone is not a rejection.
+		if variant == "missing checkpoint" {
+			rec.Metadata.LatestUserPrompt = "unproven prompt absent from native history"
+			wantMismatches = []ports.ChatHistoryMismatchDimension{ports.ChatHistoryMismatchUntrustedUserText}
+		}
+	default:
+		t.Fatalf("unknown fake Resume case %q", variant)
 	}
 	ao16Must(t, st.UpdateSession(ctx, rec))
 	var next atomic.Int64
@@ -239,14 +298,37 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 			return conversation, nil
 		}}}, NewID: func() string { return fmt.Sprintf("ao16-import-%d", next.Add(1)) }})
 		t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
+		beforeRows := ao16ResumeRowFingerprint(t, db)
 		startCtx, cancel := context.WithTimeout(ctx, time.Second)
-		_, err := svc.Start(startCtx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: "/synthetic/ao16", ProviderConversationID: "thread-1", HistoryMode: ports.ChatHistoryRequired, HistoryPolicy: domain.SessionInterfaceTransitionHistoryStrict})
+		controller, err := svc.Start(startCtx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: "/synthetic/ao16", ProviderConversationID: "thread-1", HistoryMode: ports.ChatHistoryRequired, HistoryPolicy: domain.SessionInterfaceTransitionHistoryStrict})
 		cancel()
-		if variant != "matching" {
-			_ = svc.Stop(ctx, testSession)
-			if err == nil {
-				t.Fatalf("%s checkpoint/history admission passed", variant)
+		if len(wantMismatches) > 0 {
+			var unsettled *ports.ChatHistoryUnsettledError
+			if !errors.Is(err, ports.ErrChatHistoryUnsettled) || !errors.As(err, &unsettled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				t.Fatalf("%s: expected typed history rejection, got %T: %v", variant, err, err)
 			}
+			if !reflect.DeepEqual(ports.ChatHistoryMismatchDimensions(err), wantMismatches) {
+				t.Fatalf("%s: mismatch dimensions=%v want %v", variant, ports.ChatHistoryMismatchDimensions(err), wantMismatches)
+			}
+			if !resumed {
+				t.Fatal("negative admission did not reach fake Resume")
+			}
+			// Native identity is a hard checkpoint gate before ReadHistory;
+			// text/high-water mismatches must exercise the history reader.
+			if reads := conversation.historyReads(); (variant == "mismatched checkpoint" && reads != 0) || (variant != "mismatched checkpoint" && reads == 0) {
+				t.Fatalf("%s: unexpected history reads %d", variant, reads)
+			}
+			if controller != nil {
+				t.Fatal("failed Start returned a controller")
+			}
+			if published, lookupErr := svc.Controller(testSession); published != nil || !errors.Is(lookupErr, chatsvc.ErrNoController) {
+				t.Fatalf("failed Start published controller: %v, %v", published, lookupErr)
+			}
+			if after := ao16ResumeRowFingerprint(t, db); after != beforeRows {
+				t.Fatal("rejected Start mutated projected/raw history")
+			}
+			ao16AssertResumeProjection(t, db)
+			_ = svc.Stop(ctx, testSession)
 			t.Logf("HOLD: %s rejected: %v", variant, err)
 			return
 		}
@@ -262,9 +344,10 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 		if messages != 2 {
 			t.Fatalf("repeated import duplicated projected history: %d messages", messages)
 		}
+		ao16AssertResumeProjection(t, db)
 		if continuation && attempt == 1 {
 			// Unsupported normalized event kinds are still durable raw evidence.
-			conversation.emit(ports.ChatEvent{Kind: ports.ChatEventKind("ao16.fixture.continuation"), ProviderEventID: "post-restore"})
+			conversation.emit(ports.ChatEvent{Kind: ports.ChatEventKind("ao16.fixture.continuation"), ProviderEventID: "post-restore", ProviderConversationID: "thread-1", ProviderTurnID: "native-turn-1", ProviderItemID: "continuation-item", Text: "continuation evidence"})
 			deadline := time.Now().Add(2 * time.Second)
 			var count int
 			for time.Now().Before(deadline) {
@@ -277,13 +360,29 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 			if count != 1 {
 				t.Fatal("new fake-provider continuation event was not archived")
 			}
+			var conversationID, sessionID, branchID, method, payload string
+			var eventID int64
+			ao16Must(t, db.QueryRow(`SELECT id,conversation_id,session_id,branch_id,method,payload_json FROM conversation_provider_events WHERE provider_event_id='post-restore'`).Scan(&eventID, &conversationID, &sessionID, &branchID, &method, &payload))
+			if eventID <= 21 || conversationID != "ao16" || sessionID != "p1-1" || branchID != "ao16:root" || method != "ao16.fixture.continuation" {
+				t.Fatalf("wrong continuation order/ownership: %d %s %s %s %s", eventID, conversationID, sessionID, branchID, method)
+			}
+			var record map[string]json.RawMessage
+			ao16Must(t, json.Unmarshal([]byte(payload), &record))
+			for key, want := range map[string]string{"kind": "ao16.fixture.continuation", "providerEventId": "post-restore", "providerConversationId": "thread-1", "providerTurnId": "native-turn-1", "providerItemId": "continuation-item", "text": "continuation evidence"} {
+				var got string
+				ao16Must(t, json.Unmarshal(record[key], &got))
+				if got != want {
+					t.Fatalf("continuation payload %s=%q want %q", key, got, want)
+				}
+			}
+			ao16AssertResumeProjection(t, db)
 		}
 		ao16Must(t, svc.Stop(ctx, testSession))
 	}
 }
 
 func TestAO16RestoreFakeResumeEquivalence(t *testing.T) {
-	for _, variant := range []string{"matching", "missing history", "missing checkpoint", "mismatched checkpoint"} {
+	for _, variant := range []string{"matching", "missing history", "missing checkpoint", "mismatched checkpoint", "missing checkpoint with matching history"} {
 		t.Run(variant, func(t *testing.T) {
 			source, sourceDB := ao16Seed(t)
 			archive := ao16Archive(t, sourceDB)
