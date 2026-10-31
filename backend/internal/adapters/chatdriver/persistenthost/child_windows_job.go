@@ -16,6 +16,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// PROC_THREAD_ATTRIBUTE_JOB_LIST (WinSDK JobList=13, input=true). x/sys v0.45.0
+// exposes UpdateProcThreadAttribute but not this Windows 10+ attribute constant.
+// It assigns the limited Job as part of CreateProcessW, not in a later step.
+const experimentalJobListAttribute = 0x0002000d
+
 // This experiment requires an explicit build tag and Enabled=true. It is
 // deliberately not called by ConnectOrStart or Run. It does
 // not support command shims, provider discovery, host reconnection, or brokers.
@@ -81,16 +86,16 @@ func validateExperimentalJobLaunch(cfg experimentalJobLaunch) error {
 
 // Function injection is per invocation, only for source regression fixtures;
 // there is no global launcher override or fallback to the default start path.
+// create must atomically place the child in its supplied, already-limited Job;
+// an error must not return a live process outside that Job.
 type experimentalJobCalls struct {
 	inJob        func(windows.Handle, windows.Handle) (bool, error)
 	createJob    func() (windows.Handle, error)
 	setLimits    func(windows.Handle, windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION) error
 	duplicate    func(windows.Handle) (windows.Handle, error)
-	create       func(experimentalJobLaunch, [3]windows.Handle) (windows.ProcessInformation, error)
-	assign       func(windows.Handle, windows.Handle) error
+	create       func(experimentalJobLaunch, [3]windows.Handle, windows.Handle) (windows.ProcessInformation, error)
 	resume       func(windows.Handle) (uint32, error)
 	terminateJob func(windows.Handle) error
-	terminate    func(windows.Handle) error
 	wait         func(windows.Handle, uint32) (uint32, error)
 	exitCode     func(windows.Handle, *uint32) error
 	close        func(windows.Handle) error
@@ -165,11 +170,18 @@ func launchExperimentalWindowsJobWithCalls(ctx context.Context, cfg experimental
 			return nil, experimentalJobBlocked("duplicate stdio", err)
 		}
 	}
-	pi, err := api.create(cfg, stdio)
+	// The creation API accepts only the already-created/limited Job. A
+	// successful return guarantees membership at birth, even if this host dies
+	// before the next instruction. The Job handle is never inherited by P.
+	pi, err := api.create(cfg, stdio, p.job)
 	if err != nil {
-		return nil, experimentalJobBlocked("create suspended provider", err)
+		return nil, experimentalJobBlocked("create Job-owned provider", err)
 	}
 	p.process, thread = pi.Process, pi.Thread
+	member, err := api.inJob(p.process, p.job)
+	if err != nil || !member {
+		return nil, experimentalJobBlocked("verify creation-time membership", errors.Join(err, errors.New("membership not established by native creation")))
+	}
 	// Inheritance has completed. Drop our child-side stdio duplicates before
 	// any resume or cancellation callback can run; caller endpoints stay open.
 	for i, handle := range stdio {
@@ -178,20 +190,6 @@ func launchExperimentalWindowsJobWithCalls(ctx context.Context, cfg experimental
 		}
 		stdio[i] = 0
 	}
-	foreign, err = api.inJob(p.process, 0)
-	if err != nil || foreign {
-		return nil, experimentalJobBlocked("suspended provider Job ownership", errors.Join(err, errors.New("provider must not inherit a foreign Job")))
-	}
-	// The primary thread is still suspended here. There is no post-Start
-	// assignment, process scan, breakaway request, or PID-based cleanup.
-	if err := api.assign(p.job, p.process); err != nil {
-		return nil, experimentalJobBlocked("assign suspended provider", err)
-	}
-	member, err := api.inJob(p.process, p.job)
-	if err != nil || !member {
-		return nil, experimentalJobBlocked("verify suspended membership", errors.Join(err, errors.New("membership not established")))
-	}
-	p.assigned = true
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -221,7 +219,6 @@ type experimentalJobProcess struct {
 	owner      experimentalJobOwner
 	job        windows.Handle
 	process    windows.Handle
-	assigned   bool
 	stopCancel func() bool
 	closed     bool
 	exit       uint32
@@ -233,10 +230,10 @@ type experimentalJobProcess struct {
 func (p *experimentalJobProcess) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.closeLocked(false)
+	return p.closeLocked()
 }
 
-func (p *experimentalJobProcess) closeLocked(rootExited bool) error {
+func (p *experimentalJobProcess) closeLocked() error {
 	if p.closed {
 		return p.closeErr
 	}
@@ -249,9 +246,6 @@ func (p *experimentalJobProcess) closeLocked(rootExited bool) error {
 		if err := p.api.terminateJob(p.job); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if p.process != 0 && !p.assigned && !rootExited {
-		errs = append(errs, p.api.terminate(p.process)) // Own suspended, unassigned root only.
 	}
 	if p.job != 0 {
 		errs = append(errs, p.api.close(p.job))
@@ -285,7 +279,7 @@ func (p *experimentalJobProcess) Wait(ctx context.Context) (uint32, error) {
 		}
 		event, err := p.api.wait(p.process, 50)
 		if err == nil && event == windows.WAIT_OBJECT_0 {
-			err = p.closeLocked(true)
+			err = p.closeLocked()
 			code := p.exit
 			p.mu.Unlock()
 			return code, err
@@ -301,9 +295,9 @@ func nativeExperimentalJobCalls() (experimentalJobCalls, error) {
 	dll := windows.NewLazySystemDLL("kernel32.dll")
 	// Resolve before allocating native resources. Missing APIs block this
 	// experiment; they never select an uncontained launch path.
-	for _, name := range []string{"IsProcessInJob", "CreateJobObjectW", "SetInformationJobObject", "AssignProcessToJobObject",
+	for _, name := range []string{"IsProcessInJob", "CreateJobObjectW", "SetInformationJobObject",
 		"CreateProcessW", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "DeleteProcThreadAttributeList",
-		"DuplicateHandle", "ResumeThread", "TerminateJobObject", "TerminateProcess", "WaitForSingleObject", "GetExitCodeProcess", "CloseHandle"} {
+		"DuplicateHandle", "ResumeThread", "TerminateJobObject", "WaitForSingleObject", "GetExitCodeProcess", "CloseHandle"} {
 		if err := dll.NewProc(name).Find(); err != nil {
 			return experimentalJobCalls{}, err
 		}
@@ -329,18 +323,23 @@ func nativeExperimentalJobCalls() (experimentalJobCalls, error) {
 			return dup, err
 		},
 		create:       nativeExperimentalJobCreate,
-		assign:       windows.AssignProcessToJobObject,
 		resume:       windows.ResumeThread,
 		terminateJob: func(job windows.Handle) error { return windows.TerminateJobObject(job, 1) },
-		terminate:    func(process windows.Handle) error { return windows.TerminateProcess(process, 1) },
 		wait:         windows.WaitForSingleObject,
 		exitCode:     windows.GetExitCodeProcess,
 		close:        windows.CloseHandle,
 	}, nil
 }
 
-func nativeExperimentalJobCreate(cfg experimentalJobLaunch, stdio [3]windows.Handle) (windows.ProcessInformation, error) {
-	var pi windows.ProcessInformation
+func nativeExperimentalJobCreate(cfg experimentalJobLaunch, stdio [3]windows.Handle, job windows.Handle) (pi windows.ProcessInformation, result error) {
+	defer func() {
+		if result != nil {
+			result = experimentalJobBlocked("atomic Job creation", result)
+		}
+	}()
+	if job == 0 || job == windows.InvalidHandle {
+		return pi, errors.New("native creation requires the owned, limited Job handle")
+	}
 	app, err := windows.UTF16PtrFromString(cfg.Executable)
 	if err != nil {
 		return pi, err
@@ -357,7 +356,7 @@ func nativeExperimentalJobCreate(cfg experimentalJobLaunch, stdio [3]windows.Han
 	if err != nil {
 		return pi, err
 	}
-	attributes, err := windows.NewProcThreadAttributeList(1)
+	attributes, err := windows.NewProcThreadAttributeList(2)
 	if err != nil {
 		return pi, err
 	}
@@ -365,18 +364,23 @@ func nativeExperimentalJobCreate(cfg experimentalJobLaunch, stdio [3]windows.Han
 	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&stdio[0]), unsafe.Sizeof(stdio)); err != nil {
 		return pi, err
 	}
+	jobs := [1]windows.Handle{job}
+	if err := attributes.Update(experimentalJobListAttribute, unsafe.Pointer(&jobs[0]), unsafe.Sizeof(jobs)); err != nil {
+		return pi, err // Unsupported Job-list attributes NEVER select an unowned fallback.
+	}
 	si := windows.StartupInfoEx{}
 	si.Cb = uint32(unsafe.Sizeof(si))
 	si.Flags = windows.STARTF_USESTDHANDLES | windows.STARTF_USESHOWWINDOW
 	si.ShowWindow = windows.SW_HIDE
 	si.StdInput, si.StdOutput, si.StdErr = stdio[0], stdio[1], stdio[2]
 	si.ProcThreadAttributeList = attributes.List()
-	// CREATE_SUSPENDED is mandatory: assignment and membership verification
-	// happen in the caller before the ONLY ResumeThread call. No shell, parent
-	// spoofing, CREATE_BREAKAWAY_FROM_JOB, or inherited Job handle is supplied.
+	// The kernel establishes Job membership during creation. Suspension remains
+	// for pre-execution verification; it is not the containment boundary. No
+	// breakaway, parent spoofing, shell, or inherited Job handle is supplied.
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_NO_WINDOW |
 		windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
 	err = windows.CreateProcess(app, &command[0], nil, nil, true, flags, &env[0], dir, &si.StartupInfo, &pi)
+	runtime.KeepAlive(jobs)
 	runtime.KeepAlive(stdio)
 	runtime.KeepAlive(attributes)
 	return pi, err
