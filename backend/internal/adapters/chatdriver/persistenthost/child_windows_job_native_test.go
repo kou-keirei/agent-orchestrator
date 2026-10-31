@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,7 +28,9 @@ import (
 // run. No provider, shell, chat-host entry point, DB, or installed daemon is used.
 // H is the test controller outside every Job. Each serial case owns P -> L -> G
 // in one Job capped at three members/128 MiB. S is one independent child of H,
-// outside every Job, with no child-spawn branch and a 45-second self deadline.
+// outside every Job, with no child-spawn branch. All cases share one deadline:
+// assertions finish by 6s, every helper self-expires by 8s, and H aborts by 9s,
+// including cleanup. These failing watchdog exits never qualify containment.
 // There are exactly three tree cases (nine successful tree launches), one S,
 // one overflow attempt, and one breakaway attempt; probes are NEVER resumed.
 // The breakaway probe has an atomic guard Job and runs BEFORE G exists: even an
@@ -37,22 +40,24 @@ import (
 const (
 	nativeJobCommit       = 128 << 20
 	nativeJobProbeBytes   = 64 << 10
-	nativeJobCaseDeadline = 10 * time.Second
-	nativeJobHelperLife   = 20 * time.Second
-	nativeJobSiblingLife  = 45 * time.Second
+	nativeJobCaseDeadline = 5 * time.Second
+	nativeJobTestDeadline = 6 * time.Second
+	nativeJobHelperLife   = 8 * time.Second
+	nativeJobHardDeadline = 9 * time.Second
 	nativeJobJobList      = experimentalJobListAttribute
 )
 
 type nativeJobReport struct {
-	Token     string
-	Role      string
-	Event     string
-	PID       uint32
-	ChildRole string
-	Error     string
-	Errno     uint32
-	Allocated bool
-	Freed     bool
+	Token            string
+	Role             string
+	Event            string
+	PID              uint32
+	ChildRole        string
+	Error            string
+	Errno            uint32
+	Allocated        bool
+	Freed            bool
+	DeadlineUnixNano int64
 }
 
 type nativeJobHandle struct {
@@ -170,13 +175,14 @@ func nativeJobEnv(dir, token, role string) []string {
 		"GOMAXPROCS=1", "GOMEMLIMIT=16MiB", "GOGC=off", "GOTELEMETRY=off",
 		"AO_JOB_NATIVE_CANARY=1", "AO_JOB_NATIVE_DIR=" + dir,
 		"AO_JOB_NATIVE_TOKEN=" + token, "AO_JOB_NATIVE_ROLE=" + role,
+		"AO_JOB_NATIVE_DEADLINE=" + os.Getenv("AO_JOB_NATIVE_DEADLINE"),
 	}
 }
 
 func nativeJobConfig(exe, dir, token, role string, stdio [3]windows.Handle) experimentalJobLaunch {
 	return experimentalJobLaunch{
 		Enabled: true, Owner: experimentalJobOwner{SessionID: "native-canary-" + token, OwnerGeneration: 1, RuntimeGeneration: 1},
-		Executable: exe, Args: []string{"-test.run=^TestExperimentalWindowsJobNativeHelper$", "-test.count=1", "-test.timeout=60s"},
+		Executable: exe, Args: []string{"-test.run=^TestExperimentalWindowsJobNativeHelper$", "-test.count=1", "-test.timeout=9s"},
 		Workdir: dir, Environment: nativeJobEnv(dir, token, role), Stdio: stdio,
 		ProcessLimit: 3, CommitBytes: nativeJobCommit,
 	}
@@ -197,6 +203,8 @@ func nativeJobCommand(t *testing.T, dir, token, role, event string) {
 
 func nativeJobRead(t *testing.T, ctx context.Context, dir, token, role, event string) nativeJobReport {
 	t.Helper()
+	helperDeadline, err := nativeJobHelperDeadline()
+	nativeJobMust(t, err)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && ctx.Err() == nil {
 		name := nativeJobPath(dir, role, event, ".json")
@@ -208,7 +216,7 @@ func nativeJobRead(t *testing.T, ctx context.Context, dir, token, role, event st
 			nativeJobMust(t, err)
 			var report nativeJobReport
 			nativeJobMust(t, json.Unmarshal(data, &report))
-			if report.Token != token || report.Role != role || report.Event != event || report.Error != "" {
+			if report.Token != token || report.Role != role || report.Event != event || report.Error != "" || report.DeadlineUnixNano != helperDeadline.UnixNano() {
 				t.Fatalf("invalid native report: %+v", report)
 			}
 			t.Logf("native report: %+v", report)
@@ -231,12 +239,42 @@ func nativeJobAlive(t *testing.T, h windows.Handle) {
 	}
 }
 
-func nativeJobExited(t *testing.T, h windows.Handle, want uint32) {
+// Every blocking fixture wait consumes its existing absolute budget. Never
+// grant a fresh cleanup interval after the shared deadline has expired.
+func nativeJobWaitUntil(h windows.Handle, deadline time.Time, maximum time.Duration) (uint32, error) {
+	remaining := time.Until(deadline)
+	if remaining > maximum {
+		remaining = maximum
+	}
+	if remaining < time.Millisecond {
+		return uint32(windows.WAIT_TIMEOUT), context.DeadlineExceeded
+	}
+	return windows.WaitForSingleObject(h, uint32(remaining/time.Millisecond))
+}
+
+func nativeJobHelperDeadline() (time.Time, error) {
+	nanos, err := strconv.ParseInt(os.Getenv("AO_JOB_NATIVE_DEADLINE"), 10, 64)
+	if err != nil || nanos <= 0 {
+		return time.Time{}, errors.New("missing or invalid shared fixture deadline")
+	}
+	deadline := time.Unix(0, nanos)
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > nativeJobHelperLife {
+		return time.Time{}, errors.New("expired or oversized shared fixture deadline")
+	}
+	return deadline, nil
+}
+
+func nativeJobExited(t *testing.T, ctx context.Context, h windows.Handle, want uint32) {
 	t.Helper()
-	event, err := windows.WaitForSingleObject(h, 3000)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("owned process exit requires a bounded case context")
+	}
+	event, err := nativeJobWaitUntil(h, deadline, time.Second)
 	nativeJobMust(t, err)
 	if event != windows.WAIT_OBJECT_0 {
-		t.Fatal("owned process did not terminate within 3 seconds")
+		t.Fatal("owned process did not terminate within the remaining case budget (at most 1 second)")
 	}
 	var code uint32
 	nativeJobMust(t, windows.GetExitCodeProcess(h, &code))
@@ -372,6 +410,19 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 	if os.Getenv("AO_JOB_NATIVE_ROLE") != "" {
 		t.Fatal("controller cannot run in helper mode")
 	}
+	started := time.Now()
+	// Register first so this fail-closed watchdog stays armed through every
+	// later t.Cleanup, including a stuck native Wait/Close or scratch cleanup.
+	// Exiting H closes its own non-inherited Jobs; S has its earlier independent
+	// deadline. Code 94 fails the binary and cannot count as a cleanup success.
+	hardStop := time.AfterFunc(nativeJobHardDeadline, func() { os.Exit(94) })
+	t.Cleanup(func() { hardStop.Stop() })
+	fixtureCtx, fixtureCancel := context.WithDeadline(context.Background(), started.Add(nativeJobTestDeadline))
+	t.Cleanup(fixtureCancel)
+	helperDeadline := started.Add(nativeJobHelperLife)
+	// The explicit child environment carries this same absolute deadline down
+	// P -> L -> G. Neither a late launch nor readiness restarts a countdown.
+	t.Setenv("AO_JOB_NATIVE_DEADLINE", strconv.FormatInt(helperDeadline.UnixNano(), 10))
 	home, err := os.UserHomeDir()
 	nativeJobMust(t, err)
 	scratch := os.Getenv("AO_JOB_NATIVE_SCRATCH")
@@ -425,19 +476,15 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 	// killed by H, including constructor/readiness failures and test timeouts.
 	sibling, err := nativeJobFixtureCreate(siblingCfg, siblingStdio, false)
 	nativeJobMust(t, err)
-	nativeJobMust(t, siblingLedger.add(sibling.Process, "fixture-sibling", nil))
-	nativeJobMust(t, siblingLedger.add(sibling.Thread, "fixture-sibling-thread", nil))
-	for _, h := range siblingStdio {
-		nativeJobMust(t, siblingLedger.close(h))
-	}
-	nativeJobMust(t, siblingLedger.close(sibling.Thread))
+	// Install cooperative cleanup immediately after successful creation, before
+	// any subsequent ledger/stdio/readiness assertion can fail. It never kills S.
 	t.Cleanup(func() {
 		if err := os.WriteFile(nativeJobPath(siblingDir, "S", "quit", ".cmd"), []byte(token), 0o600); err != nil {
 			t.Error(err)
 		}
-		// A failing cooperative exit is still bounded by S's own 45-second
-		// watchdog. Code 93 fails; a watchdog exit never qualifies the canary.
-		event, err := windows.WaitForSingleObject(sibling.Process, 46000)
+		// Spend only the remainder of the shared 8s helper budget. S's own
+		// already-armed watchdog survives H's death; code 93 still fails here.
+		event, err := nativeJobWaitUntil(sibling.Process, helperDeadline, nativeJobHelperLife)
 		if err != nil || event != windows.WAIT_OBJECT_0 {
 			t.Errorf("independent sibling exit wait=%d error=%v", event, err)
 			return
@@ -447,21 +494,28 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 			t.Errorf("independent sibling exit=%d error=%v", code, err)
 		}
 	})
+	nativeJobMust(t, siblingLedger.add(sibling.Process, "fixture-sibling", nil))
+	nativeJobMust(t, siblingLedger.add(sibling.Thread, "fixture-sibling-thread", nil))
+	for _, h := range siblingStdio {
+		nativeJobMust(t, siblingLedger.close(h))
+	}
+	nativeJobMust(t, siblingLedger.close(sibling.Thread))
 	siblingMember, err := raw.inJob(sibling.Process, 0)
 	nativeJobMust(t, err)
 	if siblingMember {
 		t.Fatal("independent sibling unexpectedly belongs to a Job")
 	}
-	siblingCtx, siblingCancel := context.WithTimeout(context.Background(), nativeJobSiblingLife+time.Second)
-	t.Cleanup(siblingCancel)
-	_ = nativeJobRead(t, siblingCtx, siblingDir, token, "S", "ready")
+	siblingReady := nativeJobRead(t, fixtureCtx, siblingDir, token, "S", "ready")
+	if siblingReady.PID != sibling.ProcessId {
+		t.Fatal("independent sibling creation and readiness identities differ")
+	}
 	for index, action := range []string{"cancel", "close", "wait"} {
 		if !t.Run(action, func(t *testing.T) {
 			dir := filepath.Join(root, action)
 			nativeJobMust(t, os.Mkdir(dir, 0o700))
 			ledger := newNativeJobHandles()
 			t.Cleanup(func() { ledger.cleanup(t) })
-			ctx, cancel := context.WithTimeout(context.Background(), nativeJobCaseDeadline)
+			ctx, cancel := context.WithTimeout(fixtureCtx, nativeJobCaseDeadline)
 			t.Cleanup(cancel)
 			launchCtx, cancelLaunch := context.WithCancel(ctx)
 			api, job, atCreate, preResume := nativeJobTrackedCalls(t, ledger, raw)
@@ -538,7 +592,7 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 			case "wait":
 				rootExit = 0
 				nativeJobCommand(t, dir, token, "P", "exit")
-				nativeJobExited(t, witnesses[0], 0)
+				nativeJobExited(t, ctx, witnesses[0], 0)
 				nativeJobAlive(t, witnesses[1])
 				nativeJobAlive(t, witnesses[2])
 				code, err := p.Wait(ctx)
@@ -554,7 +608,7 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 				if i == 0 {
 					want = rootExit
 				}
-				nativeJobExited(t, h, want)
+				nativeJobExited(t, ctx, h, want)
 			}
 			nativeJobAlive(t, sibling.Process)
 		}) {
@@ -573,6 +627,7 @@ func TestExperimentalWindowsJobNativeAcceptance(t *testing.T) {
 	if beforeWD != afterWD || beforeSession != os.Getenv("AO_SESSION_ID") || beforeData != os.Getenv("AO_DATA_DIR") {
 		t.Fatal("original controller workdir/session environment changed")
 	}
+	nativeJobMust(t, fixtureCtx.Err())
 }
 
 func nativeJobEmit(dir string, report nativeJobReport) error {
@@ -607,17 +662,19 @@ func TestExperimentalWindowsJobNativeHelper(t *testing.T) {
 }
 
 func nativeJobHelper(role string) (code int) {
+	deadline, err := nativeJobHelperDeadline()
+	if err != nil {
+		return 93 // Fail before readiness/native calls; never reset an expired budget.
+	}
+	// Arm before validation, native discovery, or ready emission. In particular,
+	// S keeps this independent countdown if H exits immediately after ready.
+	watchdog := time.AfterFunc(time.Until(deadline), func() { os.Exit(93) })
+	defer watchdog.Stop()
 	dir, token := os.Getenv("AO_JOB_NATIVE_DIR"), os.Getenv("AO_JOB_NATIVE_TOKEN")
 	wd, err := os.Getwd()
 	if err != nil || !filepath.IsAbs(dir) || wd != dir || len(token) != 32 || os.Getenv("AO_SESSION_ID") != "" || os.Getenv("AO_DATA_DIR") != "" {
 		return 91
 	}
-	life := nativeJobHelperLife
-	if role == "S" {
-		life = nativeJobSiblingLife
-	}
-	watchdog := time.AfterFunc(life, func() { os.Exit(93) })
-	defer watchdog.Stop()
 	raw, err := nativeExperimentalJobCalls()
 	if err != nil {
 		return 91
@@ -627,7 +684,7 @@ func nativeJobHelper(role string) (code int) {
 		return 91
 	}
 	emit := func(event string, err error) nativeJobReport {
-		r := nativeJobReport{Token: token, Role: role, Event: event, PID: uint32(os.Getpid())}
+		r := nativeJobReport{Token: token, Role: role, Event: event, PID: uint32(os.Getpid()), DeadlineUnixNano: deadline.UnixNano()}
 		if err != nil {
 			r.Error, r.Errno = err.Error(), nativeJobErrno(err)
 		}
@@ -655,9 +712,11 @@ func nativeJobHelper(role string) (code int) {
 		}
 	}()
 	seen := make(map[string]bool)
-	deadline := time.Now().Add(life)
 	for time.Now().Before(deadline) {
 		for _, op := range []string{"probe-before", "probe-denied", "probe-after", "create", "resume", "breakaway", "overflow", "exit", "quit"} {
+			if !time.Now().Before(deadline) {
+				return 93
+			}
 			if seen[op] {
 				continue
 			}
@@ -769,6 +828,9 @@ func nativeJobHelperCreate(raw experimentalJobCalls, cfg experimentalJobLaunch) 
 
 func nativeJobFixtureCreate(cfg experimentalJobLaunch, stdio [3]windows.Handle, inheritJob bool) (windows.ProcessInformation, error) {
 	var pi windows.ProcessInformation
+	if _, err := nativeJobHelperDeadline(); err != nil {
+		return pi, experimentalJobBlocked("fixture deadline", err)
+	}
 	raw, err := nativeExperimentalJobCalls()
 	if err != nil {
 		return pi, experimentalJobBlocked("fixture native APIs", err)
@@ -810,6 +872,9 @@ func nativeJobFixtureCreate(cfg experimentalJobLaunch, stdio [3]windows.Handle, 
 	if inheritJob {
 		flags |= windows.CREATE_SUSPENDED // Membership is inherited at birth, not at resume.
 	}
+	if _, err := nativeJobHelperDeadline(); err != nil {
+		return pi, experimentalJobBlocked("fixture deadline before create", err)
+	}
 	err = windows.CreateProcess(app, &command[0], nil, nil, true, flags, &env[0], dir, &si.StartupInfo, &pi)
 	runtime.KeepAlive(stdio)
 	runtime.KeepAlive(attributes)
@@ -817,6 +882,10 @@ func nativeJobFixtureCreate(cfg experimentalJobLaunch, stdio [3]windows.Handle, 
 }
 
 func nativeJobBreakaway(raw experimentalJobCalls, cfg experimentalJobLaunch) (result error) {
+	deadline, err := nativeJobHelperDeadline()
+	if err != nil {
+		return experimentalJobBlocked("breakaway deadline", err)
+	}
 	// This guard contains an unexpectedly permitted breakaway AT CREATION.
 	// It is non-inherited and kill-on-close, so P's own deadline/Job death also
 	// destroys the guard. The probe is never resumed, even on test failure.
@@ -868,7 +937,7 @@ func nativeJobBreakaway(raw experimentalJobCalls, cfg experimentalJobLaunch) (re
 	runtime.KeepAlive(attributes)
 	if err == nil {
 		stopErr := windows.TerminateJobObject(guard, 92)
-		event, waitErr := windows.WaitForSingleObject(pi.Process, 3000)
+		event, waitErr := nativeJobWaitUntil(pi.Process, deadline, time.Second)
 		closeErr := errors.Join(windows.CloseHandle(pi.Thread), windows.CloseHandle(pi.Process))
 		return errors.Join(errors.New("breakaway unexpectedly succeeded"), stopErr, waitErr, closeErr, fmt.Errorf("probe wait=%d", event))
 	}
