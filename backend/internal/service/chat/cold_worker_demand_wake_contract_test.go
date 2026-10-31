@@ -5,21 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 // These are source-contract tests, not installed cold-start/wake E2E tests.
 // New models passive service construction; the injected restorer models the
 // manager boundary by publishing an unstarted controller backed by a fake
-// conversation. No provider driver, event loop, daemon, runtime, SQLite, native
-// user session, credentials, or network is involved. Manager recovery and actual
-// provider restoration remain separate qualification requirements.
+// conversation. The additional durable-delivery and manager tests use only
+// t.TempDir SQLite and fake provider boundaries. No real provider, daemon,
+// runtime, native user session, provider credentials, or network is involved.
+// Installed recovery and actual provider restoration remain unqualified.
 type coldDemandStore struct {
 	// Unimplemented operations fail loudly if this bounded path expands.
 	Store
@@ -302,6 +308,236 @@ func TestColdWorkerDemandWakeAddressedSend(t *testing.T) {
 			}
 			if len(restored) != 1 || registry.calls != 0 {
 				t.Fatalf("post-send history triggered extra work: restores=%v drivers=%d", restored, registry.calls)
+			}
+		})
+	}
+}
+
+// Use production persistence for duplicate delivery: a fake returning false on
+// its second call would not establish that the client ID is durably deduplicated.
+func coldDemandDurableStore(t *testing.T, rec domain.SessionRecord) (*sqlite.Store, domain.SessionRecord) {
+	t.Helper()
+	ctx := context.Background()
+	st := sqlitetest.MustOpenAt(t, t.TempDir())
+	if err := st.UpsertProject(ctx, domain.ProjectRecord{
+		ID: string(rec.ProjectID), Path: rec.Metadata.WorkspacePath, RegisteredAt: rec.CreatedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec.Metadata.Branch = "ao/cold-contract"
+	rec.Metadata.ControllerGeneration = "saved-generation"
+	rec.Metadata.Permissions = ports.PermissionModeAuto
+	created, err := st.CreateSession(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = created // SQLite owns session numbering; retain its assigned identity.
+	if _, err := st.CreateConversation(ctx, "durable-cold-conversation", domain.ConversationScopeSession,
+		rec.ProjectID, rec.ID, rec.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	current, found, err := st.GetSession(ctx, rec.ID)
+	if err != nil || !found {
+		t.Fatalf("read durable fixture: found=%v err=%v", found, err)
+	}
+	return st, current
+}
+
+func TestColdWorkerDemandWakeLostAcknowledgementDuplicate(t *testing.T) {
+	ctx := context.Background()
+	svc, fake, registry := newColdDemandFixture(t)
+	st, rec := coldDemandDurableStore(t, fake.records["cold-target"])
+	svc.store, svc.sessions = st, st
+	conversation, err := st.ConversationForSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &coldDemandConversation{id: rec.Metadata.ProviderConversationID}
+	restores := 0
+	svc.SetControllerRestorer(func(_ context.Context, id domain.SessionID) error {
+		restores++
+		if id != rec.ID {
+			t.Fatalf("restored foreign session %s", id)
+		}
+		controller := newController(id, conversation, rec.Metadata.ControllerGeneration, rec.Harness,
+			rec.Metadata.Permissions, provider, st, nil, slog.New(slog.DiscardHandler), svc.newID, svc.now, nil, nil)
+		svc.mu.Lock()
+		svc.controllers[id] = controller
+		svc.mu.Unlock()
+		return nil
+	})
+	msg := ports.ChatUserMessage{Text: "retry after lost acknowledgement", ClientMessageID: "cold-exact-client-id", Origin: domain.MessageOriginHuman}
+	first, err := svc.Send(ctx, rec.ID, msg)
+	if err != nil || first.ID == "" || first.HandledBySessionID != rec.ID {
+		t.Fatalf("first send: turn=%+v err=%v", first, err)
+	}
+	// Simulate losing the response, then retry the identical request through the
+	// real Send method while its first provider turn remains pending. Removing
+	// the controller's !created guard would falsely return a new queued turn.
+	duplicate, err := svc.Send(ctx, rec.ID, msg)
+	if err != nil || !reflect.DeepEqual(duplicate, domain.ConversationTurn{}) {
+		t.Fatalf("duplicate falsely acknowledged creation: turn=%+v err=%v", duplicate, err)
+	}
+	rows, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows.Turns) != 1 || rows.Turns[0].ID != first.ID || rows.Turns[0].ProviderTurnID != "fake-turn" ||
+		len(rows.Messages) != 1 || rows.Messages[0].ClientMessageID != msg.ClientMessageID || rows.Messages[0].Text != msg.Text {
+		t.Fatalf("duplicate changed durable delivery: turns=%+v messages=%+v", rows.Turns, rows.Messages)
+	}
+	if restores != 1 || registry.calls != 0 || len(provider.sends) != 1 ||
+		provider.sends[0].ClientMessageID != msg.ClientMessageID || provider.sends[0].Text != msg.Text {
+		t.Fatalf("duplicate caused work: restores=%d drivers=%d sends=%+v", restores, registry.calls, provider.sends)
+	}
+}
+
+type coldDemandNoAgents struct{}
+
+func (coldDemandNoAgents) Agent(domain.AgentHarness) (ports.Agent, bool) { return nil, false }
+
+// This is a synthetic browser credential, never a provider or installed AO
+// credential. It enables the existing production owner-CAS before provider birth.
+type coldDemandCapabilityIssuer struct{}
+
+func (coldDemandCapabilityIssuer) Issue(domain.SessionID) (string, string, error) {
+	return "fixture-browser-token", "fixture-browser-verifier", nil
+}
+
+type coldDemandOwnerStore struct {
+	*sqlite.Store
+	foreign bool
+}
+
+func (f coldDemandOwnerStore) ConversationForSession(ctx context.Context, id domain.SessionID) (domain.ConversationRecord, error) {
+	rec, err := f.Store.ConversationForSession(ctx, id)
+	if f.foreign && err == nil {
+		rec.SessionID = "cold-foreign-session"
+	}
+	return rec, err
+}
+
+type coldDemandManagedLauncher struct {
+	*Service
+	beforeStart func(ports.ChatControllerStart)
+	starts      int
+}
+
+func (f *coldDemandManagedLauncher) StartChat(ctx context.Context, cfg ports.ChatControllerStart) (ports.ChatControllerStarted, error) {
+	f.starts++
+	f.beforeStart(cfg)
+	return f.Service.StartChat(ctx, cfg)
+}
+
+type coldDemandBirthDriver struct {
+	ports.ChatDriver
+	resumes []ports.ChatResumeConfig
+	births  int
+}
+
+func (f *coldDemandBirthDriver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.ChatConversation, error) {
+	f.resumes = append(f.resumes, cfg)
+	if cfg.PrepareEnv == nil {
+		return nil, errors.New("fixture requires real manager launch preparation")
+	}
+	// Drivers execute this existing callback before creating a provider. The
+	// callback, manager and SQLite perform all ownership checks, not this fake.
+	if _, err := cfg.PrepareEnv(ctx); err != nil {
+		return nil, err
+	}
+	f.births++
+	return nil, errors.New("unexpected provider birth")
+}
+
+func (f *coldDemandBirthDriver) Start(context.Context, ports.ChatStartConfig) (ports.ChatConversation, error) {
+	f.births++
+	return nil, errors.New("unexpected fresh provider birth")
+}
+
+type coldDemandBirthRegistry struct{ driver *coldDemandBirthDriver }
+
+func (f coldDemandBirthRegistry) Driver(domain.AgentHarness) (ports.ChatDriver, error) {
+	return f.driver, nil
+}
+func (coldDemandBirthRegistry) SupportsChat(domain.AgentHarness) bool { return true }
+
+func TestColdWorkerDemandWakeManagerOwnerRefusal(t *testing.T) {
+	for _, scenario := range []string{"foreign continuity", "stale generation", "foreign native conversation"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
+			svc, fake, _ := newColdDemandFixture(t)
+			st, original := coldDemandDurableStore(t, fake.records["cold-target"])
+			observed := coldDemandOwnerStore{Store: st, foreign: scenario == "foreign continuity"}
+			svc.store, svc.sessions = observed, st
+			driver := &coldDemandBirthDriver{}
+			svc.drivers = coldDemandBirthRegistry{driver: driver}
+			launcher := &coldDemandManagedLauncher{Service: svc}
+			launcher.beforeStart = func(cfg ports.ChatControllerStart) {
+				if cfg.SessionID != original.ID || cfg.ProviderConversationID != original.Metadata.ProviderConversationID ||
+					cfg.ExpectedControllerOwner != original.ControllerOwner() {
+					t.Fatalf("manager selected foreign/stale restore identity: %+v", cfg.ExpectedControllerOwner)
+				}
+				// Change the durable owner after the manager has selected its
+				// snapshot, before the real service invokes launch preparation.
+				current := original
+				if scenario == "stale generation" {
+					current.Metadata.ControllerGeneration = "replacement-generation"
+				} else if scenario == "foreign native conversation" {
+					current.Metadata.ProviderConversationID = "foreign-native-conversation"
+				}
+				if err := st.UpdateSession(ctx, current); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dataDir := t.TempDir()
+			manager := sessionmanager.New(sessionmanager.Deps{
+				Store:               st,
+				Chat:                launcher,
+				Agents:              coldDemandNoAgents{},
+				DataDir:             dataDir,
+				RunFilePath:         filepath.Join(dataDir, "fixture-running.json"),
+				BrowserCapabilities: coldDemandCapabilityIssuer{},
+				Executable:          func() (string, error) { return filepath.Join(dataDir, "ao.exe"), nil },
+				Logger:              slog.New(slog.DiscardHandler),
+			})
+			svc.SetControllerRestorer(manager.EnsureChatController)
+			turn, err := svc.Send(ctx, original.ID, ports.ChatUserMessage{
+				Text: "must not reach a provider", ClientMessageID: "owner-refusal", Origin: domain.MessageOriginHuman,
+			})
+			if !errors.Is(err, ports.ErrChatControllerRestore) || !reflect.DeepEqual(turn, domain.ConversationTurn{}) {
+				t.Fatalf("manager did not refuse stale/foreign ownership: turn=%+v err=%v", turn, err)
+			}
+			if scenario == "foreign continuity" {
+				if !strings.Contains(err.Error(), "invalid Chat continuity owner") || launcher.starts != 0 || len(driver.resumes) != 0 {
+					t.Fatalf("manager bypassed continuity refusal: starts=%d resumes=%d err=%v", launcher.starts, len(driver.resumes), err)
+				}
+			} else {
+				if !strings.Contains(err.Error(), "session controller ownership changed before browser capability rotation") ||
+					launcher.starts != 1 || len(driver.resumes) != 1 {
+					t.Fatalf("real owner-CAS was not exercised: starts=%d resumes=%d err=%v", launcher.starts, len(driver.resumes), err)
+				}
+				resume := driver.resumes[0]
+				if resume.SessionID != original.ID || resume.ProviderConversationID != original.Metadata.ProviderConversationID {
+					t.Fatalf("wrong native resume identity: session=%s provider=%s", resume.SessionID, resume.ProviderConversationID)
+				}
+			}
+			rows, readErr := st.LoadConversationSnapshot(ctx, "durable-cold-conversation")
+			if readErr != nil || len(rows.Turns) != 0 || len(rows.Messages) != 0 || driver.births != 0 || svc.HasLiveChatController(original.ID) {
+				t.Fatalf("unauthorized provider/work: births=%d turns=%d messages=%d live=%v err=%v",
+					driver.births, len(rows.Turns), len(rows.Messages), svc.HasLiveChatController(original.ID), readErr)
+			}
+			current, found, readErr := st.GetSession(ctx, original.ID)
+			if readErr != nil || !found {
+				t.Fatalf("read refused owner: found=%v err=%v", found, readErr)
+			}
+			expected := original.ControllerOwner()
+			if scenario == "stale generation" {
+				expected.ControllerGeneration = "replacement-generation"
+			} else if scenario == "foreign native conversation" {
+				expected.ProviderConversationID = "foreign-native-conversation"
+			}
+			if current.ControllerOwner() != expected || current.Metadata.BrowserCapabilityVerifier != original.Metadata.BrowserCapabilityVerifier {
+				t.Fatalf("refused restore changed durable ownership: got=%+v want=%+v", current.ControllerOwner(), expected)
 			}
 		})
 	}
