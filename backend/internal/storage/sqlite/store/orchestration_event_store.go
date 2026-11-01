@@ -110,6 +110,7 @@ func hasUnresolvedPRComments(comments []domain.PullRequestComment) bool {
 	return false
 }
 
+// EnqueueOrchestrationEvent inserts an event unless its source revision already exists.
 func (s *Store) EnqueueOrchestrationEvent(ctx context.Context, e domain.OrchestrationEvent) (bool, error) {
 	if e.ProjectID == "" {
 		return false, nil
@@ -127,6 +128,7 @@ func (s *Store) EnqueueOrchestrationEvent(ctx context.Context, e domain.Orchestr
 	return rows == 1, err
 }
 
+// RecordOrchestrationSourceState records source transitions and enqueues newly active generations.
 func (s *Store) RecordOrchestrationSourceState(ctx context.Context, project domain.ProjectID, worker domain.SessionID, kind domain.OrchestrationEventKind, sourceID string, active bool, now time.Time) (bool, error) {
 	if project == "" {
 		return false, nil
@@ -176,6 +178,7 @@ func (s *Store) RecordOrchestrationSourceState(ctx context.Context, project doma
 	return created, err
 }
 
+// ReclaimOrchestrationEventLeases retries or dead-letters events whose delivery leases expired.
 func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -203,6 +206,7 @@ func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Ti
 	return result.RowsAffected()
 }
 
+// MarkProjectNoDestinationAttention marks overdue pending events as requiring attention.
 func (s *Store) MarkProjectNoDestinationAttention(ctx context.Context, project domain.ProjectID, now time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -213,6 +217,7 @@ func (s *Store) MarkProjectNoDestinationAttention(ctx context.Context, project d
 	return result.RowsAffected()
 }
 
+// MarkOrchestrationRetentionOverflow dead-letters pending events exceeding age or count limits.
 func (s *Store) MarkOrchestrationRetentionOverflow(ctx context.Context, now time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -223,6 +228,7 @@ func (s *Store) MarkOrchestrationRetentionOverflow(ctx context.Context, now time
 	return result.RowsAffected()
 }
 
+// ListDueOrchestrationEvents loads due events while preserving reclaimed batch membership.
 func (s *Store) ListDueOrchestrationEvents(ctx context.Context, project domain.ProjectID, now time.Time, limit int) ([]domain.OrchestrationEvent, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -263,6 +269,7 @@ func (s *Store) ListDueOrchestrationEvents(ctx context.Context, project domain.P
 	return events, nil
 }
 
+// ListOrchestrationEvents lists recent events for a project.
 func (s *Store) ListOrchestrationEvents(ctx context.Context, project domain.ProjectID, limit int) ([]domain.OrchestrationEvent, error) {
 	rows, err := s.readDB.QueryContext(ctx, `SELECT `+orchestrationColumns+` FROM orchestration_events WHERE project_id=? ORDER BY enqueued_at DESC,id DESC LIMIT ?`, project, limit)
 	if err != nil {
@@ -284,6 +291,7 @@ func (s *Store) ListOrchestrationEventsRequiringAttention(ctx context.Context, p
 	return scanOrchestrationEvents(rows)
 }
 
+// ClearOrchestrationAttention clears attention markers for the specified events.
 func (s *Store) ClearOrchestrationAttention(ctx context.Context, ids []string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -297,6 +305,7 @@ func (s *Store) ClearOrchestrationAttention(ctx context.Context, ids []string) e
 	})
 }
 
+// RetryDeadLetterOrchestrationEvent retries a project-scoped dead-letter event and its batch.
 func (s *Store) RetryDeadLetterOrchestrationEvent(ctx context.Context, project domain.ProjectID, id string, now time.Time) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -311,18 +320,21 @@ func (s *Store) RetryDeadLetterOrchestrationEvent(ctx context.Context, project d
 	return rows > 0, err
 }
 
+// LeaseOrchestrationEvents assigns pending events to a destination under a lease token.
 func (s *Store) LeaseOrchestrationEvents(ctx context.Context, ids []string, token string, destination domain.SessionID, expires time.Time) error {
 	return s.updateOrchestrationBatch(ctx, "lease orchestration events", ids, func(db gen.DBTX, id string) (sql.Result, error) {
 		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='leased',lease_token=?,lease_expires_at=?,destination_session_id=? WHERE id=? AND state='pending'`, token, expires, destination, id)
 	})
 }
 
+// MarkOrchestrationEventsSubmitted records submission for events matching the lease token.
 func (s *Store) MarkOrchestrationEventsSubmitted(ctx context.Context, ids []string, token string, at time.Time) error {
 	return s.updateOrchestrationBatch(ctx, "submit orchestration events", ids, func(db gen.DBTX, id string) (sql.Result, error) {
 		return db.ExecContext(ctx, `UPDATE orchestration_events SET state=CASE WHEN state='leased' THEN 'submitted' ELSE state END,submitted_at=COALESCE(submitted_at,?) WHERE id=? AND state IN ('leased','acknowledged') AND lease_token=?`, at, id, token)
 	})
 }
 
+// AcknowledgeOrchestrationEvents acknowledges events matching the lease token.
 func (s *Store) AcknowledgeOrchestrationEvents(ctx context.Context, ids []string, token string, at time.Time) error {
 	return s.updateOrchestrationBatch(ctx, "acknowledge orchestration events", ids, func(db gen.DBTX, id string) (sql.Result, error) {
 		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='acknowledged',acknowledged_at=?,lease_expires_at=NULL,last_error='' WHERE id=? AND state IN ('leased','submitted') AND lease_token=?`, at, id, token)
@@ -342,6 +354,7 @@ func (s *Store) AcknowledgeOrchestrationBatchAccepted(ctx context.Context, desti
 	return result.RowsAffected()
 }
 
+// RetryOrchestrationEvents schedules retries or dead-letters a failed delivery batch.
 func (s *Store) RetryOrchestrationEvents(ctx context.Context, events []domain.OrchestrationEvent, token, message string, now time.Time, mode domain.SessionMode) error {
 	if len(message) > 512 {
 		message = message[:512]
