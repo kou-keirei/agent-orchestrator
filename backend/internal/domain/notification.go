@@ -16,7 +16,8 @@ const (
 	// NotificationPRMerged means a tracked PR was merged.
 	NotificationPRMerged NotificationType = "pr_merged"
 	// NotificationPRClosedUnmerged means a tracked PR closed without merging.
-	NotificationPRClosedUnmerged       NotificationType = "pr_closed_unmerged"
+	NotificationPRClosedUnmerged NotificationType = "pr_closed_unmerged"
+	// NotificationOrchestrationAttention means an orchestration event needs user attention.
 	NotificationOrchestrationAttention NotificationType = "orchestration_attention"
 )
 

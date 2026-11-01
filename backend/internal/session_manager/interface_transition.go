@@ -188,7 +188,7 @@ func (m *Manager) StartInterfaceTransition(
 	}
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
-		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: stored permission mode is invalid: %s", ports.ErrChatPermissionModeUnsupported, err.Error())
 	}
 	if target == domain.SessionModeTUI && permissions == ports.PermissionModeReadOnly {
 		// Refuse before arming or stopping Chat: read-only is a provider-enforced
@@ -696,20 +696,20 @@ func (m *Manager) nativeConversationNotStarted(
 		if !filepath.IsAbs(path) {
 			return false
 		}
-		if _, err := os.Lstat(path); err == nil {
+		_, err := os.Lstat(path)
+		if err == nil {
 			return false
-		} else {
-			if !errors.Is(err, os.ErrNotExist) {
-				return false
-			}
-			// A missing leaf is safe only when its parent can be resolved as a
-			// directory. If lookup failed because an ancestor is missing or is
-			// not a directory, fail closed instead of treating the error as a
-			// fresh conversation.
-			parentInfo, parentErr := os.Stat(filepath.Dir(path))
-			if parentErr != nil || !parentInfo.IsDir() {
-				return false
-			}
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		// A missing leaf is safe only when its parent can be resolved as a
+		// directory. If lookup failed because an ancestor is missing or is
+		// not a directory, fail closed instead of treating the error as a
+		// fresh conversation.
+		parentInfo, parentErr := os.Stat(filepath.Dir(path))
+		if parentErr != nil || !parentInfo.IsDir() {
+			return false
 		}
 	}
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
@@ -855,7 +855,7 @@ func (m *Manager) preflightInterfaceTarget(
 	}
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
-		return fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+		return fmt.Errorf("%w: stored permission mode is invalid: %s", ports.ErrChatPermissionModeUnsupported, err.Error())
 	}
 	config.Permissions = permissions
 	if config.Permissions == ports.PermissionModeReadOnly {

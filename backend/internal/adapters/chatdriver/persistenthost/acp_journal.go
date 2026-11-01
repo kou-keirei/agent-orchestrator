@@ -31,13 +31,9 @@ func openACPPromptJournal(ctx context.Context, path string) (*acpPromptJournal, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o600)
+	file, err := openACPJournalFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open persistent ACP prompt journal: %w", err)
-	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("secure persistent ACP prompt journal: %w", err)
 	}
 	return &acpPromptJournal{path: path, file: file}, nil
 }

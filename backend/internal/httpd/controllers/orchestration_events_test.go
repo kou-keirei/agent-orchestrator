@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
-	"github.com/go-chi/chi/v5"
 )
 
 type orchestrationReaderFake struct {

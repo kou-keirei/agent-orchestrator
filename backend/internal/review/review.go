@@ -105,12 +105,12 @@ func reviewerCleanupPendingIdentity(body string) (marker, handleID, launchID str
 	for {
 		start := strings.Index(body, reviewerCleanupPendingPrefix)
 		if start < 0 {
-			return
+			return marker, handleID, launchID, ok
 		}
 		value := body[start:]
 		end := strings.IndexByte(value, ']')
 		if end < 0 {
-			return
+			return marker, handleID, launchID, ok
 		}
 		// A malformed earlier marker must not consume a later valid marker.
 		if next := strings.Index(value[len(reviewerCleanupPendingPrefix):], reviewerCleanupPendingPrefix); next >= 0 && next+len(reviewerCleanupPendingPrefix) < end {
@@ -137,16 +137,6 @@ func reviewerCleanupPendingIdentity(body string) (marker, handleID, launchID str
 			marker, handleID, launchID, ok = candidate, candidateHandle, candidateLaunch, true
 		}
 	}
-}
-
-func reviewerCleanupPendingHandle(body string) string {
-	_, handleID, _, _ := reviewerCleanupPendingIdentity(body)
-	return handleID
-}
-
-func reviewerCleanupPendingGeneration(body string) string {
-	_, _, launchID, _ := reviewerCleanupPendingIdentity(body)
-	return launchID
 }
 
 // Sessions resolves the worker session under review.
@@ -685,7 +675,7 @@ func (e *Engine) observeReviewWorkspace(ctx stdctx.Context, worker domain.Sessio
 		ProjectID:        worker.ProjectID,
 	})
 	if err != nil {
-		return ports.WorkspaceObservation{}, fmt.Errorf("%w: observe reviewer workspace: %v", ErrInvalid, err)
+		return ports.WorkspaceObservation{}, fmt.Errorf("%w: observe reviewer workspace: %s", ErrInvalid, fmt.Sprint(err))
 	}
 	if strings.TrimSpace(observation.Path) != workspacePath || strings.TrimSpace(observation.HeadSHA) == "" {
 		return ports.WorkspaceObservation{}, fmt.Errorf("%w: reviewer target binding observation is incomplete", ErrInvalid)
@@ -1012,7 +1002,7 @@ func (e *Engine) restoreReviewerLocked(
 			return RestoreReviewerResult{}, failureErr
 		}
 		cleanupErr := e.cleanupRestoredReviewer(ctx, worker.ID, reviewRow, hasReview, restoreRuns, harness, launch.LaunchID, agentSessionID, launch.HandleID)
-		failureErr := error(errors.New(reason))
+		failureErr := errors.New(reason)
 		if cleanupErr != nil {
 			failureErr = errors.Join(failureErr, cleanupErr)
 		}

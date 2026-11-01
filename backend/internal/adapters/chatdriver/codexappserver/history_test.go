@@ -646,11 +646,12 @@ func TestRollbackUncertainMutationDoesNotRetry(t *testing.T) {
 				done := make(chan error, 1)
 				go func() { done <- conv.Rollback(ctx, "turn-b") }()
 				request := srv.awaitFrame(func(f frame) bool { return f.Method == method })
-				want := error(context.DeadlineExceeded)
-				if failure == "cancel" {
+				want := context.DeadlineExceeded
+				switch failure {
+				case "cancel":
 					cancel()
 					want = context.Canceled
-				} else if failure == "transport" {
+				case "transport":
 					_ = srv.toClient.Close()
 					want = ErrConnClosed
 				}
