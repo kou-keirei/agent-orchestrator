@@ -240,14 +240,14 @@ type ChatNativeEvidence struct {
 	ControllerGeneration   string
 	ProviderConversationID string
 	ProviderTurnID         string
-	Provider             string
-	RequestedPermission  string
-	EffectivePermission  string
-	ApprovalPolicy       string
-	ThreadSandbox        string
-	TurnSandbox          string
-	PreventiveCapability bool
-	ProofStatus          string
+	Provider               string
+	RequestedPermission    string
+	EffectivePermission    string
+	ApprovalPolicy         string
+	ThreadSandbox          string
+	TurnSandbox            string
+	PreventiveCapability   bool
+	ProofStatus            string
 }
 
 // ChatNativeEvidenceReader is implemented by conversations whose provider
