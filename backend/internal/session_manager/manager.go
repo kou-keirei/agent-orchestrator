@@ -3079,6 +3079,16 @@ func (m *Manager) reconcileInterruptedSpawnSeeds(ctx context.Context) error {
 		if rec.IsTerminated || rec.Kind != domain.KindOrchestrator || rec.Metadata.WorkspacePath != "" || runtimeHandle(rec.Metadata).ID != "" {
 			continue
 		}
+		// A launch can persist ownership or recovery identity before its final
+		// workspace/runtime metadata commit (notably Chat's controller claim).
+		// Preserve those durable anchors for the existing recovery paths.
+		metadata := rec.Metadata
+		if metadata.Branch != "" || metadata.WorkspaceRepoPath != "" ||
+			metadata.RuntimeLaunchID != "" || metadata.AgentSessionID != "" ||
+			metadata.AgentSessionIDLaunchID != "" || metadata.ProviderConversationID != "" ||
+			metadata.ControllerGeneration != "" || metadata.NativeTranscriptPath != "" {
+			continue
+		}
 		rows, err := m.store.ListSessionWorktrees(ctx, rec.ID)
 		if err != nil {
 			return fmt.Errorf("reconcile: list worktrees for interrupted spawn %s: %w", rec.ID, err)
