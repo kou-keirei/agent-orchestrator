@@ -30,7 +30,7 @@ const countUnresolvedNotifications = `-- name: CountUnresolvedNotifications :one
 SELECT COUNT(*)
 FROM notifications
 WHERE resolved_at IS NULL
-  AND type IN ('needs_input', 'ready_to_merge')
+  AND type IN ('needs_input', 'ready_to_merge', 'orchestration_attention')
 `
 
 func (q *Queries) CountUnresolvedNotifications(ctx context.Context) (int64, error) {
@@ -275,7 +275,7 @@ const listUnresolvedNotificationsPage = `-- name: ListUnresolvedNotificationsPag
 SELECT id, session_id, project_id, pr_url, type, title, body, status, created_at, resolved_at
 FROM notifications
 WHERE resolved_at IS NULL
-  AND type IN ('needs_input', 'ready_to_merge')
+  AND type IN ('needs_input', 'ready_to_merge', 'orchestration_attention')
   AND (
     CAST(?1 AS TEXT) = ''
     OR created_at < ?2

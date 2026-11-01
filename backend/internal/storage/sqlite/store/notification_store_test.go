@@ -9,6 +9,154 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+func TestNotificationStore_CountUnresolvedActionableTypes(t *testing.T) {
+	for _, tt := range []struct {
+		typ  domain.NotificationType
+		want int64
+	}{
+		{domain.NotificationNeedsInput, 1},
+		{domain.NotificationReadyToMerge, 1},
+		{domain.NotificationOrchestrationAttention, 1},
+		{domain.NotificationPRMerged, 0},
+		{domain.NotificationPRClosedUnmerged, 0},
+	} {
+		t.Run(string(tt.typ), func(t *testing.T) {
+			s := newTestStore(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			seedProject(t, s, "p")
+			sess, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			rec := domain.NotificationRecord{
+				ID: "count", SessionID: sess.ID, ProjectID: "p", Type: tt.typ,
+				Title: "count regression", Status: domain.NotificationUnread, CreatedAt: now,
+			}
+			if _, created, err := s.CreateNotification(ctx, rec); err != nil || !created {
+				t.Fatalf("create=%v err=%v", created, err)
+			}
+			assertCount := func(want int64) {
+				t.Helper()
+				if got, err := s.CountUnresolvedNotifications(ctx); err != nil || got != want {
+					t.Fatalf("unresolved count=%d err=%v, want %d", got, err, want)
+				}
+				rows, err := s.ListNotifications(ctx, domain.NotificationListUnresolved, time.Time{}, "", 10)
+				if err != nil || int64(len(rows)) != want {
+					t.Fatalf("unresolved list=%v err=%v, want %d rows", rows, err, want)
+				}
+			}
+			assertCount(tt.want)
+			if _, ok, err := s.MarkNotificationRead(ctx, rec.ID); err != nil || !ok {
+				t.Fatalf("mark read=%v err=%v", ok, err)
+			}
+			assertCount(tt.want) // Seeing an issue does not resolve it.
+			if got, err := s.CountUnreadNotifications(ctx); err != nil || got != 0 {
+				t.Fatalf("unread count=%d err=%v, want 0", got, err)
+			}
+			resolvedAt := now.Add(time.Second)
+			if rows, err := s.ResolveSessionNotifications(ctx, sess.ID, tt.typ, resolvedAt); err != nil || len(rows) != 1 {
+				t.Fatalf("resolve=%v err=%v", rows, err)
+			}
+			assertCount(0)
+			rows, err := s.ListNotifications(ctx, domain.NotificationListAll, time.Time{}, "", 10)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("history=%v err=%v", rows, err)
+			}
+			if rows[0].ID != rec.ID || rows[0].Status != domain.NotificationRead || !rows[0].ResolvedAt.Equal(resolvedAt) {
+				t.Fatalf("historical record changed unexpectedly: %+v", rows[0])
+			}
+		})
+	}
+}
+
+func TestNotificationStore_UnresolvedListCountParityAcrossPages(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	seedProject(t, s, "p")
+	sess, err := s.CreateSession(ctx, sampleRecord("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, rec := range []domain.NotificationRecord{
+		{ID: "attention", Type: domain.NotificationOrchestrationAttention, Status: domain.NotificationRead},
+		{ID: "input", Type: domain.NotificationNeedsInput, Status: domain.NotificationUnread},
+		{ID: "ready", Type: domain.NotificationReadyToMerge, Status: domain.NotificationRead},
+		{ID: "merged", Type: domain.NotificationPRMerged, Status: domain.NotificationUnread},
+		{ID: "closed", Type: domain.NotificationPRClosedUnmerged, Status: domain.NotificationUnread},
+	} {
+		rec.SessionID, rec.ProjectID, rec.Title, rec.CreatedAt = sess.ID, "p", rec.ID, now
+		if _, created, err := s.CreateNotification(ctx, rec); err != nil || !created {
+			t.Fatalf("create %s=%v err=%v", rec.ID, created, err)
+		}
+	}
+	assertParity := func(want int64) {
+		t.Helper()
+		count, err := s.CountUnresolvedNotifications(ctx)
+		if err != nil || count != want {
+			t.Fatalf("count=%d err=%v, want %d", count, err, want)
+		}
+		seen := map[string]bool{}
+		var before time.Time
+		var beforeID string
+		for page := 0; page < 5; page++ {
+			rows, err := s.ListNotifications(ctx, domain.NotificationListUnresolved, before, beforeID, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) == 0 {
+				break
+			}
+			row := rows[0]
+			if seen[row.ID] || row.Resolved() || !row.Type.NeedsResolution() {
+				t.Fatalf("unexpected unresolved row: %+v", row)
+			}
+			seen[row.ID] = true
+			before, beforeID = row.CreatedAt, row.ID
+		}
+		if int64(len(seen)) != count {
+			t.Fatalf("paginated IDs=%v, count=%d", seen, count)
+		}
+	}
+	assertParity(3)
+	if _, err := s.ResolveSessionNotifications(ctx, sess.ID, domain.NotificationOrchestrationAttention, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertParity(2)
+}
+
+func TestNotificationStore_CountUnresolvedExcludesResolvedUnreadAttention(t *testing.T) {
+	s := newTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	seedProject(t, s, "p")
+	sess, err := s.CreateSession(ctx, sampleRecord("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rec := domain.NotificationRecord{
+		ID: "resolved-unread", SessionID: sess.ID, ProjectID: "p",
+		Type: domain.NotificationOrchestrationAttention, Title: "resolved attention",
+		Status: domain.NotificationUnread, CreatedAt: now,
+	}
+	if _, created, err := s.CreateNotification(ctx, rec); err != nil || !created {
+		t.Fatalf("create=%v err=%v", created, err)
+	}
+	if rows, err := s.ResolveSessionNotifications(ctx, sess.ID, rec.Type, now.Add(time.Second)); err != nil || len(rows) != 1 {
+		t.Fatalf("resolve=%v err=%v", rows, err)
+	}
+	if got, err := s.CountUnresolvedNotifications(ctx); err != nil || got != 0 {
+		t.Fatalf("unresolved count=%d err=%v, want 0", got, err)
+	}
+	if got, err := s.CountUnreadNotifications(ctx); err != nil || got != 1 {
+		t.Fatalf("unread count=%d err=%v, want 1", got, err)
+	}
+}
+
 func TestNotificationStoreOrchestrationAttentionDedupesAndResolves(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
