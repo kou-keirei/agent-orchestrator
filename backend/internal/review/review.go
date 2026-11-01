@@ -51,11 +51,11 @@ type Store interface {
 	ListRunningReviewRunsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.ReviewRun, error)
 }
 
-// ReviewRunNativeEvidenceAppender is the optional persistence capability used
+// RunNativeEvidenceAppender is the optional persistence capability used
 // for provider-native reviewer hook facts. Keeping it optional preserves the
 // transport-neutral test/store boundary while production SQLite can enforce
 // launch-generation and append-only semantics in one statement.
-type ReviewRunNativeEvidenceAppender interface {
+type RunNativeEvidenceAppender interface {
 	AppendReviewRunNativeEvidence(ctx stdctx.Context, id, launchID, runSessionID, nativeSessionID, firstTurnID, completionID string, observedAt time.Time) (bool, error)
 }
 
