@@ -11,7 +11,8 @@ const (
 	// ChatDispatchConformanceVerified means native dispatch evidence matches the request.
 	ChatDispatchConformanceVerified ChatDispatchConformanceStatus = "VERIFIED"
 	// ChatDispatchConfigMismatch indicates dispatch configuration differs from the requested values.
-	ChatDispatchConfigMismatch            ChatDispatchConformanceStatus = "DISPATCH_CONFIG_MISMATCH"
+	ChatDispatchConfigMismatch ChatDispatchConformanceStatus = "DISPATCH_CONFIG_MISMATCH"
+	// ChatDispatchEvidenceMissing indicates required native dispatch evidence is missing.
 	ChatDispatchEvidenceMissing           ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
 	ChatDispatchEvidenceStale             ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_STALE"
 	ChatDispatchEvidenceWrongSession      ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_SESSION"
@@ -30,7 +31,8 @@ const (
 	// ChatDispatchProvenanceAORequested identifies values requested through AO.
 	ChatDispatchProvenanceAORequested ChatDispatchEvidenceProvenance = "ao.requested"
 	// ChatDispatchProvenanceAOConfigured identifies values obtained from AO configuration.
-	ChatDispatchProvenanceAOConfigured              ChatDispatchEvidenceProvenance = "ao.configured"
+	ChatDispatchProvenanceAOConfigured ChatDispatchEvidenceProvenance = "ao.configured"
+	// ChatDispatchProvenanceAODispatched identifies values dispatched by AO.
 	ChatDispatchProvenanceAODispatched              ChatDispatchEvidenceProvenance = "ao.dispatched"
 	ChatDispatchProvenanceCodexThreadStartResponse  ChatDispatchEvidenceProvenance = "codex.thread/start.response"
 	ChatDispatchProvenanceCodexThreadResumeResponse ChatDispatchEvidenceProvenance = "codex.thread/resume.response"
@@ -74,7 +76,8 @@ const (
 	// ChatDispatchVariantNone records that no dispatch variant was selected.
 	ChatDispatchVariantNone = "none"
 	// ChatDispatchNotApplicable indicates a dispatch metadata value does not apply.
-	ChatDispatchNotApplicable   = "not-applicable"
+	ChatDispatchNotApplicable = "not-applicable"
+	// ChatDispatchVariantMetadata identifies AO dispatch metadata.
 	ChatDispatchVariantMetadata = "ao.dispatch-metadata"
 )
 

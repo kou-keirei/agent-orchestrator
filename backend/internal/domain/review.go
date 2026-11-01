@@ -139,7 +139,8 @@ const (
 	// ReviewEvidenceRequested identifies settings requested for a review.
 	ReviewEvidenceRequested ReviewEvidenceLevel = "REQUESTED"
 	// ReviewEvidenceConfigured identifies AO-configured settings, not provider-native evidence.
-	ReviewEvidenceConfigured        ReviewEvidenceLevel = "CONFIGURED"
+	ReviewEvidenceConfigured ReviewEvidenceLevel = "CONFIGURED"
+	// ReviewEvidenceAOResolved identifies settings resolved by AO.
 	ReviewEvidenceAOResolved        ReviewEvidenceLevel = "AO_RESOLVED"
 	ReviewEvidenceProviderEffective ReviewEvidenceLevel = "PROVIDER_EFFECTIVE"
 	ReviewEvidenceProviderNative    ReviewEvidenceLevel = "PROVIDER_NATIVE"

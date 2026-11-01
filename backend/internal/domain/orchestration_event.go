@@ -22,7 +22,8 @@ const (
 	// OrchestrationPending marks an event waiting for delivery.
 	OrchestrationPending OrchestrationDeliveryState = "pending"
 	// OrchestrationLeased marks an event leased temporarily for delivery.
-	OrchestrationLeased       OrchestrationDeliveryState = "leased"
+	OrchestrationLeased OrchestrationDeliveryState = "leased"
+	// OrchestrationSubmitted marks an event submitted to its destination.
 	OrchestrationSubmitted    OrchestrationDeliveryState = "submitted"
 	OrchestrationAcknowledged OrchestrationDeliveryState = "acknowledged"
 	OrchestrationDeadLetter   OrchestrationDeliveryState = "dead_letter"
