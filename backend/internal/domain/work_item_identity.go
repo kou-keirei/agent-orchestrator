@@ -105,27 +105,21 @@ func (c WorkItemCandidate) ValidateAgainst(expected WorkItemIdentity) error {
 }
 
 // ValidateWorkItemIdentities checks a snapshot with one current attempt per work
-// item. It rejects duplicate logical IDs, attempt IDs and repository/worktree
-// bindings. It is not an attempt history validator or a transactional uniqueness
-// guarantee; persistence must enforce its own constraints.
+// item. It rejects duplicate logical IDs, attempt IDs and exact worktree paths
+// across projects and repositories. It is not an attempt history validator or a
+// transactional uniqueness guarantee; persistence must enforce its own constraints.
 func ValidateWorkItemIdentities(items []WorkItemIdentity) error {
 	ids := make(map[WorkItemID]bool)
 	attempts := make(map[WorkAttemptID]bool)
-	type worktreeKey struct {
-		project ProjectID
-		repo    string
-		path    string
-	}
-	worktrees := make(map[worktreeKey]bool)
+	worktrees := make(map[string]bool)
 	for _, item := range items {
 		if err := item.Validate(); err != nil {
 			return err
 		}
-		key := worktreeKey{item.ProjectID, item.Repository, item.WorktreePath}
-		if ids[item.ID] || attempts[item.AttemptID] || worktrees[key] {
+		if ids[item.ID] || attempts[item.AttemptID] || worktrees[item.WorktreePath] {
 			return ErrDuplicateWorkIdentity
 		}
-		ids[item.ID], attempts[item.AttemptID], worktrees[key] = true, true, true
+		ids[item.ID], attempts[item.AttemptID], worktrees[item.WorktreePath] = true, true, true
 	}
 	return nil
 }

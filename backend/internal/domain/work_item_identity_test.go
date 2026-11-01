@@ -137,6 +137,14 @@ func TestWorkItemIdentitySnapshotDuplicates(t *testing.T) {
 		{"logical ID", func(i *WorkItemIdentity) { i.ID = first.ID }},
 		{"attempt ID", func(i *WorkItemIdentity) { i.AttemptID = first.AttemptID }},
 		{"worktree", func(i *WorkItemIdentity) { i.WorktreePath = first.WorktreePath }},
+		{"worktree across repositories", func(i *WorkItemIdentity) {
+			i.WorktreePath = first.WorktreePath
+			i.Repository = "child"
+		}},
+		{"worktree across projects", func(i *WorkItemIdentity) {
+			i.WorktreePath = first.WorktreePath
+			i.ProjectID = "project-2"
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			duplicate := second
