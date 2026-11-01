@@ -899,7 +899,9 @@ func TestDispatcherAcceptsSynchronousTUIHookAcknowledgement(t *testing.T) {
 	o := sampleRecord("p")
 	o.Kind, o.Mode, o.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeTUI, time.Now().UTC()
 	o.Activity.State = domain.ActivityIdle
-	o, _ = s.CreateSession(ctx, o)
+	if _, err := s.CreateSession(ctx, o); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	e := domain.OrchestrationEvent{ID: "e-sync", ProjectID: "p", WorkerID: w.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "r", EnqueuedAt: now, NextAttemptAt: now}
 	if ok, err := s.EnqueueOrchestrationEvent(ctx, e); err != nil || !ok {
