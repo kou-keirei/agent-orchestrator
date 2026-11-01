@@ -4,10 +4,13 @@ package systemexec
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCommandContextWrapsBatchShimWithComSpec(t *testing.T) {
@@ -43,6 +46,55 @@ func TestCommandContextWrapsBatchShimWithComSpec(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(output)); got != "argument with spaces" {
 		t.Fatalf("output = %q, want batch argument preserved", got)
+	}
+}
+
+func TestWindowsCapabilityProbeCapture(t *testing.T) {
+	t.Setenv("AO_W187_CAPABILITY_ENV", "probe-inherited")
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "bounded probe.cmd")
+	t.Setenv("PATH", dir+";"+os.Getenv("PATH"))
+	t.Setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+	for _, code := range []string{"0", "7"} {
+		if err := os.WriteFile(shim, []byte("@echo off\r\necho %AO_W187_CAPABILITY_ENV%\r\necho probe-stderr 1>&2\r\nexit /b "+code+"\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := capabilityOutput(ctx, "bounded probe")
+		cancel()
+		if code == "0" {
+			if err != nil || out != "probe-inherited" {
+				t.Fatalf("capture: out=%q error=%v", out, err)
+			}
+		} else {
+			var exitErr *exec.ExitError
+			if out != "" || !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 || strings.TrimSpace(string(exitErr.Stderr)) != "probe-stderr" {
+				t.Fatalf("stderr/exit contract: out=%q error=%v exit=%+v", out, err, exitErr)
+			}
+		}
+	}
+}
+
+func TestWindowsCapabilityProbeOutputLimit(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "finite output.cmd")
+	// Fixed 300 built-in echo operations; exceed the same byte fence without
+	// making the negative test depend on thousands of interpreter iterations.
+	script := "@echo off\r\nfor /L %%i in (1,1,300) do @echo " + strings.Repeat("x", 1024) + "\r\n"
+	if err := os.WriteFile(shim, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := capabilityOutput(context.Background(), shim)
+	if out != "" || err == nil || !strings.Contains(err.Error(), "stream limit") {
+		t.Fatalf("output fence: out length=%d error=%v", len(out), err)
+	}
+}
+
+func TestWindowsCapabilityProbeCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := capabilityOutput(ctx, filepath.Join(t.TempDir(), "never-launch.exe"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancel = %v", err)
 	}
 }
 
