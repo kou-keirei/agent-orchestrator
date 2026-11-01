@@ -14,6 +14,9 @@ import (
 )
 
 type fakeStore struct {
+	held                              bool
+	holdErr                           error
+	afterLease                        func()
 	sessions                          []domain.SessionRecord
 	events                            []domain.OrchestrationEvent
 	attentionEvents                   []domain.OrchestrationEvent
@@ -24,11 +27,35 @@ type fakeStore struct {
 	attentionChanged                  int64
 }
 
-func (f *fakeStore) ListSessions(context.Context, domain.ProjectID) ([]domain.SessionRecord, error) {
-	return f.sessions, nil
+func (f *fakeStore) OrchestrationDispatchHeld(context.Context, domain.ProjectID) (bool, error) {
+	return f.held, f.holdErr
 }
-func (f *fakeStore) ListDueOrchestrationEvents(context.Context, domain.ProjectID, time.Time, int) ([]domain.OrchestrationEvent, error) {
-	return f.events, nil
+func (f *fakeStore) WithOrchestrationDispatch(_ context.Context, _ domain.ProjectID, fn func() error) error {
+	if f.holdErr != nil {
+		return f.holdErr
+	}
+	if f.held {
+		return ErrDispatchHeld
+	}
+	return fn()
+}
+func (f *fakeStore) ListSessions(_ context.Context, p domain.ProjectID) ([]domain.SessionRecord, error) {
+	out := slices.Clone(f.sessions)
+	for i := range out {
+		if out[i].ProjectID == "" {
+			out[i].ProjectID = p
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) ListDueOrchestrationEvents(_ context.Context, p domain.ProjectID, _ time.Time, _ int) ([]domain.OrchestrationEvent, error) {
+	out := slices.Clone(f.events)
+	for i := range out {
+		if out[i].ProjectID == "" {
+			out[i].ProjectID = p
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) ListOrchestrationEventsRequiringAttention(context.Context, domain.ProjectID) ([]domain.OrchestrationEvent, error) {
 	return f.attentionEvents, nil
@@ -39,6 +66,9 @@ func (f *fakeStore) LeaseOrchestrationEvents(_ context.Context, ids []string, _ 
 	}
 	f.leased = ids
 	f.destination = d
+	if f.afterLease != nil {
+		f.afterLease()
+	}
 	return nil
 }
 func (f *fakeStore) MarkOrchestrationEventsSubmitted(_ context.Context, ids []string, _ string, _ time.Time) error {
@@ -438,5 +468,34 @@ func TestPromptIsBoundedAndExcludesUntrustedProviderText(t *testing.T) {
 	}
 	if !strings.Contains(payload, "grants no permission or authorization") {
 		t.Fatal("authorization warning absent")
+	}
+}
+
+func TestDispatchHoldBoundaries(t *testing.T) {
+	for _, phase := range []string{"held", "unknown", "after-lease", "wrong-event", "wrong-destination"} {
+		t.Run(phase, func(t *testing.T) {
+			now := time.Now()
+			s := &fakeStore{sessions: []domain.SessionRecord{{ID: "o", ProjectID: "p", Kind: domain.KindOrchestrator, Mode: domain.SessionModeChat, Activity: domain.Activity{State: domain.ActivityIdle}, FirstSignalAt: now}}, events: []domain.OrchestrationEvent{{ID: "e", ProjectID: "p", EnqueuedAt: now}}}
+			switch phase {
+			case "held":
+				s.held = true
+			case "unknown":
+				s.holdErr = errors.New("database unavailable")
+			case "after-lease":
+				s.afterLease = func() { s.held = true }
+			case "wrong-event":
+				s.events[0].ProjectID = "other"
+			case "wrong-destination":
+				s.sessions[0].ProjectID = "other"
+			}
+			tr := &fakeTransport{}
+			err := (&Dispatcher{Store: s, Transport: tr}).DispatchProject(context.Background(), "p")
+			if err == nil || tr.calls != 0 || len(s.retried) != 0 || len(s.acked) != 0 {
+				t.Fatalf("err=%v sends=%d retries=%v acks=%v", err, tr.calls, s.retried, s.acked)
+			}
+			if phase != "after-lease" && len(s.leased) != 0 {
+				t.Fatal("unexpected lease")
+			}
+		})
 	}
 }
