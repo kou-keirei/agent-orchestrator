@@ -92,11 +92,15 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	if (token == "" && destination != "") || strings.TrimSpace(token) != token {
 		return fmt.Errorf("incomplete orchestration batch binding")
 	}
+	deadLetter := false
 	for _, event := range events {
 		if event.LeaseToken != token || event.DestinationSessionID != destination ||
 			(token == "" && (event.AttemptCount != 0 || !event.SubmittedAt.IsZero())) ||
 			(token != "" && event.ProjectID != project) {
 			return fmt.Errorf("inconsistent orchestration batch binding")
+		}
+		if event.State == domain.OrchestrationDeadLetter {
+			deadLetter = true
 		}
 	}
 	var target domain.SessionRecord
@@ -104,7 +108,10 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	// Older reclaim/rearm code retained the token but erased the destination.
 	// That identity cannot be recovered safely. Hold the persisted batch without
 	// discovering a replacement or turning this legacy state into a startup error.
-	if token == "" || destination != "" {
+	// A retained token can also span pending/dead_letter after per-event expiry.
+	// Hold the entire payload, even with a live recorded destination, until an
+	// explicit retry rearms its dead-letter members. Never lease or ACK a subset.
+	if !deadLetter && (token == "" || destination != "") {
 		target, ok, err = d.destination(ctx, project, destination)
 		if err != nil {
 			return err

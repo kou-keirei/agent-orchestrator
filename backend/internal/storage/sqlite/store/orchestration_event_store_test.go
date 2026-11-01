@@ -1003,8 +1003,8 @@ func TestOrchestrationStartupHoldsLegacyMixedAgeBatch(t *testing.T) {
 					t.Fatalf("wrong HOLD attention: %+v", intent)
 				}
 			}
-			// The exception admits only destination-less pending/dead_letter
-			// membership. Other states and bound mixed batches keep their fence.
+			// The HOLD admits complete pending/dead_letter membership, with or
+			// without a destination. Other states retain their loader fence.
 			for _, state := range []domain.OrchestrationDeliveryState{domain.OrchestrationLeased, domain.OrchestrationSubmitted, domain.OrchestrationAcknowledged} {
 				if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET state=? WHERE id='legacy-0'`, state); err != nil {
 					t.Fatal(err)
@@ -1016,8 +1016,143 @@ func TestOrchestrationStartupHoldsLegacyMixedAgeBatch(t *testing.T) {
 			if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET destination_session_id=?,state=CASE WHEN id='legacy-0' THEN 'dead_letter' ELSE 'pending' END WHERE project_id='p'`, replacement.ID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents); err == nil {
-				t.Fatal("bound batch admitted dead_letter member")
+			if due, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents); err != nil || len(due) != 2 {
+				t.Fatalf("bound mixed membership unavailable for HOLD: due=%v err=%v", due, err)
+			}
+			if err := d.DispatchProject(ctx, "p"); err != nil || len(transport.batches) != 1 {
+				t.Fatalf("bound mixed batch escaped HOLD: err=%v sends=%v", err, transport.targets)
+			}
+		})
+	}
+}
+
+func TestOrchestrationStartupHoldsBoundMixedAgeBatch(t *testing.T) {
+	for _, state := range []string{"leased", "submitted"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			for _, project := range []string{"p", "q"} {
+				seedProject(t, s, project)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			worker, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := sampleRecord("p")
+			parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			parent.Activity.State = domain.ActivityIdle
+			parent, err = s.CreateSession(ctx, parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := parent
+			replacement, err = s.CreateSession(ctx, replacement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := []string{"older", "younger"}
+			for i, id := range ids {
+				enqueued := now.Add(-15*time.Minute - time.Second + time.Duration(i)*2*time.Second)
+				if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: enqueued}); err != nil || !ok {
+					t.Fatalf("enqueue %s=%v err=%v", id, ok, err)
+				}
+			}
+			// Use the real APIs: K+D survive reclaim, while ages 15m01s and
+			// 14m59s split the immutable token's membership across states.
+			if err := s.LeaseOrchestrationEvents(ctx, ids, "K", parent.ID, now.Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if state == "submitted" {
+				if err := s.MarkOrchestrationEventsSubmitted(ctx, ids, "K", now.Add(-2*time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+				t.Fatalf("reclaim=%d err=%v", n, err)
+			}
+			before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(before) != 2 || before[0].State != domain.OrchestrationPending || before[1].State != domain.OrchestrationDeadLetter || before[1].AttentionRequiredAt != now {
+				t.Fatalf("mixed fixture=%v err=%v", before, err)
+			}
+			for _, event := range before {
+				if event.LeaseToken != "K" || event.DestinationSessionID != parent.ID || event.AttemptCount != 1 || !event.LeaseExpiresAt.IsZero() {
+					t.Fatalf("reclaim lost binding or budget: %+v", event)
+				}
+			}
+			otherWorker, err := s.CreateSession(ctx, sampleRecord("q"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherParent := parent
+			otherParent.ProjectID = "q"
+			otherParent, err = s.CreateSession(ctx, otherParent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "unrelated", ProjectID: "q", WorkerID: otherWorker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "q", EnqueuedAt: now, NextAttemptAt: now}); err != nil || !ok {
+				t.Fatalf("enqueue unrelated=%v err=%v", ok, err)
+			}
+			transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			notifier := &startupAttentionRecorder{}
+			wrapped := startupHoldStore{Store: s} // Held p must precede deliverable q.
+			d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Notifier: notifier, Now: func() time.Time { return now }}
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatalf("bound mixed batch aborted startup: %v", err)
+				}
+				if err := d.DispatchProject(ctx, "p"); err != nil {
+					t.Fatalf("bound mixed batch aborted direct dispatch: %v", err)
+				}
+			}
+			due, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents)
+			if err != nil || len(due) != 2 || due[0].ID != "older" || due[1].ID != "younger" {
+				t.Fatalf("complete bound mixed batch unavailable for HOLD: due=%v err=%v", due, err)
+			}
+			if len(transport.batches) != 1 || transport.targets[0] != otherParent.ID {
+				t.Fatalf("held batch sent or unrelated work stalled/replayed: targets=%v", transport.targets)
+			}
+			other, err := s.ListOrchestrationEvents(ctx, "q", 10)
+			if err != nil || len(other) != 1 || other[0].State != domain.OrchestrationAcknowledged {
+				t.Fatalf("unrelated work=%v err=%v", other, err)
+			}
+			for _, target := range []domain.SessionID{parent.ID, replacement.ID} {
+				if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, target, "K", now); err != nil || n != 0 {
+					t.Fatalf("held batch ACK target=%s count=%d err=%v", target, n, err)
+				}
+				// The pending row is visited first: a rejected second member
+				// must roll back its earlier update even for the exact binding.
+				if err := s.LeaseOrchestrationEvents(ctx, []string{"younger", "older"}, "K", target, now.Add(time.Minute)); err == nil {
+					t.Fatalf("mixed batch leased to %s", target)
+				}
+			}
+			held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != len(before) {
+				t.Fatalf("held=%v err=%v", held, err)
+			}
+			for i, event := range held {
+				if event != before[i] {
+					t.Fatalf("HOLD or rejected lease changed durable facts: got=%+v before=%+v", event, before[i])
+				}
+			}
+			now = now.Add(2 * time.Second)
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			held, err = s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != 2 || held[0].AttentionRequiredAt.IsZero() {
+				t.Fatalf("delayed attention lost: held=%v err=%v", held, err)
+			}
+			held[0].AttentionRequiredAt = before[0].AttentionRequiredAt
+			if held[0] != before[0] || held[1] != before[1] || len(transport.batches) != 1 || len(notifier.intents) == 0 {
+				t.Fatalf("HOLD lost facts/attention or sent again: held=%v sends=%v alerts=%v", held, transport.targets, notifier.intents)
+			}
+			for _, intent := range notifier.intents {
+				if intent.ProjectID != "p" || intent.SessionID != worker.ID {
+					t.Fatalf("wrong HOLD attention: %+v", intent)
+				}
 			}
 		})
 	}

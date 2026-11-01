@@ -252,20 +252,13 @@ func (s *Store) ListDueOrchestrationEvents(ctx context.Context, project domain.P
 		if len(events) > limit {
 			return nil, fmt.Errorf("reclaimed orchestration batch exceeds event limit %d", limit)
 		}
-		lostDestination := true
-		for _, event := range events {
-			if event.DestinationSessionID != "" {
-				lostDestination = false
-				break
-			}
-		}
 		for _, event := range events {
 			if event.State != domain.OrchestrationPending {
-				// Baseline reclaim erased destinations and could split a token
-				// across pending/dead_letter at the per-event age limit. Return
-				// its complete membership for the dispatcher's lost-destination
-				// HOLD. Never replay a subset or admit an acknowledged member.
-				if lostDestination && event.State == domain.OrchestrationDeadLetter {
+				// Reclaim can split a token across pending/dead_letter at the
+				// per-event age limit, even with its destination retained. Return
+				// complete membership for the dispatcher's HOLD; never replay a
+				// subset or admit an acknowledged or in-flight member.
+				if event.State == domain.OrchestrationDeadLetter {
 					continue
 				}
 				return nil, fmt.Errorf("reclaimed orchestration batch contains non-pending event %q", event.ID)

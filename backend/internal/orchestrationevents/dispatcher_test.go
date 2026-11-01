@@ -496,6 +496,13 @@ func TestRetryDestinationFence(t *testing.T) {
 			s.events[1].EnqueuedAt = now.Add(-15*time.Minute + time.Second)
 		}, false, false},
 		{"inconsistent_member_destination", func(s *fakeStore) { s.events[1].DestinationSessionID = "replacement" }, false, true},
+		{"bound_mixed_age_dead_letter_and_pending", func(s *fakeStore) {
+			s.events[0].State = domain.OrchestrationDeadLetter
+			s.events[0].EnqueuedAt = now.Add(-15*time.Minute - time.Second)
+			s.events[0].AttentionRequiredAt = now
+			s.events[1].State = domain.OrchestrationPending
+			s.events[1].EnqueuedAt = now.Add(-15*time.Minute + time.Second)
+		}, false, false},
 		{"missing_retry_token", func(s *fakeStore) {
 			for i := range s.events {
 				s.events[i].LeaseToken = ""
