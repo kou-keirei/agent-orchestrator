@@ -132,6 +132,13 @@ func TestLegacy169Compatibility(t *testing.T) {
 	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalBefore); err != nil {
 		t.Fatal(err)
 	}
+	if err := reconcileDesktop169(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var checkpointJournal string
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&checkpointJournal); err != nil || checkpointJournal != journalBefore {
+		t.Fatalf("physical compatibility changed exact historical journal: %v", err)
+	}
 	if err := migrate(db); err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +184,25 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatalf("repeat startup: %v", err)
 	}
 	var journalAfter string
-	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
+	// Preserve every historical row byte-for-byte. New source migrations may
+	// append their own claims above 169; they may not relabel the old journal.
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version WHERE version_id <= 169`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
 		t.Fatalf("journal changed: %v", err)
+	}
+	latest, err := expectedMigrationVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forwardClaims string
+	if err := db.QueryRow(`SELECT COALESCE(group_concat(version_id||':'||is_applied,'|'),'') FROM goose_db_version WHERE version_id > 169`).Scan(&forwardClaims); err != nil {
+		t.Fatal(err)
+	}
+	if latest > 169 {
+		if latest != 217 || forwardClaims != "217:1" {
+			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
+		}
+	} else if forwardClaims != "" {
+		t.Fatalf("unexpected claims beyond frozen historical journal: %s", forwardClaims)
 	}
 	if rows, err := db.Query(`PRAGMA foreign_key_check`); err != nil {
 		t.Fatal(err)
@@ -764,13 +788,19 @@ func historical169DB(t *testing.T, db *sql.DB, reconciled bool) *sql.DB {
 		t.Fatalf("historical fixture changed: %s", got)
 	}
 	if reconciled {
-		if err := migrate(db); err != nil {
+		// This fixture is the physical compatibility checkpoint at 169,
+		// before any source forward migration is allowed to advance Goose.
+		if err := reconcileDesktop169(t.Context(), db); err != nil {
 			t.Fatal(err)
 		}
 	} else {
 		mustExec(t, db, `ALTER TABLE sessions ADD COLUMN hidden_at TIMESTAMP`)
 	}
 	mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+historical169CDC)
+	var version int
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&version); err != nil || version != 169 {
+		t.Fatalf("historical fixture must remain at 169: version=%d err=%v", version, err)
+	}
 	return db
 }
 
@@ -916,5 +946,124 @@ func TestLegacy169HistoricalCDCTransactionalReplacement(t *testing.T) {
 	}
 	if err := migrate(db); err != nil {
 		t.Fatalf("retry after rollback: %v", err)
+	}
+}
+
+func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, tc := range []struct{ name, old, replacement string }{
+		{"foreign literal", "'session_updated'", "'SESSION_UPDATED'"},
+		{"foreign payload", "'hiddenAt'", "'hidden_at'"},
+		{"missing old predicate", "OR OLD.display_name <> NEW.display_name", ""},
+		{"provision predicate only", "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at OR OLD.provision_state <> NEW.provision_state"},
+		{"extra side effect", "\nEND", "\nUPDATE foreign_history SET content='unexpected'; END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), true)
+			if err := migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+strings.Replace(historical169CDC, tc.old, tc.replacement, 1))
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, claim := range []int{170, 218} {
+		t.Run(strconv.Itoa(claim), func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), true)
+			if err := migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			// 170 remains foreign even though the owned 217 is now the maximum.
+			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169NormalizationFailureDoesNotAdvanceForward(t *testing.T) {
+	db := historical169DB(t, legacy169(t), true)
+	before := desktop169Snapshot(t, db)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exact historical CREATE fits; the canonical provisioning-aware
+	// replacement does not. DROP must roll back before Goose can commit 217.
+	old, err := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, len(historical169CDC)+1)
+	_ = conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = migrate(db)
+	conn, connErr := db.Conn(t.Context())
+	if connErr != nil {
+		t.Fatal(connErr)
+	}
+	_, resetErr := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, old)
+	_ = conn.Close()
+	if resetErr != nil {
+		t.Fatal(resetErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "replay session hidden CDC trigger") {
+		t.Fatalf("expected canonical CREATE failure: %v", err)
+	}
+	var version, forwardTable int
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='conversation_send_attempts'`).Scan(&forwardTable); err != nil {
+		t.Fatal(err)
+	}
+	if version != 169 || forwardTable != 0 || desktop169Snapshot(t, db) != before {
+		t.Fatalf("normalization failure advanced or mutated historical checkpoint: version=%d forwardTable=%d", version, forwardTable)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("retry after failed normalization: %v", err)
+	}
+	after := desktop169Snapshot(t, db)
+	if err := migrate(db); err != nil || desktop169Snapshot(t, db) != after {
+		t.Fatalf("restart after forward migration: %v", err)
+	}
+}
+
+func TestLegacy169ForwardDoesNotReplayMissingHistoricalEffects(t *testing.T) {
+	db := historical169DB(t, legacy169(t), true)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `DROP TABLE reviewer_cleanup_obligation`)
+	rejectDesktop169Unchanged(t, db)
+}
+
+func TestLegacy169MissingCDCAndOccupiedName(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, tc := range []struct{ name, ddl string }{
+		{"absent", ""},
+		{"temporary dependency", `CREATE TEMP TRIGGER temp_update AFTER UPDATE ON main.sessions BEGIN SELECT 1; END`},
+		{"foreign backfill dependency", `CREATE TRIGGER foreign_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='unexpected'; END`},
+		{"wrong owner", `CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`},
+		{"wrong type", `CREATE TABLE sessions_cdc_update (content TEXT)`},
+		{"case variant", `CREATE TRIGGER SESSIONS_CDC_UPDATE AFTER UPDATE ON sessions BEGIN SELECT 1; END`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), false)
+			mustExec(t, db, `DROP TRIGGER sessions_cdc_update`)
+			if tc.ddl != "" {
+				mustExec(t, db, tc.ddl)
+				rejectDesktop169Unchanged(t, db)
+				return
+			}
+			if err := migrate(db); err != nil {
+				t.Fatalf("restore genuinely absent CDC before forward migration: %v", err)
+			}
+			snapshot := desktop169Snapshot(t, db)
+			if err := migrate(db); err != nil || desktop169Snapshot(t, db) != snapshot {
+				t.Fatalf("restart after absent CDC repair: %v", err)
+			}
+		})
 	}
 }

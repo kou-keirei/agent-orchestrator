@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -946,12 +947,156 @@ func (s *Store) appendUserMessage(
 				return fmt.Errorf("record latest human message: %w", err)
 			}
 		}
-		return nil
+		return q.InsertConversationSendPending(ctx, gen.InsertConversationSendPendingParams{
+			TurnID: turnID, ConversationID: conversationID,
+		})
 	})
 	if err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// OrdinarySendAttempt reads durable intent for recovery, including after Store
+// replacement. A reserved or legacy result must never be acknowledged as sent.
+func (s *Store) OrdinarySendAttempt(ctx context.Context, turnID string) (domain.ConversationSendAttempt, error) {
+	row, err := s.conversationReader(ctx).SelectConversationSendAttempt(ctx, turnID)
+	if err != nil {
+		return domain.ConversationSendAttempt{}, fmt.Errorf("read ordinary send %s: %w", turnID, err)
+	}
+	attempt := domain.ConversationSendAttempt{
+		ConversationSendOwner: domain.ConversationSendOwner{
+			ConversationID: row.ConversationID, TurnID: row.ID, ClientMessageID: row.ClientMessageID,
+			BranchID: row.BranchID, SessionID: row.HandledBySessionID,
+			ControllerGeneration: row.ControllerGeneration,
+		},
+		State: domain.ConversationSendState(row.State),
+	}
+	if row.ReservedAt.Valid {
+		at := row.ReservedAt.Time
+		attempt.ReservedAt = &at
+	}
+	return attempt, nil
+}
+
+// ReserveOrdinarySend commits exact, owner-fenced pre-provider intent. Only a
+// nil error authorizes ONE SendTurn, using the returned durable message. Every
+// error, including commit failure or repeat reservation, forbids provider I/O.
+// This applies equally to initial sends and automatic queue drain.
+func (s *Store) ReserveOrdinarySend(ctx context.Context, owner domain.ConversationSendOwner, now time.Time) (domain.QueuedTurn, error) {
+	// Provider authorization must own its COMMIT. Reusing a projection's
+	// transaction could return before commit, and reacquiring its mutex deadlocks.
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return domain.QueuedTurn{}, domain.ErrConversationSendConflict
+	}
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	defer s.writeMu.Unlock()
+	var message domain.QueuedTurn
+	if now.IsZero() {
+		return message, domain.ErrConversationSendConflict
+	}
+	err := s.inTx(ctx, "reserve ordinary send", func(q *gen.Queries) error {
+		held, err := q.HasUnresolvedConversationSend(ctx, owner.ConversationID)
+		if err != nil {
+			return err
+		}
+		if held {
+			return domain.ErrConversationSendUncertain
+		}
+		rows, err := q.ReserveConversationOrdinarySend(ctx, gen.ReserveConversationOrdinarySendParams{
+			TurnID: owner.TurnID, ConversationID: owner.ConversationID,
+			BranchID: owner.BranchID, SessionID: owner.SessionID,
+			ClientMessageID: owner.ClientMessageID, Generation: owner.ControllerGeneration,
+			ReservedAt: sql.NullTime{Time: now, Valid: true},
+		})
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return domain.ErrConversationSendConflict
+		}
+		row, err := q.SelectOrdinarySendMessage(ctx, owner.TurnID)
+		if err != nil {
+			return err
+		}
+		message = domain.QueuedTurn{
+			TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
+			Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	return message, nil
+}
+
+// BindReservedOrdinarySend records an actually correlated native provider turn,
+// atomically with resolving the reservation. An unknown/no-reference result
+// must remain reserved. A replaced generation cannot resolve its predecessor.
+func (s *Store) BindReservedOrdinarySend(ctx context.Context, owner domain.ConversationSendOwner, providerTurnID string, now time.Time) error {
+	if providerTurnID == "" {
+		return domain.ErrConversationSendUncertain
+	}
+	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendBound, "", now,
+		func(txCtx context.Context, _ *gen.Queries) error {
+			return s.BindTurnToProvider(txCtx, owner.TurnID, providerTurnID, now)
+		})
+}
+
+// ConfirmOrdinarySendNotDelivered requires conclusive native non-delivery
+// evidence from the current reserving owner, never a timeout or lost reference.
+// Evidence is an opaque correlation supplied by the native lifecycle owner.
+// The failed turn stays durable and is not silently made replayable.
+func (s *Store) ConfirmOrdinarySendNotDelivered(ctx context.Context, owner domain.ConversationSendOwner, evidence string, now time.Time) error {
+	if strings.TrimSpace(evidence) == "" {
+		return domain.ErrConversationSendUncertain
+	}
+	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendNotDelivered, evidence, now,
+		func(txCtx context.Context, q *gen.Queries) error {
+			return q.SettleConversationTurn(txCtx, gen.SettleConversationTurnParams{
+				ID: owner.TurnID, State: domain.TurnStateFailed,
+				ErrorMessage: "provider confirmed non-delivery", CompletedAt: sql.NullTime{Time: now, Valid: true},
+			})
+		})
+}
+
+func (s *Store) resolveOrdinarySend(ctx context.Context, owner domain.ConversationSendOwner, state domain.ConversationSendState, evidence string, now time.Time, apply func(context.Context, *gen.Queries) error) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return domain.ErrConversationSendConflict
+	}
+	if err := s.writeMu.LockContext(ctx); err != nil {
+		return err
+	}
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "resolve ordinary send", func(q *gen.Queries) error {
+		rows, err := q.ResolveConversationOrdinarySend(ctx, gen.ResolveConversationOrdinarySendParams{
+			TurnID: owner.TurnID, ConversationID: owner.ConversationID,
+			BranchID: owner.BranchID, SessionID: owner.SessionID,
+			ClientMessageID: owner.ClientMessageID, Generation: owner.ControllerGeneration,
+			Resolution: string(state), NonDeliveryEvidence: evidence,
+		})
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return domain.ErrConversationSendConflict
+		}
+		return apply(context.WithValue(ctx, conversationProjectionTxKey{}, q), q)
+	})
+}
+
+func rejectUnresolvedSend(ctx context.Context, q *gen.Queries, turnID string) error {
+	held, err := q.HasUnresolvedTurnSend(ctx, turnID)
+	if err != nil {
+		return err
+	}
+	if held {
+		return domain.ErrConversationSendUncertain
+	}
+	return nil
 }
 
 // ConversationMessageByClientID finds the durable normal-message outcome for an
@@ -1071,6 +1216,9 @@ func (s *Store) AppendImportedUserMessage(
 func (s *Store) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
+	if err := rejectUnresolvedSend(ctx, q, turnID); err != nil {
+		return err
+	}
 	if err := q.BindConversationTurnProviderID(ctx, gen.BindConversationTurnProviderIDParams{
 		ProviderTurnID: providerTurnID,
 		StartedAt:      sql.NullTime{Time: now, Valid: true},
@@ -1111,6 +1259,9 @@ func (s *Store) SettleTurn(
 	}
 	if err != nil {
 		return fmt.Errorf("select turn %s: %w", providerTurnID, err)
+	}
+	if err := rejectUnresolvedSend(ctx, q, turn.ID); err != nil {
+		return err
 	}
 
 	if err := q.SettleConversationTurn(ctx, gen.SettleConversationTurnParams{
@@ -1698,6 +1849,13 @@ func (s *Store) SettleActivityStreamedText(
 // is durable before it is delivered, so a daemon that dies with one queued can
 // still account for it.
 func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (domain.QueuedTurn, error) {
+	held, err := s.qr.HasUnresolvedConversationSend(ctx, conversationID)
+	if err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	if held {
+		return domain.QueuedTurn{}, domain.ErrConversationSendUncertain
+	}
 	row, err := s.qr.SelectNextQueuedConversationTurn(ctx, conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.QueuedTurn{}, ErrNoQueuedTurn
@@ -2022,6 +2180,9 @@ func (s *Store) SettleTurnByID(
 ) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if err := rejectUnresolvedSend(ctx, s.qw, turnID); err != nil {
+		return err
+	}
 	if err := s.qw.SettleConversationTurn(ctx, gen.SettleConversationTurnParams{
 		State:        state,
 		ErrorMessage: errMessage,

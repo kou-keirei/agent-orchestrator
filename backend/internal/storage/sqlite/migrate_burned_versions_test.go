@@ -161,6 +161,7 @@ var shippedMigrations = map[int64]string{
 	154: "0154_review_run_evidence.sql",
 	155: "0155_review_run_second_opinion_uniqueness.sql",
 	156: "0156_reviewer_cleanup_obligation.sql",
+	217: "0217_conversation_ordinary_send.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

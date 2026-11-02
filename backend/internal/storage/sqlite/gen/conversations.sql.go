@@ -391,6 +391,8 @@ const bindConversationTurnProviderID = `-- name: BindConversationTurnProviderID 
 UPDATE conversation_turns
 SET provider_turn_id = ?, started_at = COALESCE(started_at, ?)
 WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type BindConversationTurnProviderIDParams struct {
@@ -423,7 +425,9 @@ func (q *Queries) BindProjectConversationSession(ctx context.Context, arg BindPr
 const cancelAllQueuedConversationTurns = `-- name: CancelAllQueuedConversationTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ? AND state = 'queued'
+WHERE conversation_turns.conversation_id = ? AND conversation_turns.state = 'queued'
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type CancelAllQueuedConversationTurnsParams struct {
@@ -443,10 +447,12 @@ func (q *Queries) CancelAllQueuedConversationTurns(ctx context.Context, arg Canc
 const cancelQueuedConversationTurnByID = `-- name: CancelQueuedConversationTurnByID :execrows
 UPDATE conversation_turns
 SET state = 'cancelled', completed_at = ?
-WHERE id = ?
-  AND conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
+WHERE conversation_turns.id = ?
+  AND conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type CancelQueuedConversationTurnByIDParams struct {
@@ -467,7 +473,9 @@ func (q *Queries) CancelQueuedConversationTurnByID(ctx context.Context, arg Canc
 const cancelQueuedConversationTurns = `-- name: CancelQueuedConversationTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ? AND state = 'queued' AND requested_at <= ?
+WHERE conversation_turns.conversation_id = ? AND conversation_turns.state = 'queued' AND conversation_turns.requested_at <= ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type CancelQueuedConversationTurnsParams struct {
@@ -718,6 +726,30 @@ SELECT EXISTS (
 
 func (q *Queries) HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error) {
 	row := q.db.QueryRowContext(ctx, hasPendingConversationInteractions, conversationID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasUnresolvedConversationSend = `-- name: HasUnresolvedConversationSend :one
+SELECT EXISTS (SELECT 1 FROM conversation_send_attempts
+WHERE conversation_id = ? AND state IN ('reserved', 'legacy'))
+`
+
+func (q *Queries) HasUnresolvedConversationSend(ctx context.Context, conversationID string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, hasUnresolvedConversationSend, conversationID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasUnresolvedTurnSend = `-- name: HasUnresolvedTurnSend :one
+SELECT EXISTS (SELECT 1 FROM conversation_send_attempts
+WHERE turn_id = ? AND state IN ('reserved', 'legacy'))
+`
+
+func (q *Queries) HasUnresolvedTurnSend(ctx context.Context, turnID string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, hasUnresolvedTurnSend, turnID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -1000,6 +1032,22 @@ func (q *Queries) InsertConversationQueuedEditDelivery(ctx context.Context, arg 
 	return err
 }
 
+const insertConversationSendPending = `-- name: InsertConversationSendPending :exec
+INSERT INTO conversation_send_attempts (turn_id, conversation_id, state)
+VALUES (?, ?, 'pending')
+`
+
+type InsertConversationSendPendingParams struct {
+	TurnID         string
+	ConversationID string
+}
+
+// Only the atomic AppendUserMessage transaction establishes never attempted.
+func (q *Queries) InsertConversationSendPending(ctx context.Context, arg InsertConversationSendPendingParams) error {
+	_, err := q.db.ExecContext(ctx, insertConversationSendPending, arg.TurnID, arg.ConversationID)
+	return err
+}
+
 const insertConversationSteerDeliveryReservation = `-- name: InsertConversationSteerDeliveryReservation :execrows
 INSERT OR IGNORE INTO conversation_steer_deliveries (
     conversation_id, client_message_id, request_json, state, created_at
@@ -1061,9 +1109,11 @@ func (q *Queries) InsertConversationTurn(ctx context.Context, arg InsertConversa
 const interruptRolledBackQueuedTurns = `-- name: InterruptRolledBackQueuedTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ?
-  AND state IN ('queued', 'running')
-  AND rolled_back_at IS NOT NULL
+WHERE conversation_turns.conversation_id = ?
+  AND conversation_turns.state IN ('queued', 'running')
+  AND conversation_turns.rolled_back_at IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type InterruptRolledBackQueuedTurnsParams struct {
@@ -1166,6 +1216,8 @@ const markConversationTurnStarted = `-- name: MarkConversationTurnStarted :exec
 UPDATE conversation_turns
 SET state = 'running', started_at = COALESCE(started_at, ?)
 WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type MarkConversationTurnStartedParams struct {
@@ -1186,6 +1238,8 @@ WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.rowid >= (
       SELECT anchor.rowid FROM conversation_turns AS anchor WHERE anchor.id = ?
   )
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type MarkConversationTurnsRolledBackParams struct {
@@ -1376,13 +1430,70 @@ func (q *Queries) ReleaseUntouchedConversationProvider(ctx context.Context, arg 
 	return result.RowsAffected()
 }
 
+const reserveConversationOrdinarySend = `-- name: ReserveConversationOrdinarySend :execrows
+UPDATE conversation_send_attempts
+SET state = 'reserved', controller_generation = ?1,
+    reserved_at = ?2
+WHERE conversation_send_attempts.turn_id = ?3
+  AND conversation_send_attempts.conversation_id = ?4 AND conversation_send_attempts.state = 'pending'
+  AND ?1 <> ''
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts held
+      WHERE held.conversation_id = ?4 AND held.state IN ('reserved', 'legacy'))
+  AND EXISTS (
+      SELECT 1 FROM conversation_turns t
+      JOIN conversations c ON c.id = t.conversation_id
+      JOIN sessions s ON s.id = t.handled_by_session_id
+      JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+      WHERE t.id = ?3 AND t.conversation_id = ?4
+        AND t.branch_id = ?5 AND t.branch_id = c.active_branch_id
+        AND t.handled_by_session_id = ?6 AND c.current_session_id = s.id
+        AND s.controller_generation = ?1 AND s.session_mode = 'chat' AND s.is_terminated = 0
+        AND m.client_message_id = ?7
+        AND t.state = 'queued' AND t.provider_turn_id = '' AND t.rolled_back_at IS NULL
+        AND t.promotion_started_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM conversation_turns running
+            WHERE running.conversation_id = c.id AND running.branch_id = c.active_branch_id
+              AND running.state = 'running' AND running.rolled_back_at IS NULL)
+  )
+`
+
+type ReserveConversationOrdinarySendParams struct {
+	Generation      string
+	ReservedAt      sql.NullTime
+	TurnID          string
+	ConversationID  string
+	BranchID        string
+	SessionID       domain.SessionID
+	ClientMessageID string
+}
+
+// Atomic owner-fenced admission. A successful commit grants one provider call;
+// a retry, even by the same owner, never grants another call.
+func (q *Queries) ReserveConversationOrdinarySend(ctx context.Context, arg ReserveConversationOrdinarySendParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, reserveConversationOrdinarySend,
+		arg.Generation,
+		arg.ReservedAt,
+		arg.TurnID,
+		arg.ConversationID,
+		arg.BranchID,
+		arg.SessionID,
+		arg.ClientMessageID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const reserveQueuedConversationTurnForPromotion = `-- name: ReserveQueuedConversationTurnForPromotion :execrows
 UPDATE conversation_turns
 SET promotion_started_at = ?1
-WHERE id = ?2
-  AND conversation_id = ?3
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.conversation_id = conversation_turns.conversation_id AND send.state IN ('reserved', 'legacy'))
 `
 
 type ReserveQueuedConversationTurnForPromotionParams struct {
@@ -1450,6 +1561,55 @@ func (q *Queries) ResolveConversationApproval(ctx context.Context, arg ResolveCo
 		arg.RequestID,
 	)
 	return err
+}
+
+const resolveConversationOrdinarySend = `-- name: ResolveConversationOrdinarySend :execrows
+UPDATE conversation_send_attempts
+SET state = ?1, non_delivery_evidence = ?2
+WHERE conversation_send_attempts.turn_id = ?3 AND conversation_send_attempts.conversation_id = ?4
+  AND conversation_send_attempts.state = 'reserved' AND conversation_send_attempts.controller_generation = ?5
+  AND EXISTS (
+      SELECT 1 FROM conversation_turns t
+      JOIN conversations c ON c.id = t.conversation_id
+      JOIN sessions s ON s.id = t.handled_by_session_id
+      JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+      WHERE t.id = ?3 AND t.conversation_id = ?4
+        AND t.branch_id = ?6 AND t.branch_id = c.active_branch_id
+        AND t.handled_by_session_id = ?7 AND c.current_session_id = s.id
+        AND s.controller_generation = ?5 AND s.session_mode = 'chat' AND s.is_terminated = 0
+        AND m.client_message_id = ?8
+        AND t.state = 'queued' AND t.provider_turn_id = '' AND t.rolled_back_at IS NULL
+  )
+`
+
+type ResolveConversationOrdinarySendParams struct {
+	Resolution          string
+	NonDeliveryEvidence string
+	TurnID              string
+	ConversationID      string
+	Generation          string
+	BranchID            string
+	SessionID           domain.SessionID
+	ClientMessageID     string
+}
+
+// Resolution belongs to the still-current reserving generation. Successors
+// retain uncertainty; this API does not invent cross-generation native proof.
+func (q *Queries) ResolveConversationOrdinarySend(ctx context.Context, arg ResolveConversationOrdinarySendParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, resolveConversationOrdinarySend,
+		arg.Resolution,
+		arg.NonDeliveryEvidence,
+		arg.TurnID,
+		arg.ConversationID,
+		arg.Generation,
+		arg.BranchID,
+		arg.SessionID,
+		arg.ClientMessageID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const selectCompletedEditReplacement = `-- name: SelectCompletedEditReplacement :one
@@ -2609,6 +2769,43 @@ func (q *Queries) SelectConversationRetryTurnIDBySource(ctx context.Context, arg
 	return id, err
 }
 
+const selectConversationSendAttempt = `-- name: SelectConversationSendAttempt :one
+SELECT t.id, t.conversation_id, t.branch_id, t.handled_by_session_id,
+       m.client_message_id, a.state, a.controller_generation, a.reserved_at
+FROM conversation_send_attempts a
+JOIN conversation_turns t ON t.id = a.turn_id AND t.conversation_id = a.conversation_id
+JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+WHERE a.turn_id = ?
+`
+
+type SelectConversationSendAttemptRow struct {
+	ID                   string
+	ConversationID       string
+	BranchID             string
+	HandledBySessionID   domain.SessionID
+	ClientMessageID      string
+	State                string
+	ControllerGeneration string
+	ReservedAt           sql.NullTime
+}
+
+// Internal recovery projection; state=reserved is NOT provider acceptance.
+func (q *Queries) SelectConversationSendAttempt(ctx context.Context, turnID string) (SelectConversationSendAttemptRow, error) {
+	row := q.db.QueryRowContext(ctx, selectConversationSendAttempt, turnID)
+	var i SelectConversationSendAttemptRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.BranchID,
+		&i.HandledBySessionID,
+		&i.ClientMessageID,
+		&i.State,
+		&i.ControllerGeneration,
+		&i.ReservedAt,
+	)
+	return i, err
+}
+
 const selectConversationSteerDelivery = `-- name: SelectConversationSteerDelivery :one
 SELECT conversation_id, client_message_id, request_json, state, provider_turn_id, activity_id, rejection_kind, rejection_message, created_at, settled_at FROM conversation_steer_deliveries
 WHERE conversation_id = ? AND client_message_id = ?
@@ -2968,6 +3165,9 @@ JOIN conversation_messages
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
+
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.conversation_id = conversation_turns.conversation_id AND send.state IN ('reserved', 'legacy'))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1
 `
@@ -2989,6 +3189,35 @@ type SelectNextQueuedConversationTurnRow struct {
 func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversationID string) (SelectNextQueuedConversationTurnRow, error) {
 	row := q.db.QueryRowContext(ctx, selectNextQueuedConversationTurn, conversationID)
 	var i SelectNextQueuedConversationTurnRow
+	err := row.Scan(
+		&i.ID,
+		&i.Text,
+		&i.ClientMessageID,
+		&i.Origin,
+		&i.DeliveryContentJson,
+	)
+	return i, err
+}
+
+const selectOrdinarySendMessage = `-- name: SelectOrdinarySendMessage :one
+SELECT t.id, m.text, m.client_message_id, m.origin, m.delivery_content_json
+FROM conversation_turns t
+JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+WHERE t.id = ? LIMIT 1
+`
+
+type SelectOrdinarySendMessageRow struct {
+	ID                  string
+	Text                string
+	ClientMessageID     string
+	Origin              domain.MessageOrigin
+	DeliveryContentJson string
+}
+
+// Load only the durable prompt, inside the successful reservation transaction.
+func (q *Queries) SelectOrdinarySendMessage(ctx context.Context, id string) (SelectOrdinarySendMessageRow, error) {
+	row := q.db.QueryRowContext(ctx, selectOrdinarySendMessage, id)
+	var i SelectOrdinarySendMessageRow
 	err := row.Scan(
 		&i.ID,
 		&i.Text,
@@ -3054,6 +3283,8 @@ WHERE conversation_messages.conversation_id = ?
   AND conversation_messages.origin = 'human'
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type SelectQueuedConversationMessageParams struct {
@@ -3088,9 +3319,12 @@ func (q *Queries) SelectQueuedConversationMessage(ctx context.Context, arg Selec
 const selectQueuedConversationTurnOrder = `-- name: SelectQueuedConversationTurnOrder :many
 SELECT id, requested_at
 FROM conversation_turns
-WHERE conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
+WHERE conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 ORDER BY requested_at, rowid
 `
 
@@ -3319,6 +3553,8 @@ const settleConversationTurn = `-- name: SettleConversationTurn :exec
 UPDATE conversation_turns
 SET state = ?, error_message = ?, completed_at = COALESCE(completed_at, ?)
 WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type SettleConversationTurnParams struct {
@@ -3343,7 +3579,9 @@ UPDATE conversation_turns
 SET state = 'failed',
     error_message = 'controller ended before the turn completed',
     completed_at = ?
-WHERE handled_by_session_id = ? AND state IN ('queued', 'running')
+WHERE conversation_turns.handled_by_session_id = ? AND conversation_turns.state IN ('queued', 'running')
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type SettleOrphanedConversationTurnsParams struct {
@@ -3743,6 +3981,8 @@ WHERE conversation_messages.conversation_id = ?
         AND conversation_turns.conversation_id = conversation_messages.conversation_id
         AND conversation_turns.state = 'queued'
         AND conversation_turns.promotion_started_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+            WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
   )
 `
 
@@ -3774,10 +4014,12 @@ func (q *Queries) UpdateQueuedConversationMessageText(ctx context.Context, arg U
 const updateQueuedConversationTurnRequestedAt = `-- name: UpdateQueuedConversationTurnRequestedAt :execrows
 UPDATE conversation_turns
 SET requested_at = ?
-WHERE id = ?
-  AND conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
+WHERE conversation_turns.id = ?
+  AND conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 `
 
 type UpdateQueuedConversationTurnRequestedAtParams struct {
