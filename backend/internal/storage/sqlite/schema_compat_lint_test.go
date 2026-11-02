@@ -63,7 +63,7 @@ func TestDesktop169DependencyCloseError(t *testing.T) {
 type compatCloseConnector struct{ rows *compatCloseRows }
 
 func (c compatCloseConnector) Connect(context.Context) (driver.Conn, error) {
-	return compatCloseConn{rows: c.rows}, nil
+	return compatCloseConn(c), nil
 }
 func (c compatCloseConnector) Driver() driver.Driver { return compatCloseDriver{connector: c} }
 

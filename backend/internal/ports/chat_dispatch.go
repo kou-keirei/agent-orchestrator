@@ -13,7 +13,8 @@ const (
 	// ChatDispatchConfigMismatch indicates dispatch configuration differs from the requested values.
 	ChatDispatchConfigMismatch ChatDispatchConformanceStatus = "DISPATCH_CONFIG_MISMATCH"
 	// ChatDispatchEvidenceMissing indicates required native dispatch evidence is missing.
-	ChatDispatchEvidenceMissing           ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
+	ChatDispatchEvidenceMissing ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
+	// ChatDispatchEvidenceStale indicates stale native dispatch evidence.
 	ChatDispatchEvidenceStale             ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_STALE"
 	ChatDispatchEvidenceWrongSession      ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_SESSION"
 	ChatDispatchEvidenceWrongConversation ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_CONVERSATION"
@@ -33,7 +34,8 @@ const (
 	// ChatDispatchProvenanceAOConfigured identifies values obtained from AO configuration.
 	ChatDispatchProvenanceAOConfigured ChatDispatchEvidenceProvenance = "ao.configured"
 	// ChatDispatchProvenanceAODispatched identifies values dispatched by AO.
-	ChatDispatchProvenanceAODispatched              ChatDispatchEvidenceProvenance = "ao.dispatched"
+	ChatDispatchProvenanceAODispatched ChatDispatchEvidenceProvenance = "ao.dispatched"
+	// ChatDispatchProvenanceCodexThreadStartResponse identifies provenance from the Codex thread/start response.
 	ChatDispatchProvenanceCodexThreadStartResponse  ChatDispatchEvidenceProvenance = "codex.thread/start.response"
 	ChatDispatchProvenanceCodexThreadResumeResponse ChatDispatchEvidenceProvenance = "codex.thread/resume.response"
 	// ChatDispatchProvenanceCodexFirstTurn is the native turn/started identity

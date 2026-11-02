@@ -24,7 +24,8 @@ const (
 	// OrchestrationLeased marks an event leased temporarily for delivery.
 	OrchestrationLeased OrchestrationDeliveryState = "leased"
 	// OrchestrationSubmitted marks an event submitted to its destination.
-	OrchestrationSubmitted    OrchestrationDeliveryState = "submitted"
+	OrchestrationSubmitted OrchestrationDeliveryState = "submitted"
+	// OrchestrationAcknowledged marks a durable event acknowledged by its destination.
 	OrchestrationAcknowledged OrchestrationDeliveryState = "acknowledged"
 	OrchestrationDeadLetter   OrchestrationDeliveryState = "dead_letter"
 )
