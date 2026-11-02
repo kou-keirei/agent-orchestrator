@@ -6,22 +6,34 @@ import "time"
 // imply that a worker's task completed.
 type OrchestrationEventKind string
 
+// Orchestration event kinds identify worker and PR facts.
 const (
+	// OrchestrationWorkerTurnSettled records a worker turn that has settled.
 	OrchestrationWorkerTurnSettled OrchestrationEventKind = "worker_turn_settled"
-	OrchestrationWorkerBlocked     OrchestrationEventKind = "worker_blocked"
-	OrchestrationWorkerReadyMerge  OrchestrationEventKind = "worker_ready_to_merge"
-	OrchestrationWorkerTerminated  OrchestrationEventKind = "worker_terminated"
-	OrchestrationPRMerged          OrchestrationEventKind = "pr_merged"
+	// OrchestrationWorkerBlocked records a worker blocked by an obligation.
+	OrchestrationWorkerBlocked OrchestrationEventKind = "worker_blocked"
+	// OrchestrationWorkerReadyMerge records a worker ready for merge.
+	OrchestrationWorkerReadyMerge OrchestrationEventKind = "worker_ready_to_merge"
+	// OrchestrationWorkerTerminated records a worker termination.
+	OrchestrationWorkerTerminated OrchestrationEventKind = "worker_terminated"
+	// OrchestrationPRMerged records a merged pull request.
+	OrchestrationPRMerged OrchestrationEventKind = "pr_merged"
 )
 
+// OrchestrationDeliveryState identifies an event's delivery stage.
 type OrchestrationDeliveryState string
 
 const (
-	OrchestrationPending      OrchestrationDeliveryState = "pending"
-	OrchestrationLeased       OrchestrationDeliveryState = "leased"
-	OrchestrationSubmitted    OrchestrationDeliveryState = "submitted"
+	// OrchestrationPending marks an event waiting for delivery.
+	OrchestrationPending OrchestrationDeliveryState = "pending"
+	// OrchestrationLeased marks an event leased temporarily for delivery.
+	OrchestrationLeased OrchestrationDeliveryState = "leased"
+	// OrchestrationSubmitted marks an event submitted to its destination.
+	OrchestrationSubmitted OrchestrationDeliveryState = "submitted"
+	// OrchestrationAcknowledged marks a durable event acknowledged by its destination.
 	OrchestrationAcknowledged OrchestrationDeliveryState = "acknowledged"
-	OrchestrationDeadLetter   OrchestrationDeliveryState = "dead_letter"
+	// OrchestrationDeadLetter marks an event that cannot be delivered without intervention.
+	OrchestrationDeadLetter OrchestrationDeliveryState = "dead_letter"
 )
 
 // OrchestrationEvent is the durable normalized event and delivery state. It
