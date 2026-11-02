@@ -15,12 +15,17 @@ const (
 	// ChatDispatchEvidenceMissing indicates required native dispatch evidence is missing.
 	ChatDispatchEvidenceMissing ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_MISSING"
 	// ChatDispatchEvidenceStale indicates stale native dispatch evidence.
-	ChatDispatchEvidenceStale             ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_STALE"
-	ChatDispatchEvidenceWrongSession      ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_SESSION"
+	ChatDispatchEvidenceStale ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_STALE"
+	// ChatDispatchEvidenceWrongSession identifies native dispatch evidence for another session.
+	ChatDispatchEvidenceWrongSession ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_SESSION"
+	// ChatDispatchEvidenceWrongConversation identifies evidence for another provider conversation.
 	ChatDispatchEvidenceWrongConversation ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_CONVERSATION"
-	ChatDispatchEvidenceWrongTurn         ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_TURN"
-	ChatDispatchEvidenceUncorrelated      ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_UNCORRELATED"
-	ChatDispatchProviderRejected          ChatDispatchConformanceStatus = "DISPATCH_PROVIDER_REJECTED"
+	// ChatDispatchEvidenceWrongTurn identifies evidence for another provider turn.
+	ChatDispatchEvidenceWrongTurn ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_WRONG_TURN"
+	// ChatDispatchEvidenceUncorrelated identifies evidence that cannot be correlated to dispatch.
+	ChatDispatchEvidenceUncorrelated ChatDispatchConformanceStatus = "DISPATCH_EVIDENCE_UNCORRELATED"
+	// ChatDispatchProviderRejected identifies a provider rejection of dispatch.
+	ChatDispatchProviderRejected ChatDispatchConformanceStatus = "DISPATCH_PROVIDER_REJECTED"
 )
 
 // ChatDispatchEvidenceProvenance identifies the surface that supplied a
@@ -36,12 +41,14 @@ const (
 	// ChatDispatchProvenanceAODispatched identifies values dispatched by AO.
 	ChatDispatchProvenanceAODispatched ChatDispatchEvidenceProvenance = "ao.dispatched"
 	// ChatDispatchProvenanceCodexThreadStartResponse identifies provenance from the Codex thread/start response.
-	ChatDispatchProvenanceCodexThreadStartResponse  ChatDispatchEvidenceProvenance = "codex.thread/start.response"
+	ChatDispatchProvenanceCodexThreadStartResponse ChatDispatchEvidenceProvenance = "codex.thread/start.response"
+	// ChatDispatchProvenanceCodexThreadResumeResponse identifies provenance from a Codex thread/resume response.
 	ChatDispatchProvenanceCodexThreadResumeResponse ChatDispatchEvidenceProvenance = "codex.thread/resume.response"
 	// ChatDispatchProvenanceCodexFirstTurn is the native turn/started identity
 	// correlated with the model/effort returned by thread/start or thread/resume.
 	ChatDispatchProvenanceCodexFirstTurn ChatDispatchEvidenceProvenance = "codex.first-turn.thread-response+turn/started"
-	ChatDispatchProvenanceNotApplicable  ChatDispatchEvidenceProvenance = "not-applicable"
+	// ChatDispatchProvenanceNotApplicable identifies a provenance value that does not apply.
+	ChatDispatchProvenanceNotApplicable ChatDispatchEvidenceProvenance = "not-applicable"
 )
 
 // ChatDispatchValues keeps exact provider strings. Callers must not trim,
