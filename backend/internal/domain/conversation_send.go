@@ -16,9 +16,11 @@ type ConversationSendOwner struct {
 	ControllerGeneration string
 }
 
+// ConversationSendState records the durable disposition of an ordinary send.
 type ConversationSendState string
 
 const (
+	// ConversationSendPending is untouched work eligible for one reservation.
 	ConversationSendPending      ConversationSendState = "pending"
 	ConversationSendReserved     ConversationSendState = "reserved"
 	ConversationSendLegacy       ConversationSendState = "legacy"
@@ -37,6 +39,7 @@ type ConversationSendAttempt struct {
 }
 
 var (
+	// ErrConversationSendUncertain requires correlated evidence before resolution.
 	ErrConversationSendUncertain = errors.New("ordinary send requires correlated delivery resolution")
 	ErrConversationSendConflict  = errors.New("ordinary send owner or attempt conflict")
 )

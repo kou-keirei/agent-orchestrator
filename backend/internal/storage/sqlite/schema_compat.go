@@ -39,23 +39,27 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) (resultErr error) {
 	for _, source := range sources {
 		nativeVersions[source.Version] = true
 	}
-	claims, err := db.QueryContext(ctx, `SELECT version_id FROM goose_db_version
+	foreignVersion, err := func() (foreignVersion int64, resultErr error) {
+		claims, err := db.QueryContext(ctx, `SELECT version_id FROM goose_db_version
 		WHERE id IN (SELECT MAX(id) FROM goose_db_version GROUP BY version_id)
 		  AND is_applied = 1 AND version_id > 156`)
+		if err != nil {
+			return 0, err
+		}
+		// Release the iterator before later queries, including on scan failure.
+		defer func() { resultErr = errors.Join(resultErr, claims.Close()) }()
+		for claims.Next() {
+			var claimed int64
+			if err := claims.Scan(&claimed); err != nil {
+				return 0, err
+			}
+			if !nativeVersions[claimed] && claimed > foreignVersion {
+				foreignVersion = claimed
+			}
+		}
+		return foreignVersion, claims.Err()
+	}()
 	if err != nil {
-		return err
-	}
-	var foreignVersion int64
-	for claims.Next() {
-		var claimed int64
-		if err := claims.Scan(&claimed); err != nil {
-			return errors.Join(err, claims.Close())
-		}
-		if !nativeVersions[claimed] && claimed > foreignVersion {
-			foreignVersion = claimed
-		}
-	}
-	if err := errors.Join(claims.Err(), claims.Close()); err != nil {
 		return err
 	}
 	if foreignVersion == 0 {

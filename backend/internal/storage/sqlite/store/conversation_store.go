@@ -1040,7 +1040,7 @@ func (s *Store) BindReservedOrdinarySend(ctx context.Context, owner domain.Conve
 	if providerTurnID == "" {
 		return domain.ErrConversationSendUncertain
 	}
-	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendBound, "", now,
+	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendBound, "",
 		func(txCtx context.Context, _ *gen.Queries) error {
 			return s.BindTurnToProvider(txCtx, owner.TurnID, providerTurnID, now)
 		})
@@ -1054,7 +1054,7 @@ func (s *Store) ConfirmOrdinarySendNotDelivered(ctx context.Context, owner domai
 	if strings.TrimSpace(evidence) == "" {
 		return domain.ErrConversationSendUncertain
 	}
-	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendNotDelivered, evidence, now,
+	return s.resolveOrdinarySend(ctx, owner, domain.ConversationSendNotDelivered, evidence,
 		func(txCtx context.Context, q *gen.Queries) error {
 			return q.SettleConversationTurn(txCtx, gen.SettleConversationTurnParams{
 				ID: owner.TurnID, State: domain.TurnStateFailed,
@@ -1063,7 +1063,7 @@ func (s *Store) ConfirmOrdinarySendNotDelivered(ctx context.Context, owner domai
 		})
 }
 
-func (s *Store) resolveOrdinarySend(ctx context.Context, owner domain.ConversationSendOwner, state domain.ConversationSendState, evidence string, now time.Time, apply func(context.Context, *gen.Queries) error) error {
+func (s *Store) resolveOrdinarySend(ctx context.Context, owner domain.ConversationSendOwner, state domain.ConversationSendState, evidence string, apply func(context.Context, *gen.Queries) error) error {
 	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
 		return domain.ErrConversationSendConflict
 	}
