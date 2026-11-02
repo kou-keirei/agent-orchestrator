@@ -870,7 +870,7 @@ export function Sidebar({
 				</div>
 
 				<div className="sidebar-expanded-chrome group-data-[collapsible=icon]:hidden">
-					{activeHiddenSession && <p role="status" className="px-2 text-sm">Hidden session: {activeHiddenSession.title}. Show hidden sessions to unhide.</p>}
+					{activeHiddenSession && <p role="status" className="px-2 text-sm">{t("shell.hiddenSessionNotice", { title: activeHiddenSession.title })}</p>}
 					<BulkVisibilityPreview sessions={visibilitySessions} activeId={selection.activeSessionId} showHidden={showHidden} />
 				</div>
 
@@ -1649,7 +1649,7 @@ const ProjectItem = memo(function ProjectItem({
 					{expanded && !showHidden && olderWorkerCount > 0 && (
 						<button
 							aria-expanded={showOlderWorkers}
-							aria-label={(showOlderWorkers ? "Collapse" : "Expand") + " " + olderWorkerCount + " older workers in " + workspace.name}
+							aria-label={t(showOlderWorkers ? "shell.collapseOlderWorkers" : "shell.expandOlderWorkers", { count: olderWorkerCount, workspace: workspace.name })}
 							className="sidebar-expanded-chrome mx-3.5 mb-1 flex items-center gap-1.5 rounded-lg px-2 py-1 text-left text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
 							data-testid="older-workers-toggle"
 							onClick={() => setShowOlderWorkers((value) => !value)}
@@ -1659,7 +1659,7 @@ const ProjectItem = memo(function ProjectItem({
 								aria-hidden="true"
 								className={cn("size-3.5 transition-transform", showOlderWorkers && "rotate-90")}
 							/>
-							<span>{showOlderWorkers ? "Hide" : "Show"} {olderWorkerCount} older workers</span>
+							<span>{t(showOlderWorkers ? "shell.hideOlderWorkers" : "shell.showOlderWorkers", { count: olderWorkerCount })}</span>
 						</button>
 					)}
 					<ConfirmDialog

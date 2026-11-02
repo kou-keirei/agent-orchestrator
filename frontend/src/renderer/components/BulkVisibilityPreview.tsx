@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { isOrchestratorSession, type WorkspaceSession } from "../types/workspace";
 
 type Action = "hide" | "unhide";
@@ -43,6 +44,7 @@ export function BulkVisibilityPreview({ sessions, activeId, showHidden, adapter 
 	showHidden: boolean;
 	adapter?: VisibilityPreviewAdapter;
 }) {
+	const { t } = useTranslation();
 	const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
 	const [action, setAction] = useState<Action>("hide");
 	const [results, setResults] = useState<readonly Result[]>([]);
@@ -61,10 +63,10 @@ export function BulkVisibilityPreview({ sessions, activeId, showHidden, adapter 
 					const response = await adapter(action, ids);
 					for (const id of ids) {
 						const matches = response.filter((result) => result.id === id);
-						next.push(matches.length === 1 ? matches[0] : { id, error: "Missing or ambiguous result" });
+						next.push(matches.length === 1 ? matches[0] : { id, error: t("bulkVisibility.missingResult") });
 					}
 				} catch (error) {
-					next.push(...ids.map((id) => ({ id, error: error instanceof Error ? error.message : "Preview failed" })));
+					next.push(...ids.map((id) => ({ id, error: error instanceof Error ? error.message : t("bulkVisibility.previewFailed") })));
 				}
 			}
 			setResults(next);
@@ -75,21 +77,21 @@ export function BulkVisibilityPreview({ sessions, activeId, showHidden, adapter 
 		}
 	}
 	return <details className="px-2 text-sm">
-		<summary>Bulk Hide preview</summary>
-		<p>Presentation only. Active, orchestrator and ambiguous sessions are preserved.</p>
-		{!adapter && <p>Batch integration unavailable pending backend qualification.</p>}
+		<summary>{t("bulkVisibility.title")}</summary>
+		<p>{t("bulkVisibility.description")}</p>
+		{!adapter && <p>{t("bulkVisibility.unavailable")}</p>}
 		<fieldset disabled={pending}>
-			<legend>Worker chat selection</legend>
-			<button type="button" onClick={() => { setAction("hide"); setResults([]); }}>Hide Selected</button>
+			<legend>{t("bulkVisibility.selection")}</legend>
+			<button type="button" onClick={() => { setAction("hide"); setResults([]); }}>{t("bulkVisibility.hideSelected")}</button>
 			{showHidden && <>
-				<button type="button" onClick={() => { setAction("unhide"); setResults([]); }}>Unhide Selected</button>
+				<button type="button" onClick={() => { setAction("unhide"); setResults([]); }}>{t("bulkVisibility.unhideSelected")}</button>
 				<button type="button" onClick={() => {
 					setAction("unhide"); setResults([]);
 					setSelected(new Set(candidates.filter((session) => session.hiddenAt).map((session) => session.id)));
-				}}>Unhide All (preview)</button>
+				}}>{t("bulkVisibility.unhideAll")}</button>
 			</>}
-			<button type="button" onClick={() => { setSelected(new Set(candidates.map((session) => session.id))); setResults([]); }}>Select all shown</button>
-			<button type="button" onClick={() => { setSelected(new Set()); setResults([]); }}>Clear selection</button>
+			<button type="button" onClick={() => { setSelected(new Set(candidates.map((session) => session.id))); setResults([]); }}>{t("bulkVisibility.selectAll")}</button>
+			<button type="button" onClick={() => { setSelected(new Set()); setResults([]); }}>{t("bulkVisibility.clearSelection")}</button>
 			<div className="max-h-64 overflow-auto">
 				{candidates.map((session) => <label key={session.id} className="flex gap-2">
 					<input type="checkbox" checked={selected.has(session.id)} onChange={() => {
@@ -100,14 +102,14 @@ export function BulkVisibilityPreview({ sessions, activeId, showHidden, adapter 
 							return next;
 						});
 					}} />
-					{session.title} ({session.id}){session.hiddenAt ? " — Hidden" : ""}
+					{session.title} ({session.id}){session.hiddenAt ? ` — ${t("bulkVisibility.hidden")}` : ""}
 				</label>)}
 			</div>
 		</fieldset>
-		<p role="status">{action}: {selected.size} selected, {preview.eligible.length} eligible, {preview.skipped} skipped; {preview.chunks.length} chunks (maximum 200 each).</p>
-		<button type="button" disabled={!adapter || pending || preview.eligible.length === 0} onClick={() => void apply()}>Run mock preview</button>
-		<ul aria-label="Per-session preview results">{results.map((result) => <li key={result.id}>
-			{result.id}: {result.error ? `Failed: ${result.error}` : "Succeeded"}
+		<p role="status">{t("bulkVisibility.summary", { action: t(action === "hide" ? "bulkVisibility.hideAction" : "bulkVisibility.unhideAction"), selected: selected.size, eligible: preview.eligible.length, skipped: preview.skipped, chunks: preview.chunks.length, maximum: VISIBILITY_CHUNK_SIZE })}</p>
+		<button type="button" disabled={!adapter || pending || preview.eligible.length === 0} onClick={() => void apply()}>{t("bulkVisibility.run")}</button>
+		<ul aria-label={t("bulkVisibility.results")}>{results.map((result) => <li key={result.id}>
+			{result.id}: {result.error ? t("bulkVisibility.failed", { error: result.error }) : t("bulkVisibility.succeeded")}
 		</li>)}</ul>
 	</details>;
 }
