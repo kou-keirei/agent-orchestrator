@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pressly/goose/v3"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
-	"github.com/pressly/goose/v3"
 )
 
 // Frozen pre-port statement: also exercises migration 0087's legacy-writer fallback.
@@ -320,6 +321,7 @@ func TestProviderEventBranchPairedStream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		for rows.Next() {
 			var id int64
 			var branch, event, method, payload, received string
@@ -331,7 +333,9 @@ func TestProviderEventBranchPairedStream(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		rows.Close()
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if err := f.db.QueryRowContext(ctx, `SELECT text FROM conversation_messages WHERE id = 'stream-message'`).Scan(&r.text); err != nil {
 			t.Fatal(err)
 		}
