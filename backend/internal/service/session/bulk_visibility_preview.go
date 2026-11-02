@@ -13,6 +13,7 @@ import (
 type BulkVisibilityEvidence uint8
 
 const (
+	// BulkVisibilityUnknown indicates that evidence was not supplied.
 	BulkVisibilityUnknown BulkVisibilityEvidence = iota
 	BulkVisibilityNo
 	BulkVisibilityYes
@@ -44,9 +45,11 @@ type BulkVisibilitySnapshot struct {
 	UnderReview             BulkVisibilityEvidence
 }
 
+// BulkVisibilityReasonCode identifies why supplied evidence blocks eligibility.
 type BulkVisibilityReasonCode string
 
 const (
+	// BulkVisibilityMissingEvidence indicates that a required fact was not supplied.
 	BulkVisibilityMissingEvidence BulkVisibilityReasonCode = "missing_evidence"
 	BulkVisibilityInvalidEvidence BulkVisibilityReasonCode = "invalid_evidence"
 	BulkVisibilityProtected       BulkVisibilityReasonCode = "protected"
@@ -54,7 +57,7 @@ const (
 	BulkVisibilityRevisionChanged BulkVisibilityReasonCode = "revision_changed"
 )
 
-// Field identifies the exact supplied fact responsible for each reason.
+// BulkVisibilityReason identifies the exact supplied fact responsible for a reason.
 type BulkVisibilityReason struct {
 	Field string
 	Code  BulkVisibilityReasonCode
@@ -67,8 +70,10 @@ type BulkVisibilityPreviewEntry struct {
 	Reasons  []BulkVisibilityReason
 }
 
+// BulkVisibilityPreviewPageSize is the maximum total number of entries per page.
 const BulkVisibilityPreviewPageSize = 200
 
+// BulkVisibilityPreview contains a page of classified entries and category totals.
 type BulkVisibilityPreview struct {
 	Eligible           []BulkVisibilityPreviewEntry
 	Blocked            []BulkVisibilityPreviewEntry
