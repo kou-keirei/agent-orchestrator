@@ -75,9 +75,9 @@ export async function markAllNotificationsRead(ids: string[]): Promise<number> {
 export function mergeUnreadNotification(queryClient: QueryClient, notification: NotificationDTO): boolean {
 	notification = preserveKnownState(notification, findCachedNotification(queryClient, notification.id));
 	if (notification.status !== "unread") {
-		const existing = getCachedNotifications(queryClient.getQueryData<NotificationsCache>(unreadNotificationsQueryKey)).some(
-			(item) => item.id === notification.id,
-		);
+		const existing = getCachedNotifications(
+			queryClient.getQueryData<NotificationsCache>(unreadNotificationsQueryKey),
+		).some((item) => item.id === notification.id);
 		if (existing) mergeNotificationIntoCache(queryClient, unreadNotificationsQueryKey, notification);
 		return false;
 	}
@@ -116,16 +116,20 @@ export function applyResolvedNotification(queryClient: QueryClient, notification
 				// a local lower bound until the requested refetch completes.
 				return {
 					pageParams: [""],
-					pages: [{
-						notifications: [notification],
-						unreadCount: Number(notification.status === "unread"),
-						unresolvedCount: Number(isUnresolved(notification)),
-					}],
+					pages: [
+						{
+							notifications: [notification],
+							unreadCount: Number(notification.status === "unread"),
+							unresolvedCount: Number(isUnresolved(notification)),
+						},
+					],
 				};
 			}
 			const existing = getCachedNotifications(current).find((item) => item.id === notification.id);
 			const previous = existing ?? known;
-			const unreadDelta = previous ? Number(notification.status === "unread") - Number(previous.status === "unread") : 0;
+			const unreadDelta = previous
+				? Number(notification.status === "unread") - Number(previous.status === "unread")
+				: 0;
 			const unresolvedDelta = previous ? Number(isUnresolved(notification)) - Number(isUnresolved(previous)) : 0;
 			const pages = current.pages.map((page) => ({
 				...page,
@@ -193,8 +197,7 @@ function mergeNotificationIntoCache(
 		const existing = getCachedNotifications(current).find((item) => item.id === notification.id);
 		const previous = existing ?? known;
 		const unreadDelta = (notification.status === "unread" ? 1 : 0) - (previous?.status === "unread" ? 1 : 0);
-		const unresolvedDelta =
-			(isUnresolved(notification) ? 1 : 0) - (previous && isUnresolved(previous) ? 1 : 0);
+		const unresolvedDelta = (isUnresolved(notification) ? 1 : 0) - (previous && isUnresolved(previous) ? 1 : 0);
 		const pages = current.pages.map((page) => ({
 			...page,
 			notifications: page.notifications.map((item) => (item.id === notification.id ? notification : item)),
@@ -229,11 +232,7 @@ function mergeNotificationIntoCache(
  * rows: later all-list pages can acknowledge unread ids that were never loaded
  * into the unread cache, which would otherwise leave the bell badge stuck.
  */
-export function markAllCachedNotificationsRead(
-	queryClient: QueryClient,
-	ids: string[],
-	updatedCount?: number,
-): void {
+export function markAllCachedNotificationsRead(queryClient: QueryClient, ids: string[], updatedCount?: number): void {
 	if (ids.length === 0) {
 		queryClient.setQueryData<NotificationsCache>(unreadNotificationsQueryKey, (current) => {
 			if (!current) {
@@ -355,18 +354,39 @@ export function createNotificationsTransport(
 	getVisibleAgentSessionId: () => string | undefined = () => undefined,
 ) {
 	// Presentation-only state survives stream reconnects on this transport.
-	// Keep the existing main-process IPC contract; no grouping fields are needed.
 	const lastAttentionToastByProject = new Map<string, number>();
+	const pendingAttentionProjects = new Set<string>();
 	const shouldOfferDesktopToast = (notification: NotificationDTO): boolean => {
 		if (notification.type !== "orchestration_attention") return true;
 		const projectId = notification.projectId;
 		if (!projectId?.trim()) return true; // No safe project grouping key.
 		if (!notification.title || (document.visibilityState === "visible" && document.hasFocus())) return false;
+		if (pendingAttentionProjects.has(projectId)) return false;
 		const now = Date.now();
 		const last = lastAttentionToastByProject.get(projectId);
 		if (last !== undefined && now >= last && now - last < ORCHESTRATION_ATTENTION_TOAST_COOLDOWN_MS) return false;
-		lastAttentionToastByProject.set(projectId, now);
 		return true;
+	};
+	const offerDesktopToast = async (notification: NotificationDTO): Promise<void> => {
+		const projectId =
+			notification.type === "orchestration_attention" && notification.projectId?.trim()
+				? notification.projectId
+				: undefined;
+		if (projectId) pendingAttentionProjects.add(projectId);
+		try {
+			const admitted = await aoBridge.notifications.show({
+				id: notification.id,
+				title: notification.title,
+				body: notification.body || undefined,
+				type: notification.type,
+			});
+			if (projectId && admitted === true) lastAttentionToastByProject.set(projectId, Date.now());
+		} catch {
+			// A failed IPC has no admission evidence. Leave the project eligible
+			// for the next new event; replayed IDs remain deduplicated by cache.
+		} finally {
+			if (projectId) pendingAttentionProjects.delete(projectId);
+		}
 	};
 
 	return {
@@ -420,16 +440,13 @@ export function createNotificationsTransport(
 						const inserted = mergeUnreadNotification(queryClient, notification);
 						mergeRecentNotification(queryClient, notification, known);
 						if (
-							inserted && !known && !notification.resolvedAt
-							&& !suppressToastForWatchedSession(notification, getVisibleAgentSessionId())
-							&& shouldOfferDesktopToast(notification)
+							inserted &&
+							!known &&
+							!notification.resolvedAt &&
+							!suppressToastForWatchedSession(notification, getVisibleAgentSessionId()) &&
+							shouldOfferDesktopToast(notification)
 						) {
-							void aoBridge.notifications.show({
-								id: notification.id,
-								title: notification.title,
-								body: notification.body || undefined,
-								type: notification.type,
-							});
+							void offerDesktopToast(notification);
 						}
 					});
 					// AO closed the underlying issue (the session got its input, the
