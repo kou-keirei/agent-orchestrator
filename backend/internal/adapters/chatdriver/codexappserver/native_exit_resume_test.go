@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -199,7 +198,23 @@ func TestNativeExitResumeDisposable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("native persisted history unavailable: %v", err)
 	}
-	if !reflect.DeepEqual(before, after) {
+	if len(before) != len(after) {
+		t.Fatalf("native history length changed across provider exit: before=%d after=%d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Err != nil || after[i].Err != nil {
+			t.Fatalf("native history error at %d: before=%v after=%v", i, before[i].Err, after[i].Err)
+		}
+	}
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("encode predecessor history: %v", err)
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		t.Fatalf("encode resumed history: %v", err)
+	}
+	if !bytes.Equal(beforeJSON, afterJSON) {
 		t.Fatal("native history changed across provider exit")
 	}
 	if err := nativeResumeRequireExchange(after, turn.ProviderTurnID, prompt); err != nil {
@@ -366,7 +381,7 @@ func TestNativeExitResumeRequestGuard(t *testing.T) {
 			sink := &nativeResumeWriteBuffer{}
 			write := func(child int, method string) error {
 				w := &nativeResumeRequestWriter{WriteCloser: sink, requests: r, child: child}
-				_, err := w.Write([]byte(fmt.Sprintf("{\"id\":1,\"method\":%q}\n", method)))
+				_, err := fmt.Fprintf(w, "{\"id\":1,\"method\":%q}\n", method)
 				return err
 			}
 			for _, method := range []string{"thread/start", "turn/start"} {
