@@ -21,6 +21,8 @@ type unsettledTurnReader interface {
 	HasUnsettledConversationTurns(context.Context, string) (bool, error)
 }
 
+// ChatNeedsController reports whether durable session facts require a controller.
+// Missing or uncertain continuity is treated as requiring one.
 func (s *Service) ChatNeedsController(ctx context.Context, id domain.SessionID) (bool, error) {
 	rec, err := s.requireChatSession(ctx, id)
 	if err != nil {
