@@ -356,8 +356,8 @@ func TestSteerOrSendFallsBackWithoutLeavingAQueuedTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SteerOrSend: %v", err)
 	}
-	if result.Steered || result.Turn.ID == "" || result.Turn.State != domain.TurnStateRunning {
-		t.Fatalf("result = %+v, want definitive running fallback", result)
+	if result.Steered || result.Turn.ID == "" || result.Turn.State != domain.TurnStateQueued || result.Turn.ProviderTurnID != "" {
+		t.Fatalf("result = %+v, want pending fallback behind the known running turn", result)
 	}
 	recovered, err := h.svc.SteerOrSend(context.Background(), testSession,
 		ports.ChatUserMessage{ClientMessageID: msg.ClientMessageID}, true)
@@ -367,8 +367,39 @@ func TestSteerOrSendFallsBackWithoutLeavingAQueuedTurn(t *testing.T) {
 	if recovered.Steered || recovered.Turn.ID != result.Turn.ID || !recovered.Duplicate {
 		t.Fatalf("recovered = %+v, want sent turn %s", recovered, result.Turn.ID)
 	}
-	if calls := provider.sendCallCount(); calls != 2 {
-		t.Fatalf("provider send calls = %d, want initial turn plus one fallback", calls)
+	if calls := provider.sendCallCount(); calls != 1 {
+		t.Fatalf("provider send calls = %d, want only the initial turn until correlated completion", calls)
+	}
+	attempt, err := h.st.OrdinarySendAttempt(context.Background(), result.Turn.ID)
+	if err != nil || attempt.State != domain.ConversationSendPending || attempt.ClientMessageID != msg.ClientMessageID {
+		t.Fatalf("fallback is not genuine untouched work: %+v %v", attempt, err)
+	}
+	// A terminal event from other native work cannot release this busy gate.
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "unrelated-turn", TurnState: domain.TurnStateCompleted})
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerCold})
+	deadline := time.Now().Add(5 * time.Second)
+	for h.ctrl.State() != ports.ChatControllerCold && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.ctrl.State() != ports.ChatControllerCold || provider.sendCallCount() != 1 {
+		t.Fatal("uncorrelated completion released queued fallback")
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, turn := range s.Turns {
+			if turn.ID == result.Turn.ID {
+				return turn.State == domain.TurnStateRunning
+			}
+		}
+		return false
+	})
+	recovered, err = h.svc.SteerOrSend(context.Background(), testSession, ports.ChatUserMessage{ClientMessageID: msg.ClientMessageID}, true)
+	if err != nil || !recovered.Duplicate || recovered.Turn.ID != result.Turn.ID || recovered.Turn.State != domain.TurnStateRunning {
+		t.Fatalf("correlated completion did not preserve fallback identity: %+v %v", recovered, err)
+	}
+	sent := provider.sentMessages()
+	if len(sent) != 2 || sent[1].ClientMessageID != msg.ClientMessageID || provider.sendCallCount() != 2 {
+		t.Fatalf("fallback did not make exactly one eventual provider send: %+v", sent)
 	}
 }
 

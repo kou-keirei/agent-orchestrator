@@ -396,13 +396,13 @@ func TestColdUncertainSendAndDuplicateClientIDDoNotRedispatch(t *testing.T) {
 	ctx := context.Background()
 	msg := ports.ChatUserMessage{Text: "execute once", ClientMessageID: "uncertain-cold-input"}
 	turn, err := svc.Send(ctx, rec.ID, msg)
-	if !errors.Is(err, driver.sendErr) || turn.ID == "" || turn.State != domain.TurnStateFailed || turn.ProviderTurnID != "" {
+	if !errors.Is(err, driver.sendErr) || !ports.IsChatDeliveryUnknown(err) || turn.ID == "" || turn.State != domain.TurnStateQueued || turn.ProviderTurnID != "" {
 		t.Fatalf("uncertain delivery = %+v, err=%v", turn, err)
 	}
 	for range 3 {
 		duplicate, err := svc.Send(ctx, rec.ID, msg)
-		if err != nil || duplicate.ID != "" {
-			t.Fatalf("duplicate claimed another dispatch: %+v err=%v", duplicate, err)
+		if !ports.IsChatDeliveryUnknown(err) || duplicate.ID != turn.ID {
+			t.Fatalf("duplicate falsely acknowledged or changed identity: %+v err=%v", duplicate, err)
 		}
 	}
 	if _, err := svc.RetryTurn(ctx, rec.ID, turn.ID); !errors.Is(err, chatsvc.ErrRetryDeliveryUncertain) {
@@ -414,8 +414,15 @@ func TestColdUncertainSendAndDuplicateClientIDDoNotRedispatch(t *testing.T) {
 	}
 	rows, err := st.LoadConversationSnapshot(ctx, conversation.ID)
 	if err != nil || len(rows.Messages) != 1 || len(rows.Turns) != 1 || rows.Messages[0].ClientMessageID != msg.ClientMessageID ||
-		rows.Turns[0].ID != turn.ID || rows.Turns[0].State != domain.TurnStateFailed || rows.Turns[0].ProviderTurnID != "" {
+		rows.Turns[0].ID != turn.ID || rows.Turns[0].State != domain.TurnStateQueued || rows.Turns[0].ProviderTurnID != "" {
 		t.Fatalf("uncertain delivery history changed: %+v err=%v", rows, err)
+	}
+	attempt, err := st.OrdinarySendAttempt(ctx, turn.ID)
+	current, found, sessionErr := st.GetSession(ctx, rec.ID)
+	if err != nil || sessionErr != nil || !found || attempt.State != domain.ConversationSendReserved ||
+		attempt.ClientMessageID != msg.ClientMessageID || attempt.SessionID != rec.ID ||
+		attempt.ControllerGeneration != current.Metadata.ControllerGeneration || attempt.BranchID != turn.BranchID {
+		t.Fatalf("uncertain delivery lost exact owner: %+v %v %v", attempt, err, sessionErr)
 	}
 	provider := driver.conversations[0]
 	provider.mu.Lock()
