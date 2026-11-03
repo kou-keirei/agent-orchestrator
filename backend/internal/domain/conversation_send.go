@@ -21,7 +21,8 @@ type ConversationSendState string
 
 const (
 	// ConversationSendPending is untouched work eligible for one reservation.
-	ConversationSendPending      ConversationSendState = "pending"
+	ConversationSendPending ConversationSendState = "pending"
+	// ConversationSendReserved records a send reserved for possible delivery.
 	ConversationSendReserved     ConversationSendState = "reserved"
 	ConversationSendLegacy       ConversationSendState = "legacy"
 	ConversationSendBound        ConversationSendState = "bound"
@@ -41,5 +42,6 @@ type ConversationSendAttempt struct {
 var (
 	// ErrConversationSendUncertain requires correlated evidence before resolution.
 	ErrConversationSendUncertain = errors.New("ordinary send requires correlated delivery resolution")
-	ErrConversationSendConflict  = errors.New("ordinary send owner or attempt conflict")
+	// ErrConversationSendConflict reports an ordinary send owner or attempt conflict.
+	ErrConversationSendConflict = errors.New("ordinary send owner or attempt conflict")
 )
