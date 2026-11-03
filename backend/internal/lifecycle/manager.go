@@ -122,24 +122,6 @@ type sessionVisibilityActivator interface {
 	ClearSessionHiddenIfUnchanged(context.Context, domain.SessionID, *time.Time) (bool, error)
 }
 
-func (m *Manager) clearPresentationHiddenAfterActivation(ctx context.Context, id domain.SessionID, expected *time.Time) {
-	if expected == nil {
-		return
-	}
-	visibility, ok := m.store.(sessionVisibilityActivator)
-	if !ok {
-		return
-	}
-	cleared, err := visibility.ClearSessionHiddenIfUnchanged(ctx, id, expected)
-	if err != nil {
-		slog.Default().Warn("lifecycle: failed to clear presentation-hidden state after activation", "session", id, "err", err)
-	} else if !cleared {
-		// A false CAS means a newer user hide won the race. Preserve it; this
-		// is a presentation outcome, never a provider ownership failure.
-		slog.Default().Info("lifecycle: presentation-hidden state changed during activation", "session", id)
-	}
-}
-
 // agentSwitchSourceStopStore and agentSwitchTargetActivationStore are the
 // atomic persistence primitives used at the two agent-switch ownership
 // boundaries. They remain optional so focused lifecycle reducer fakes do not
@@ -310,6 +292,24 @@ type Manager struct {
 	// The counter is memory-only and guarded by mu.
 	consecutiveDeadProbes map[domain.SessionID]int
 	orchestrationWake     func(domain.ProjectID)
+}
+
+func (m *Manager) clearPresentationHiddenAfterActivation(ctx context.Context, id domain.SessionID, expected *time.Time) {
+	if expected == nil {
+		return
+	}
+	visibility, ok := m.store.(sessionVisibilityActivator)
+	if !ok {
+		return
+	}
+	cleared, err := visibility.ClearSessionHiddenIfUnchanged(ctx, id, expected)
+	if err != nil {
+		slog.Default().Warn("lifecycle: failed to clear presentation-hidden state after activation", "session", id, "err", err)
+	} else if !cleared {
+		// A false CAS means a newer user hide won the race. Preserve it; this
+		// is a presentation outcome, never a provider ownership failure.
+		slog.Default().Info("lifecycle: presentation-hidden state changed during activation", "session", id)
+	}
 }
 
 // SetOrchestrationWake connects durable event commits to the daemon dispatcher.

@@ -162,7 +162,7 @@ func (m *Manager) executeChatAgentSwitch(
 	}
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
-		return result, fmt.Errorf("switch Chat agent %s: %w: stored permission mode is invalid: %v", id, ports.ErrChatPermissionModeUnsupported, err)
+		return result, fmt.Errorf("switch Chat agent %s: %w: stored permission mode is invalid: %s", id, ports.ErrChatPermissionModeUnsupported, err.Error())
 	}
 	if err := m.chat.PreflightChat(
 		ctx,
