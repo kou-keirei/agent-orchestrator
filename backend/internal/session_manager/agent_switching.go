@@ -1363,7 +1363,7 @@ func (m *Manager) prepareTargetActivation(ctx context.Context, store ports.Agent
 	}
 	permissions, err := sessionPermission(rec, project.Config)
 	if err != nil {
-		return preparedTargetActivation{}, fmt.Errorf("%w: stored permission mode is invalid: %v", ports.ErrChatPermissionModeUnsupported, err)
+		return preparedTargetActivation{}, fmt.Errorf("%w: stored permission mode is invalid: %s", ports.ErrChatPermissionModeUnsupported, err.Error())
 	}
 	config.Permissions = permissions
 	if config.Permissions == ports.PermissionModeReadOnly {
