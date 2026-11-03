@@ -11,9 +11,12 @@ import (
 type RetentionFact string
 
 const (
+	// RetentionUnknown indicates that the evidence state is unknown.
 	RetentionUnknown RetentionFact = "UNKNOWN"
-	RetentionYes     RetentionFact = "YES"
-	RetentionNo      RetentionFact = "NO"
+	// RetentionYes indicates that the fact is affirmed by evidence.
+	RetentionYes RetentionFact = "YES"
+	// RetentionNo indicates that the fact is negated by evidence.
+	RetentionNo RetentionFact = "NO"
 )
 
 // RetentionPreview is a single-row fixture result, not a snapshot census or a
