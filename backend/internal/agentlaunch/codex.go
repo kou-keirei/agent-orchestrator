@@ -91,13 +91,14 @@ type CodexLaunch struct {
 	Environment   []string
 }
 
+// NewCodexLaunch validates the executable and resolves the workspace and environment.
 func NewCodexLaunch(ctx context.Context, executable, workspacePath string, overlay map[string]string) (CodexLaunch, error) {
 	if err := ctx.Err(); err != nil {
 		return CodexLaunch{}, err
 	}
 	executable = strings.TrimSpace(executable)
 	if executable == "" {
-		return CodexLaunch{}, errors.New("Codex launch executable is required")
+		return CodexLaunch{}, errors.New("codex launch executable is required")
 	}
 	workspacePath, err := FinalWorkspacePath(workspacePath)
 	if err != nil {
@@ -110,6 +111,7 @@ func NewCodexLaunch(ctx context.Context, executable, workspacePath string, overl
 	}, nil
 }
 
+// WithEnvironment rebuilds the launch environment with the supplied overlay.
 func (c CodexLaunch) WithEnvironment(ctx context.Context, overlay map[string]string) (CodexLaunch, error) {
 	return NewCodexLaunch(ctx, c.Executable, c.WorkspacePath, overlay)
 }

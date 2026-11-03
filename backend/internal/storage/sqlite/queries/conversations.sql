@@ -1311,8 +1311,12 @@ WHERE id = ?
 -- did the provider actually say" once a projection turns out to be wrong.
 -- name: InsertConversationProviderEvent :execrows
 INSERT OR IGNORE INTO conversation_provider_events (
-    conversation_id, session_id, provider_event_id, method, payload_json, received_at
-) VALUES (?, ?, ?, ?, ?, ?);
+    conversation_id, session_id, provider_event_id, method, payload_json, received_at, branch_id
+) VALUES (
+    sqlc.arg(conversation_id), sqlc.arg(session_id), sqlc.arg(provider_event_id),
+    sqlc.arg(method), sqlc.arg(payload_json), sqlc.arg(received_at),
+    COALESCE((SELECT active_branch_id FROM conversations WHERE id = sqlc.arg(conversation_id)), '')
+);
 
 -- name: SelectConversationProviderEvents :many
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (

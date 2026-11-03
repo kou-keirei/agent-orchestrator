@@ -2393,10 +2393,11 @@ function cancelDockBounce(): void {
 
 ipcMain.handle(
 	"notifications:show",
-	(_event, notification: { id: string; title: string; body?: string; type?: string }) => {
-		if (!notification.id || !mainWindow) return;
+	(_event, notification: { id: string; title: string; body?: string; type?: string }): boolean => {
+		if (!notification.id || !mainWindow) return false;
 		// Only signal when the window isn't already focused (the user is looking).
-		if (mainWindow.isFocused()) return;
+		if (mainWindow.isFocused()) return false;
+		let admitted = false;
 		// OS toast: a native banner the user can click to jump straight back to the
 		// session. Fires for every backend notification type (see shouldToast), so a
 		// new type in notification.go never silently loses its toast.
@@ -2418,6 +2419,7 @@ ipcMain.handle(
 				getShellWebContents()?.send("notifications:click", notification.id);
 			});
 			toast.show();
+			admitted = true;
 		}
 
 		// Dock (macOS) / taskbar (Windows/Linux) attention signal. On macOS every
@@ -2441,6 +2443,7 @@ ipcMain.handle(
 					if (!hadPendingBounce) mainWindow.once("focus", cancelDockBounce);
 				}
 			}
+			admitted ||= pendingBounce !== null;
 		} else if ((process.platform === "win32" || process.platform === "linux") && shouldSignalAttention(notification.type)) {
 			if (!isFlashing) {
 				isFlashing = true;
@@ -2450,10 +2453,13 @@ ipcMain.handle(
 					mainWindow?.flashFrame(false);
 				});
 			}
+			admitted = true;
 		}
 		if (shouldSignalAttention(notification.type) && soundNotificationsEnabled) {
 			shell.beep();
+			admitted = true;
 		}
+		return admitted;
 	},
 );
 

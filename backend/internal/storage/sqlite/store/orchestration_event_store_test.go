@@ -12,6 +12,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
@@ -108,8 +110,8 @@ func TestOrchestrationEventStoreRestartReclaimsExpiredLease(t *testing.T) {
 	if err != nil || len(due) != 1 {
 		t.Fatalf("due=%v err=%v", due, err)
 	}
-	if due[0].LeaseToken != "batch" {
-		t.Fatalf("reclaimed lease token=%q, want stable batch token", due[0].LeaseToken)
+	if due[0].LeaseToken != "batch" || due[0].DestinationSessionID != o.ID {
+		t.Fatalf("reclaimed binding=%+v, want stable batch and destination", due[0])
 	}
 }
 
@@ -140,7 +142,7 @@ func TestOrchestrationRetryPreservesPendingBatchIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	due, err := s.ListDueOrchestrationEvents(ctx, "p", now.Add(time.Minute), 50)
-	if err != nil || len(due) != 1 || due[0].LeaseToken != "batch" {
+	if err != nil || len(due) != 1 || due[0].LeaseToken != "batch" || due[0].DestinationSessionID != o.ID {
 		t.Fatalf("due=%v err=%v, want pending batch identity", due, err)
 	}
 }
@@ -279,7 +281,7 @@ func TestOrchestrationDeadLetterRearmRestoresTheWholeBatch(t *testing.T) {
 		t.Fatalf("events=%+v err=%v", got, err)
 	}
 	for _, event := range got {
-		if event.State != domain.OrchestrationPending || event.AttemptCount != 0 || event.LeaseToken != "dead-batch" {
+		if event.State != domain.OrchestrationPending || event.AttemptCount != 0 || event.LeaseToken != "dead-batch" || event.DestinationSessionID != o.ID {
 			t.Fatalf("rearmed event=%+v, want whole batch pending with identity", event)
 		}
 	}
@@ -712,7 +714,833 @@ func TestTerminalLifecycleAndReconciliationShareCanonicalRevision(t *testing.T) 
 
 type capturedOrchestrationTransport struct {
 	batches []orchestrationevents.Batch
+	targets []domain.SessionID
 	result  orchestrationevents.Submission
+}
+
+// Keep the held project first so startup must pass it to reach unrelated work.
+// missing models an exact native lookup returning not-found, without deleting
+// the recorded destination (the schema's delete action clears that binding).
+type startupHoldStore struct {
+	*sqlite.Store
+	missing domain.SessionID
+}
+
+func (s startupHoldStore) ListProjects(context.Context) ([]domain.ProjectRecord, error) {
+	return []domain.ProjectRecord{{ID: "p"}, {ID: "q"}}, nil
+}
+
+func (s startupHoldStore) GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	if id == s.missing {
+		return domain.SessionRecord{}, false, nil
+	}
+	return s.Store.GetSession(ctx, id)
+}
+
+type startupAttentionRecorder struct{ intents []ports.NotificationIntent }
+
+func (n *startupAttentionRecorder) Notify(_ context.Context, intent ports.NotificationIntent) error {
+	n.intents = append(n.intents, intent)
+	return nil
+}
+
+func (*startupAttentionRecorder) Resolve(context.Context, ports.NotificationResolution) error {
+	return nil
+}
+
+func TestOrchestrationStartupHoldsLegacyLostDestination(t *testing.T) {
+	for _, recovery := range []string{"reclaimed_lease", "reclaimed_submission", "rearmed_dead_letter"} {
+		t.Run(recovery, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := sqlitetest.MustOpenAt(t, dataDir)
+			for _, project := range []string{"p", "q"} {
+				seedProject(t, s, project)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			worker, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := sampleRecord("p")
+			replacement.Kind, replacement.Mode, replacement.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			replacement.Activity.State = domain.ActivityIdle
+			if _, err := s.CreateSession(ctx, replacement); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			attempts := 1
+			var submitted any
+			if recovery == "reclaimed_submission" {
+				submitted = now.Add(-time.Minute)
+			}
+			if recovery == "rearmed_dead_letter" {
+				attempts = 0
+			}
+			// Seed the state produced by BASE_SHA reclaim/rearm directly. Using
+			// the repaired lease/reclaim APIs would miss already-persisted rows:
+			// pending + retained token + NULL destination and lease expiry;
+			// reclaim increments attempts and retains submitted_at, rearm resets both.
+			for _, id := range []string{"legacy-a", "legacy-b"} {
+				if _, err := db.ExecContext(ctx, `INSERT INTO orchestration_events
+					(id,project_id,worker_id,kind,source_revision,state,attempt_count,enqueued_at,next_attempt_at,lease_token,destination_session_id,lease_expires_at,submitted_at,acknowledged_at,attention_required_at,last_error)
+					VALUES(?,'p',?,? ,?,'pending',?,?,?,'legacy-batch',NULL,NULL,?,NULL,NULL,'')`,
+					id, worker.ID, domain.OrchestrationWorkerBlocked, id, attempts, now.Add(-time.Minute), now.Add(-time.Second), submitted); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(before) != 2 {
+				t.Fatalf("legacy fixture=%v err=%v", before, err)
+			}
+			transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			notifier := &startupAttentionRecorder{}
+			wrapped := startupHoldStore{Store: s} // p must be visited before q.
+			d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Notifier: notifier, Now: func() time.Time { return now }, NewID: func() string { return "fresh-token" }}
+			if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+				t.Fatalf("startup aborted on legacy lost destination: %v", err)
+			}
+			if err := d.DispatchProject(ctx, "p"); err != nil {
+				t.Fatalf("direct dispatch aborted on legacy lost destination: %v", err)
+			}
+			if len(transport.batches) != 0 || len(notifier.intents) != 0 {
+				t.Fatalf("legacy hold sent or alerted prematurely: sends=%v attention=%v", transport.targets, notifier.intents)
+			}
+			// A missing destination cannot be repaired by a stale lifecycle ACK
+			// or by directly trying to lease the batch to a replacement parent.
+			parents, err := s.ListSessions(ctx, "p")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, parent := range parents {
+				if parent.Kind != domain.KindOrchestrator {
+					continue
+				}
+				if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parent.ID, "legacy-batch", now); err != nil || n != 0 {
+					t.Fatalf("replacement ACK=%d err=%v", n, err)
+				}
+				if err := s.LeaseOrchestrationEvents(ctx, []string{"legacy-a", "legacy-b"}, "legacy-batch", parent.ID, now.Add(time.Minute)); err == nil {
+					t.Fatal("legacy batch was rebound to replacement")
+				}
+			}
+			otherWorker, err := s.CreateSession(ctx, sampleRecord("q"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherParent := replacement
+			otherParent.ProjectID = "q"
+			otherParent, err = s.CreateSession(ctx, otherParent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "unrelated", ProjectID: "q", WorkerID: otherWorker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "q", EnqueuedAt: now, NextAttemptAt: now}); err != nil || !ok {
+				t.Fatalf("enqueue unrelated=%v err=%v", ok, err)
+			}
+			now = now.Add(16 * time.Minute)
+			// Repeated recovery must keep holding p, expose durable attention,
+			// deliver q once, and never replay its acknowledged batch.
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(transport.batches) != 1 || transport.targets[0] != otherParent.ID {
+				t.Fatalf("replacement sent, unrelated stalled or replayed: targets=%v", transport.targets)
+			}
+			otherEvents, err := s.ListOrchestrationEvents(ctx, "q", 10)
+			if err != nil || len(otherEvents) != 1 || otherEvents[0].State != domain.OrchestrationAcknowledged {
+				t.Fatalf("unrelated events=%v err=%v", otherEvents, err)
+			}
+			held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != len(before) {
+				t.Fatalf("legacy held=%v err=%v", held, err)
+			}
+			for i, event := range held {
+				if event.AttentionRequiredAt.IsZero() {
+					t.Fatalf("legacy hold lost delayed attention: %+v", event)
+				}
+				event.AttentionRequiredAt = before[i].AttentionRequiredAt
+				if event != before[i] {
+					t.Fatalf("legacy hold changed durable facts: got=%+v before=%+v", event, before[i])
+				}
+			}
+			if len(notifier.intents) == 0 {
+				t.Fatal("legacy hold attention never became visible")
+			}
+			for _, intent := range notifier.intents {
+				if intent.SessionID != worker.ID || intent.ProjectID != "p" {
+					t.Fatalf("wrong legacy hold attention: %+v", intent)
+				}
+			}
+		})
+	}
+}
+
+func TestOrchestrationStartupHoldsLegacyMixedAgeBatch(t *testing.T) {
+	for _, recovery := range []string{"reclaimed_lease", "reclaimed_submission"} {
+		t.Run(recovery, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := sqlitetest.MustOpenAt(t, dataDir)
+			for _, project := range []string{"p", "q"} {
+				seedProject(t, s, project)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			worker, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := sampleRecord("p")
+			replacement.Kind, replacement.Mode, replacement.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			replacement.Activity.State = domain.ActivityIdle
+			replacement, err = s.CreateSession(ctx, replacement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			var submitted any
+			if recovery == "reclaimed_submission" {
+				submitted = now.Add(-30 * time.Second)
+			}
+			// Persist BASE_SHA reclaim's result, not the repaired reclaim API's
+			// result. One expired token spans ages 15m01s and 14m59s: reclaim
+			// increments both attempts and erases both destinations, but only
+			// the older member becomes dead_letter and requires attention.
+			for i, state := range []domain.OrchestrationDeliveryState{domain.OrchestrationDeadLetter, domain.OrchestrationPending} {
+				var attention any
+				if state == domain.OrchestrationDeadLetter {
+					attention = now
+				}
+				id := "legacy-" + strconv.Itoa(i)
+				if _, err := db.ExecContext(ctx, `INSERT INTO orchestration_events
+					(id,project_id,worker_id,kind,source_revision,state,attempt_count,enqueued_at,next_attempt_at,lease_token,destination_session_id,lease_expires_at,submitted_at,acknowledged_at,attention_required_at,last_error)
+					VALUES(?,'p',?,?,?,?,1,?,?,'legacy-mixed',NULL,NULL,?,NULL,?,'')`,
+					id, worker.ID, domain.OrchestrationWorkerBlocked, id, state, now.Add(-15*time.Minute-time.Second+time.Duration(i)*2*time.Second), now, submitted, attention); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(before) != 2 || before[0].State != domain.OrchestrationPending || before[1].State != domain.OrchestrationDeadLetter || before[1].AttentionRequiredAt.IsZero() {
+				t.Fatalf("mixed fixture=%v err=%v", before, err)
+			}
+			otherWorker, err := s.CreateSession(ctx, sampleRecord("q"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherParent := replacement
+			otherParent.ProjectID = "q"
+			otherParent, err = s.CreateSession(ctx, otherParent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "unrelated", ProjectID: "q", WorkerID: otherWorker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "q", EnqueuedAt: now, NextAttemptAt: now}); err != nil || !ok {
+				t.Fatalf("enqueue unrelated=%v err=%v", ok, err)
+			}
+			transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			notifier := &startupAttentionRecorder{}
+			wrapped := startupHoldStore{Store: s} // Held p must precede deliverable q.
+			d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Notifier: notifier, Now: func() time.Time { return now }}
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatalf("mixed legacy batch aborted startup: %v", err)
+				}
+				if err := d.DispatchProject(ctx, "p"); err != nil {
+					t.Fatalf("mixed legacy batch aborted direct dispatch: %v", err)
+				}
+			}
+			due, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents)
+			if err != nil || len(due) != 2 || due[0].ID != "legacy-0" || due[1].ID != "legacy-1" {
+				t.Fatalf("complete legacy mixed batch unavailable for HOLD: due=%v err=%v", due, err)
+			}
+			if len(transport.batches) != 1 || transport.targets[0] != otherParent.ID {
+				t.Fatalf("replacement sent, later project stalled or replayed: targets=%v", transport.targets)
+			}
+			other, err := s.ListOrchestrationEvents(ctx, "q", 10)
+			if err != nil || len(other) != 1 || other[0].State != domain.OrchestrationAcknowledged {
+				t.Fatalf("later project events=%v err=%v", other, err)
+			}
+			if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, replacement.ID, "legacy-mixed", now); err != nil || n != 0 {
+				t.Fatalf("replacement ACK=%d err=%v", n, err)
+			}
+			if err := s.LeaseOrchestrationEvents(ctx, []string{"legacy-0", "legacy-1"}, "legacy-mixed", replacement.ID, now.Add(time.Minute)); err == nil {
+				t.Fatal("mixed legacy batch rebound to replacement")
+			}
+			held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != len(before) {
+				t.Fatalf("held=%v err=%v", held, err)
+			}
+			for i, event := range held {
+				if event != before[i] {
+					t.Fatalf("HOLD changed durable facts: got=%+v before=%+v", event, before[i])
+				}
+			}
+			// The younger pending member also acquires attention after aging;
+			// the original dead-letter attention timestamp remains untouched.
+			now = now.Add(2 * time.Second)
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			held, err = s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != 2 || held[0].AttentionRequiredAt.IsZero() {
+				t.Fatalf("delayed attention lost: held=%v err=%v", held, err)
+			}
+			held[0].AttentionRequiredAt = before[0].AttentionRequiredAt
+			if held[0] != before[0] || held[1] != before[1] || len(transport.batches) != 1 || len(notifier.intents) == 0 {
+				t.Fatalf("HOLD lost facts/attention or sent again: held=%v sends=%v alerts=%v", held, transport.targets, notifier.intents)
+			}
+			for _, intent := range notifier.intents {
+				if intent.ProjectID != "p" || intent.SessionID != worker.ID {
+					t.Fatalf("wrong HOLD attention: %+v", intent)
+				}
+			}
+			// The HOLD admits complete pending/dead_letter membership, with or
+			// without a destination. Other states retain their loader fence.
+			for _, state := range []domain.OrchestrationDeliveryState{domain.OrchestrationLeased, domain.OrchestrationSubmitted, domain.OrchestrationAcknowledged} {
+				if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET state=? WHERE id='legacy-0'`, state); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents); err == nil {
+					t.Fatalf("lost-destination batch admitted %s member", state)
+				}
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET destination_session_id=?,state=CASE WHEN id='legacy-0' THEN 'dead_letter' ELSE 'pending' END WHERE project_id='p'`, replacement.ID); err != nil {
+				t.Fatal(err)
+			}
+			if due, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents); err != nil || len(due) != 2 {
+				t.Fatalf("bound mixed membership unavailable for HOLD: due=%v err=%v", due, err)
+			}
+			if err := d.DispatchProject(ctx, "p"); err != nil || len(transport.batches) != 1 {
+				t.Fatalf("bound mixed batch escaped HOLD: err=%v sends=%v", err, transport.targets)
+			}
+		})
+	}
+}
+
+func TestOrchestrationStartupHoldsBoundMixedAgeBatch(t *testing.T) {
+	for _, state := range []string{"leased", "submitted"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			s := newTestStore(t)
+			for _, project := range []string{"p", "q"} {
+				seedProject(t, s, project)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			worker, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := sampleRecord("p")
+			parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			parent.Activity.State = domain.ActivityIdle
+			parent, err = s.CreateSession(ctx, parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := parent
+			replacement, err = s.CreateSession(ctx, replacement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := []string{"older", "younger"}
+			for i, id := range ids {
+				enqueued := now.Add(-15*time.Minute - time.Second + time.Duration(i)*2*time.Second)
+				if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: enqueued}); err != nil || !ok {
+					t.Fatalf("enqueue %s=%v err=%v", id, ok, err)
+				}
+			}
+			// Use the real APIs: K+D survive reclaim, while ages 15m01s and
+			// 14m59s split the immutable token's membership across states.
+			if err := s.LeaseOrchestrationEvents(ctx, ids, "K", parent.ID, now.Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if state == "submitted" {
+				if err := s.MarkOrchestrationEventsSubmitted(ctx, ids, "K", now.Add(-2*time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+				t.Fatalf("reclaim=%d err=%v", n, err)
+			}
+			before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(before) != 2 || before[0].State != domain.OrchestrationPending || before[1].State != domain.OrchestrationDeadLetter || before[1].AttentionRequiredAt != now {
+				t.Fatalf("mixed fixture=%v err=%v", before, err)
+			}
+			for _, event := range before {
+				if event.LeaseToken != "K" || event.DestinationSessionID != parent.ID || event.AttemptCount != 1 || !event.LeaseExpiresAt.IsZero() {
+					t.Fatalf("reclaim lost binding or budget: %+v", event)
+				}
+			}
+			otherWorker, err := s.CreateSession(ctx, sampleRecord("q"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherParent := parent
+			otherParent.ProjectID = "q"
+			otherParent, err = s.CreateSession(ctx, otherParent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "unrelated", ProjectID: "q", WorkerID: otherWorker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "q", EnqueuedAt: now, NextAttemptAt: now}); err != nil || !ok {
+				t.Fatalf("enqueue unrelated=%v err=%v", ok, err)
+			}
+			transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			notifier := &startupAttentionRecorder{}
+			wrapped := startupHoldStore{Store: s} // Held p must precede deliverable q.
+			d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Notifier: notifier, Now: func() time.Time { return now }}
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatalf("bound mixed batch aborted startup: %v", err)
+				}
+				if err := d.DispatchProject(ctx, "p"); err != nil {
+					t.Fatalf("bound mixed batch aborted direct dispatch: %v", err)
+				}
+			}
+			due, err := s.ListDueOrchestrationEvents(ctx, "p", now, orchestrationevents.MaxBatchEvents)
+			if err != nil || len(due) != 2 || due[0].ID != "older" || due[1].ID != "younger" {
+				t.Fatalf("complete bound mixed batch unavailable for HOLD: due=%v err=%v", due, err)
+			}
+			if len(transport.batches) != 1 || transport.targets[0] != otherParent.ID {
+				t.Fatalf("held batch sent or unrelated work stalled/replayed: targets=%v", transport.targets)
+			}
+			other, err := s.ListOrchestrationEvents(ctx, "q", 10)
+			if err != nil || len(other) != 1 || other[0].State != domain.OrchestrationAcknowledged {
+				t.Fatalf("unrelated work=%v err=%v", other, err)
+			}
+			for _, target := range []domain.SessionID{parent.ID, replacement.ID} {
+				if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, target, "K", now); err != nil || n != 0 {
+					t.Fatalf("held batch ACK target=%s count=%d err=%v", target, n, err)
+				}
+				// The pending row is visited first: a rejected second member
+				// must roll back its earlier update even for the exact binding.
+				if err := s.LeaseOrchestrationEvents(ctx, []string{"younger", "older"}, "K", target, now.Add(time.Minute)); err == nil {
+					t.Fatalf("mixed batch leased to %s", target)
+				}
+			}
+			held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != len(before) {
+				t.Fatalf("held=%v err=%v", held, err)
+			}
+			for i, event := range held {
+				if event != before[i] {
+					t.Fatalf("HOLD or rejected lease changed durable facts: got=%+v before=%+v", event, before[i])
+				}
+			}
+			now = now.Add(2 * time.Second)
+			for range 2 {
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			held, err = s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(held) != 2 || held[0].AttentionRequiredAt.IsZero() {
+				t.Fatalf("delayed attention lost: held=%v err=%v", held, err)
+			}
+			held[0].AttentionRequiredAt = before[0].AttentionRequiredAt
+			if held[0] != before[0] || held[1] != before[1] || len(transport.batches) != 1 || len(notifier.intents) == 0 {
+				t.Fatalf("HOLD lost facts/attention or sent again: held=%v sends=%v alerts=%v", held, transport.targets, notifier.intents)
+			}
+			for _, intent := range notifier.intents {
+				if intent.ProjectID != "p" || intent.SessionID != worker.ID {
+					t.Fatalf("wrong HOLD attention: %+v", intent)
+				}
+			}
+		})
+	}
+}
+
+func TestOrchestrationStoreRejectsIncompleteTokenMembership(t *testing.T) {
+	for _, operation := range []string{"pending_subset_lease_then_ack", "historical_subset_lifecycle_ack", "historical_subset_direct_ack", "complete_historical_mixed_ack", "nonmixed_pending_subset_lease", "nonmixed_leased_subset_ack", "append_fresh_to_token", "foreign_member_lifecycle_ack", "nonmixed_leased_subset_retry", "nonmixed_leased_subset_submit"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := sqlitetest.MustOpenAt(t, dataDir)
+			seedProject(t, s, "p")
+			worker, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			parent := sampleRecord("p")
+			parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			parent.Activity.State = domain.ActivityIdle
+			parent, err = s.CreateSession(ctx, parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, id := range []string{"older", "younger"} {
+				enqueued := now.Add(-15*time.Minute - time.Second + time.Duration(i)*2*time.Second)
+				if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: enqueued}); err != nil || !ok {
+					t.Fatalf("enqueue %s=%v err=%v", id, ok, err)
+				}
+			}
+			if err := s.LeaseOrchestrationEvents(ctx, []string{"older", "younger"}, "K", parent.ID, now.Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+				t.Fatalf("reclaim=%d err=%v", n, err)
+			}
+			db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			switch operation {
+			case "historical_subset_lifecycle_ack", "historical_subset_direct_ack", "complete_historical_mixed_ack":
+				// Model the persisted outcome of the old subset-lease API.
+				_, err = db.ExecContext(ctx, `UPDATE orchestration_events SET state='leased',lease_expires_at=? WHERE id='younger'`, now.Add(time.Minute))
+			case "nonmixed_pending_subset_lease":
+				_, err = s.RetryDeadLetterOrchestrationEvent(ctx, "p", "older", now)
+			case "nonmixed_leased_subset_ack", "foreign_member_lifecycle_ack", "nonmixed_leased_subset_retry", "nonmixed_leased_subset_submit":
+				_, err = s.RetryDeadLetterOrchestrationEvent(ctx, "p", "older", now)
+				if err == nil {
+					err = s.LeaseOrchestrationEvents(ctx, []string{"older", "younger"}, "K", parent.ID, now.Add(time.Minute))
+				}
+				if err == nil && operation == "foreign_member_lifecycle_ack" {
+					_, err = db.ExecContext(ctx, `UPDATE orchestration_events SET destination_session_id=? WHERE id='older'`, worker.ID)
+				}
+			case "append_fresh_to_token":
+				_, err = s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "fresh", ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "fresh", EnqueuedAt: now, NextAttemptAt: now})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch operation {
+			case "pending_subset_lease_then_ack", "nonmixed_pending_subset_lease":
+				if err := s.LeaseOrchestrationEvents(ctx, []string{"younger"}, "K", parent.ID, now.Add(time.Minute)); err == nil {
+					t.Error("pending-only lease bypassed complete token membership")
+				}
+				if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parent.ID, "K", now); err != nil || n != 0 {
+					t.Errorf("subset exact-destination ACK=%d err=%v", n, err)
+				}
+			case "historical_subset_lifecycle_ack", "foreign_member_lifecycle_ack":
+				if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parent.ID, "K", now); err != nil || n != 0 {
+					t.Errorf("incomplete-token lifecycle ACK=%d err=%v", n, err)
+				}
+			case "historical_subset_direct_ack", "nonmixed_leased_subset_ack":
+				if err := s.AcknowledgeOrchestrationEvents(ctx, []string{"younger"}, "K", now); err == nil {
+					t.Error("incomplete-token direct ACK accepted")
+				}
+			case "complete_historical_mixed_ack":
+				if err := s.AcknowledgeOrchestrationEvents(ctx, []string{"younger", "older"}, "K", now); err == nil {
+					t.Error("mixed-state direct ACK accepted")
+				}
+			case "append_fresh_to_token":
+				if err := s.LeaseOrchestrationEvents(ctx, []string{"younger", "fresh"}, "K", parent.ID, now.Add(time.Minute)); err == nil {
+					t.Error("fresh member replaced an omitted member of K")
+				}
+			case "nonmixed_leased_subset_retry":
+				if err := s.RetryOrchestrationEvents(ctx, []domain.OrchestrationEvent{before[0]}, "K", "transport_error", now, domain.SessionModeChat); err == nil {
+					t.Error("incomplete-token retry accepted")
+				}
+			case "nonmixed_leased_subset_submit":
+				if err := s.MarkOrchestrationEventsSubmitted(ctx, []string{"younger"}, "K", now); err == nil {
+					t.Error("incomplete-token submission accepted")
+				}
+			}
+			after, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("after=%v err=%v", after, err)
+			}
+			for i, event := range after {
+				if event != before[i] {
+					t.Errorf("rejected operation changed durable facts: before=%+v after=%+v", before[i], event)
+				}
+			}
+		})
+	}
+}
+
+func TestOrchestrationLifecycleACKScopesCollidingTokensToProject(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	parents := make(map[domain.ProjectID]domain.SessionID)
+	for _, project := range []domain.ProjectID{"p", "foreign"} {
+		seedProject(t, s, string(project))
+		worker, err := s.CreateSession(ctx, sampleRecord(string(project)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent := sampleRecord(string(project))
+		parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+		parent.Activity.State = domain.ActivityIdle
+		parent, err = s.CreateSession(ctx, parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parents[project] = parent.ID
+		ids := []string{string(project) + "-a", string(project) + "-b"}
+		for _, id := range ids {
+			if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: project, WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: now, NextAttemptAt: now}); err != nil || !ok {
+				t.Fatalf("enqueue %s=%v err=%v", id, ok, err)
+			}
+		}
+		if err := s.LeaseOrchestrationEvents(ctx, ids, "K", parent.ID, now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foreign, err := s.ListOrchestrationEvents(ctx, "foreign", 10)
+	if err != nil || len(foreign) != 2 {
+		t.Fatalf("foreign=%v err=%v", foreign, err)
+	}
+	if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parents["p"], "K", now); err != nil || n != 2 {
+		t.Fatalf("project-local ACK=%d err=%v", n, err)
+	}
+	if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parents["p"], "K", now); err != nil || n != 0 {
+		t.Fatalf("replayed project-local ACK=%d err=%v", n, err)
+	}
+	after, err := s.ListOrchestrationEvents(ctx, "foreign", 10)
+	if err != nil || len(after) != 2 || after[0] != foreign[0] || after[1] != foreign[1] {
+		t.Fatalf("project ACK changed foreign token: before=%v after=%v err=%v", foreign, after, err)
+	}
+	if n, err := s.AcknowledgeOrchestrationBatchAccepted(ctx, parents["foreign"], "K", now); err != nil || n != 2 {
+		t.Fatalf("foreign owner's ACK=%d err=%v", n, err)
+	}
+	for _, project := range []domain.ProjectID{"p", "foreign"} {
+		events, err := s.ListOrchestrationEvents(ctx, project, 10)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("events=%v err=%v", events, err)
+		}
+		for _, event := range events {
+			if event.State != domain.OrchestrationAcknowledged || event.LeaseToken != "K" || event.DestinationSessionID != parents[project] {
+				t.Fatalf("ACK lost exact project/owner binding: %+v", event)
+			}
+		}
+	}
+}
+
+func TestOrchestrationMixedTokenRearmAfterColdReopen(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dataDir)
+	seedProject(t, s, "p")
+	seedProject(t, s, "q")
+	worker, err := s.CreateSession(ctx, sampleRecord("p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	parent := sampleRecord("p")
+	parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+	parent.Activity.State = domain.ActivityIdle
+	parent, err = s.CreateSession(ctx, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range []string{"older", "younger"} {
+		enqueued := now.Add(-15*time.Minute - time.Second + time.Duration(i)*2*time.Second)
+		if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: enqueued}); err != nil || !ok {
+			t.Fatalf("enqueue %s=%v err=%v", id, ok, err)
+		}
+	}
+	if err := s.LeaseOrchestrationEvents(ctx, []string{"older", "younger"}, "K", parent.ID, now.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+		t.Fatalf("reclaim=%d err=%v", n, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	before, err := s.ListOrchestrationEvents(ctx, "p", 10)
+	if err != nil || len(before) != 2 {
+		t.Fatalf("reopened events=%v err=%v", before, err)
+	}
+	transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+	wrapped := startupHoldStore{Store: s}
+	d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Now: func() time.Time { return now }}
+	for range 2 {
+		if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+	if err != nil || len(held) != 2 || held[0] != before[0] || held[1] != before[1] || len(transport.batches) != 0 {
+		t.Fatalf("cold recovery changed HOLD: held=%v err=%v sends=%v", held, err, transport.targets)
+	}
+	if changed, err := s.RetryDeadLetterOrchestrationEvent(ctx, "p", "older", now); err != nil || !changed {
+		t.Fatalf("rearm changed=%v err=%v", changed, err)
+	}
+	if changed, err := s.RetryDeadLetterOrchestrationEvent(ctx, "p", "older", now); err != nil || changed {
+		t.Fatalf("repeated rearm changed=%v err=%v", changed, err)
+	}
+	for range 2 {
+		if err := d.DispatchProject(ctx, "p"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := s.ListOrchestrationEvents(ctx, "p", 10)
+	if err != nil || len(after) != 2 || len(transport.batches) != 1 || transport.targets[0] != parent.ID || transport.batches[0].ID != "K" || len(transport.batches[0].EventIDs) != 2 {
+		t.Fatalf("rearmed batch=%v err=%v sends=%v", after, err, transport.batches)
+	}
+	for _, event := range after {
+		if event.State != domain.OrchestrationAcknowledged || event.LeaseToken != "K" || event.DestinationSessionID != parent.ID {
+			t.Fatalf("rearm lost exact-parent membership: %+v", event)
+		}
+	}
+}
+
+func TestOrchestrationStartupHoldsUnavailableRecordedDestination(t *testing.T) {
+	for _, recovery := range []string{"leased", "submitted", "rearmed"} {
+		for _, unavailable := range []string{"retired", "blocked", "waiting_input", "exited", "startup", "busy_tui", "missing"} {
+			t.Run(recovery+"/"+unavailable, func(t *testing.T) {
+				ctx := context.Background()
+				s := newTestStore(t)
+				for _, project := range []string{"p", "q"} {
+					seedProject(t, s, project)
+				}
+				now := time.Now().UTC().Truncate(time.Second)
+				worker, err := s.CreateSession(ctx, sampleRecord("p"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				parent := sampleRecord("p")
+				parent.Kind, parent.Mode, parent.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+				if unavailable == "busy_tui" {
+					parent.Mode = domain.SessionModeTUI
+				}
+				parent.Activity.State = domain.ActivityIdle
+				parent, err = s.CreateSession(ctx, parent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				enqueued := now.Add(-time.Minute)
+				if recovery == "rearmed" {
+					enqueued = now.Add(-16 * time.Minute)
+				}
+				for _, id := range []string{"held-a", "held-b"} {
+					ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: worker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: enqueued})
+					if err != nil || !ok {
+						t.Fatalf("enqueue=%v err=%v", ok, err)
+					}
+				}
+				ids := []string{"held-a", "held-b"}
+				if err := s.LeaseOrchestrationEvents(ctx, ids, "original-token", parent.ID, now.Add(-time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if recovery == "submitted" {
+					if err := s.MarkOrchestrationEventsSubmitted(ctx, ids, "original-token", enqueued); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if recovery == "rearmed" {
+					if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+						t.Fatalf("reclaim=%d err=%v", n, err)
+					}
+					if ok, err := s.RetryDeadLetterOrchestrationEvent(ctx, "p", ids[0], now); err != nil || !ok {
+						t.Fatalf("rearm=%v err=%v", ok, err)
+					}
+				}
+				wrapped := startupHoldStore{Store: s}
+				switch unavailable {
+				case "retired":
+					parent.IsTerminated = true
+				case "blocked":
+					parent.Activity.State = domain.ActivityBlocked
+				case "waiting_input":
+					parent.Activity.State = domain.ActivityWaitingInput
+				case "exited":
+					parent.Activity.State = domain.ActivityExited
+				case "startup":
+					parent.FirstSignalAt = time.Time{}
+				case "busy_tui":
+					parent.Activity.State = domain.ActivityActive
+				case "missing":
+					wrapped.missing = parent.ID
+				}
+				if err := s.UpdateSession(ctx, parent); err != nil {
+					t.Fatal(err)
+				}
+				replacement := sampleRecord("p")
+				replacement.Kind, replacement.Mode, replacement.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+				replacement.Activity.State = domain.ActivityIdle
+				if _, err := s.CreateSession(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
+				transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+				notifier := &startupAttentionRecorder{}
+				// Recover uses wall time for reclaim's next_attempt_at. Dispatch
+				// just beyond that instant so this first scan exercises the hold.
+				now = now.Add(time.Minute)
+				d := &orchestrationevents.Dispatcher{Store: wrapped, Transport: transport, Notifier: notifier, Now: func() time.Time { return now }, NewID: func() string { return "fresh-token" }}
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatalf("startup aborted on held destination: %v", err)
+				}
+				if len(transport.batches) != 0 {
+					t.Fatalf("held startup sent: %v", transport.targets)
+				}
+				wantAttention := recovery == "rearmed"
+				if (len(notifier.intents) != 0) != wantAttention {
+					t.Fatalf("premature/missing attention: %v", notifier.intents)
+				}
+				for _, intent := range notifier.intents {
+					if intent.SessionID != worker.ID || intent.ProjectID != "p" {
+						t.Fatalf("wrong attention: %+v", intent)
+					}
+				}
+				// The next startup scan must still deliver work from a later project.
+				otherWorker, err := s.CreateSession(ctx, sampleRecord("q"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				otherParent := replacement
+				otherParent.ID, otherParent.ProjectID = "", "q"
+				otherParent, err = s.CreateSession(ctx, otherParent)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ok, err := s.EnqueueOrchestrationEvent(ctx, domain.OrchestrationEvent{ID: "unrelated", ProjectID: "q", WorkerID: otherWorker.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "q", EnqueuedAt: enqueued, NextAttemptAt: enqueued}); err != nil || !ok {
+					t.Fatalf("enqueue unrelated=%v err=%v", ok, err)
+				}
+				now = now.Add(16 * time.Minute)
+				if err := orchestrationevents.Recover(ctx, wrapped, d); err != nil {
+					t.Fatal(err)
+				}
+				if len(transport.batches) != 1 || transport.targets[0] != otherParent.ID {
+					t.Fatalf("unrelated project stalled or replacement sent: %v", transport.targets)
+				}
+				otherEvents, err := s.ListOrchestrationEvents(ctx, "q", 10)
+				if err != nil || len(otherEvents) != 1 || otherEvents[0].State != domain.OrchestrationAcknowledged {
+					t.Fatalf("unrelated events=%+v err=%v", otherEvents, err)
+				}
+				held, err := s.ListOrchestrationEvents(ctx, "p", 10)
+				if err != nil || len(held) != 2 {
+					t.Fatalf("held=%v err=%v", held, err)
+				}
+				for _, event := range held {
+					wantAttempts := 1
+					if recovery == "rearmed" {
+						wantAttempts = 0
+					}
+					if event.State != domain.OrchestrationPending || event.LeaseToken != "original-token" || event.DestinationSessionID != parent.ID || event.AttemptCount != wantAttempts || !event.LeaseExpiresAt.IsZero() || !event.AcknowledgedAt.IsZero() || event.AttentionRequiredAt.IsZero() {
+						t.Fatalf("hold changed binding/delivery facts or lost delayed attention: %+v", event)
+					}
+				}
+				if len(notifier.intents) == 0 {
+					t.Fatal("delayed attention missing")
+				}
+			})
+		}
+	}
 }
 
 func TestPersistedBatchOnePastEventLimitFailsClosed(t *testing.T) {
@@ -797,8 +1625,9 @@ func TestUnknownLegacyTerminalRevisionFailsClosedWithoutEvent(t *testing.T) {
 	}
 }
 
-func (t *capturedOrchestrationTransport) Submit(_ context.Context, _ domain.SessionRecord, batch orchestrationevents.Batch) (orchestrationevents.Submission, error) {
+func (t *capturedOrchestrationTransport) Submit(_ context.Context, target domain.SessionRecord, batch orchestrationevents.Batch) (orchestrationevents.Submission, error) {
 	t.batches = append(t.batches, batch)
+	t.targets = append(t.targets, target.ID)
 	return t.result, nil
 }
 
@@ -899,7 +1728,9 @@ func TestDispatcherAcceptsSynchronousTUIHookAcknowledgement(t *testing.T) {
 	o := sampleRecord("p")
 	o.Kind, o.Mode, o.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeTUI, time.Now().UTC()
 	o.Activity.State = domain.ActivityIdle
-	o, _ = s.CreateSession(ctx, o)
+	if _, err := s.CreateSession(ctx, o); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	e := domain.OrchestrationEvent{ID: "e-sync", ProjectID: "p", WorkerID: w.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: "r", EnqueuedAt: now, NextAttemptAt: now}
 	if ok, err := s.EnqueueOrchestrationEvent(ctx, e); err != nil || !ok {
@@ -912,5 +1743,206 @@ func TestDispatcherAcceptsSynchronousTUIHookAcknowledgement(t *testing.T) {
 	events, err := s.ListOrchestrationEvents(ctx, "p", 10)
 	if err != nil || len(events) != 1 || events[0].State != domain.OrchestrationAcknowledged {
 		t.Fatalf("events=%+v err=%v", events, err)
+	}
+}
+
+func TestOrchestrationDestinationFenceAcrossRecovery(t *testing.T) {
+	for _, recovery := range []string{"crash_before_send", "submitted_without_ack", "dead_letter_rearm"} {
+		for _, retired := range []bool{false, true} {
+			t.Run(recovery+"/retired="+strconv.FormatBool(retired), func(t *testing.T) {
+				ctx := context.Background()
+				s := newTestStore(t)
+				seedProject(t, s, "p")
+				w, err := s.CreateSession(ctx, sampleRecord("p"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now().UTC().Truncate(time.Second)
+				o := sampleRecord("p")
+				o.Kind, o.Mode, o.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+				o.Activity.State = domain.ActivityIdle
+				o, err = s.CreateSession(ctx, o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				enqueued := now
+				if recovery == "dead_letter_rearm" {
+					enqueued = now.Add(-16 * time.Minute)
+				}
+				for _, id := range []string{"a", "b"} {
+					e := domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: w.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: enqueued, NextAttemptAt: now}
+					if ok, err := s.EnqueueOrchestrationEvent(ctx, e); err != nil || !ok {
+						t.Fatalf("enqueue=%v err=%v", ok, err)
+					}
+				}
+				ids := []string{"a", "b"}
+				if err := s.LeaseOrchestrationEvents(ctx, ids, "retained-batch", o.ID, now.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if recovery == "submitted_without_ack" {
+					if err := s.MarkOrchestrationEventsSubmitted(ctx, ids, "retained-batch", now); err != nil {
+						t.Fatal(err)
+					}
+				}
+				now = now.Add(time.Minute)
+				if n, err := s.ReclaimOrchestrationEventLeases(ctx, now); err != nil || n != 2 {
+					t.Fatalf("reclaim=%d err=%v", n, err)
+				}
+				if recovery == "dead_letter_rearm" {
+					if changed, err := s.RetryDeadLetterOrchestrationEvent(ctx, "p", "a", now); err != nil || !changed {
+						t.Fatalf("rearm=%v err=%v", changed, err)
+					}
+				}
+				due, err := s.ListDueOrchestrationEvents(ctx, "p", now, 50)
+				if err != nil || len(due) != 2 {
+					t.Fatalf("due=%v err=%v", due, err)
+				}
+				for _, e := range due {
+					if e.DestinationSessionID != o.ID || e.LeaseToken != "retained-batch" {
+						t.Fatalf("lost binding: %+v", e)
+					}
+				}
+				payload, _ := orchestrationevents.Prompt("retained-batch", due)
+				if retired {
+					o.IsTerminated = true
+					if err := s.UpdateSession(ctx, o); err != nil {
+						t.Fatal(err)
+					}
+					replacement := sampleRecord("p")
+					replacement.Kind, replacement.Mode, replacement.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+					replacement.Activity.State = domain.ActivityIdle
+					if _, err := s.CreateSession(ctx, replacement); err != nil {
+						t.Fatal(err)
+					}
+				}
+				transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+				d := orchestrationevents.Dispatcher{Store: s, Transport: transport, Now: func() time.Time { return now }, NewID: func() string { t.Fatal("retry replaced batch token"); return "" }}
+				err = d.DispatchProject(ctx, "p")
+				if retired {
+					if err != nil || len(transport.batches) != 0 {
+						t.Fatalf("retired err=%v batches=%v", err, transport.batches)
+					}
+				} else if err != nil || len(transport.batches) != 1 || transport.targets[0] != o.ID || transport.batches[0].ID != "retained-batch" || transport.batches[0].Payload != payload {
+					t.Fatalf("err=%v batches=%v targets=%v", err, transport.batches, transport.targets)
+				}
+				got, err := s.ListOrchestrationEvents(ctx, "p", 10)
+				if err != nil || len(got) != 2 {
+					t.Fatalf("events=%v err=%v", got, err)
+				}
+				for _, e := range got {
+					want := domain.OrchestrationAcknowledged
+					if retired {
+						want = domain.OrchestrationPending
+					}
+					if e.State != want || e.DestinationSessionID != o.ID || e.LeaseToken != "retained-batch" || (retired && !e.AcknowledgedAt.IsZero()) {
+						t.Fatalf("event=%+v want=%s", e, want)
+					}
+				}
+				if !retired {
+					if err := d.DispatchProject(ctx, "p"); err != nil || len(transport.batches) != 1 {
+						t.Fatalf("ack replay err=%v batches=%v", err, transport.batches)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Mutate the fixture after the dispatcher's due read, at the lease boundary.
+type orchestrationLeaseRaceStore struct {
+	orchestrationevents.Store
+	beforeLease func()
+}
+
+func (s orchestrationLeaseRaceStore) LeaseOrchestrationEvents(ctx context.Context, ids []string, token string, destination domain.SessionID, expires time.Time) error {
+	s.beforeLease()
+	return s.Store.LeaseOrchestrationEvents(ctx, ids, token, destination, expires)
+}
+
+func TestOrchestrationLeaseDestinationFenceRejectsStaleReads(t *testing.T) {
+	for _, mutation := range []string{"changed_destination", "changed_token", "missing_destination", "retired_destination", "fresh_read_then_claimed_and_reclaimed"} {
+		t.Run(mutation, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := sqlitetest.MustOpenAt(t, dataDir)
+			seedProject(t, s, "p")
+			w, err := s.CreateSession(ctx, sampleRecord("p"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			o := sampleRecord("p")
+			o.Kind, o.Mode, o.FirstSignalAt = domain.KindOrchestrator, domain.SessionModeChat, now
+			o.Activity.State = domain.ActivityIdle
+			o, err = s.CreateSession(ctx, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"a", "b"} {
+				e := domain.OrchestrationEvent{ID: id, ProjectID: "p", WorkerID: w.ID, Kind: domain.OrchestrationWorkerBlocked, SourceRevision: id, EnqueuedAt: now, NextAttemptAt: now}
+				if ok, err := s.EnqueueOrchestrationEvent(ctx, e); err != nil || !ok {
+					t.Fatalf("enqueue=%v err=%v", ok, err)
+				}
+			}
+			ids := []string{"a", "b"}
+			if mutation != "fresh_read_then_claimed_and_reclaimed" {
+				if err := s.LeaseOrchestrationEvents(ctx, ids, "original-batch", o.ID, now.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.ReclaimOrchestrationEventLeases(ctx, now.Add(time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now = now.Add(time.Minute)
+			db, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			raceStore := orchestrationLeaseRaceStore{Store: s, beforeLease: func() {
+				var err error
+				switch mutation {
+				case "changed_destination":
+					_, err = db.ExecContext(ctx, `UPDATE orchestration_events SET destination_session_id=? WHERE id='b'`, w.ID)
+				case "changed_token":
+					_, err = db.ExecContext(ctx, `UPDATE orchestration_events SET lease_token='changed-batch' WHERE id='b'`)
+				case "missing_destination":
+					_, err = db.ExecContext(ctx, `UPDATE orchestration_events SET destination_session_id=NULL WHERE id='b'`)
+				case "retired_destination":
+					o.IsTerminated = true
+					err = s.UpdateSession(ctx, o)
+				case "fresh_read_then_claimed_and_reclaimed":
+					err = s.LeaseOrchestrationEvents(ctx, ids, "competing-batch", o.ID, now.Add(time.Second))
+					if err == nil {
+						_, err = s.ReclaimOrchestrationEventLeases(ctx, now.Add(time.Minute))
+					}
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}}
+			transport := &capturedOrchestrationTransport{result: orchestrationevents.Submission{Submitted: true, Acknowledged: true}}
+			d := orchestrationevents.Dispatcher{Store: raceStore, Transport: transport, Now: func() time.Time { return now }, NewID: func() string { return "fresh-batch" }}
+			if err := d.DispatchProject(ctx, "p"); err == nil || len(transport.batches) != 0 {
+				t.Fatalf("stale lease err=%v batches=%v", err, transport.batches)
+			}
+			if mutation == "changed_destination" || mutation == "missing_destination" {
+				// The now-inconsistent persisted batch must also fail before leasing
+				// on the next read, rather than selecting either member's target.
+				d.Store = s
+				if err := d.DispatchProject(ctx, "p"); err == nil || len(transport.batches) != 0 {
+					t.Fatalf("inconsistent batch err=%v batches=%v", err, transport.batches)
+				}
+			}
+			got, err := s.ListOrchestrationEvents(ctx, "p", 10)
+			if err != nil || len(got) != 2 {
+				t.Fatalf("events=%v err=%v", got, err)
+			}
+			for _, e := range got {
+				if e.State != domain.OrchestrationPending || !e.AcknowledgedAt.IsZero() || !e.LeaseExpiresAt.IsZero() {
+					t.Fatalf("failed lease escaped rollback: %+v", e)
+				}
+			}
+		})
 	}
 }
