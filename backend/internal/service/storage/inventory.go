@@ -15,34 +15,45 @@ import (
 type Category string
 
 const (
-	// Database and the remaining categories classify caller-supplied storage.
+	// Database classifies caller-supplied database storage.
 	Database Category = "database"
-	WAL      Category = "wal"
-	SHM      Category = "shm"
+	// WAL classifies caller-supplied write-ahead log storage.
+	WAL Category = "wal"
+	// SHM classifies caller-supplied shared-memory storage.
+	SHM Category = "shm"
+	// Snapshot classifies caller-supplied recovery snapshot storage.
 	Snapshot Category = "snapshot"
+	// Worktree classifies caller-supplied worktree storage.
 	Worktree Category = "worktree"
-	Other    Category = "other"
+	// Other classifies caller-supplied storage outside the named categories.
+	Other Category = "other"
 )
 
 // Fact is three-valued: absence never means a successful negative probe.
 type Fact string
 
 const (
-	// Unknown records an absent fact; Yes and No are explicit observations.
+	// Unknown records an absent fact.
 	Unknown Fact = ""
-	Yes     Fact = "yes"
-	No      Fact = "no"
+	// Yes records an explicit affirmative observation.
+	Yes Fact = "yes"
+	// No records an explicit negative observation.
+	No Fact = "no"
 )
 
 // FactState describes the usability of an observation's supplied facts.
 type FactState string
 
 const (
-	// FactsUnknown and the remaining states describe supplied fact provenance.
+	// FactsUnknown indicates unavailable fact provenance.
 	FactsUnknown FactState = ""
+	// FactsCurrent indicates current supplied facts.
 	FactsCurrent FactState = "current"
-	FactsStale   FactState = "stale"
-	FactsError   FactState = "error"
+	// FactsStale indicates stale supplied facts.
+	FactsStale FactState = "stale"
+	// FactsError indicates an error obtaining the supplied facts.
+	FactsError FactState = "error"
+	// FactsForeign indicates facts from a foreign provenance.
 	FactsForeign FactState = "foreign"
 )
 
