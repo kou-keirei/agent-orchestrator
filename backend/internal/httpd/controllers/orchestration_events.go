@@ -6,18 +6,23 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apispec"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
-	"github.com/go-chi/chi/v5"
 )
 
+// OrchestrationEventReader provides project-scoped event listing and explicit retry.
 type OrchestrationEventReader interface {
 	ListOrchestrationEvents(context.Context, domain.ProjectID, int) ([]domain.OrchestrationEvent, error)
 	RetryDeadLetterOrchestrationEvent(context.Context, domain.ProjectID, string, time.Time) (bool, error)
 }
+
+// OrchestrationEventsController serves orchestration event queries and retries.
 type OrchestrationEventsController struct{ Store OrchestrationEventReader }
 
+// Register adds the event listing and retry routes.
 func (c *OrchestrationEventsController) Register(r chi.Router) {
 	r.Get("/projects/{id}/orchestration-events", c.list)
 	r.Post("/projects/{id}/orchestration-events/{eventId}/retry", c.retry)

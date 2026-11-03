@@ -104,10 +104,10 @@ type Store interface {
 	MarkPRCommentResolved(ctx context.Context, prURL, commentID string) (bool, error)
 }
 
-// ReviewRunNativeEvidenceResolver finds the unique running pass whose native
+// RunNativeEvidenceResolver finds the unique running pass whose native
 // turn produced a follow-up hook. It is optional so transport tests can keep a
 // small store fake; production SQLite implements it.
-type ReviewRunNativeEvidenceResolver interface {
+type RunNativeEvidenceResolver interface {
 	FindReviewRunForNativeEvidence(ctx context.Context, reviewID string, sessionID domain.SessionID, launchID, nativeSessionID, turnID string) (domain.ReviewRun, bool, error)
 }
 
@@ -573,7 +573,7 @@ func (s *Service) ApplyReviewActivitySignal(ctx context.Context, reviewSessionID
 		return fmt.Errorf("%w: review session %q", ErrNotFound, reviewSessionID)
 	}
 	if signal.RunID == "" && signal.CompletionID != "" {
-		resolver, ok := s.store.(ReviewRunNativeEvidenceResolver)
+		resolver, ok := s.store.(RunNativeEvidenceResolver)
 		if !ok {
 			return fmt.Errorf("%w: native completion cannot be correlated", ErrInvalid)
 		}
@@ -588,7 +588,7 @@ func (s *Service) ApplyReviewActivitySignal(ctx context.Context, reviewSessionID
 	}
 	hasNativeEvidence := signal.AgentSessionID != "" || signal.FirstTurnID != "" || signal.CompletionID != ""
 	if signal.RunID != "" && hasNativeEvidence {
-		appender, ok := s.store.(reviewcore.ReviewRunNativeEvidenceAppender)
+		appender, ok := s.store.(reviewcore.RunNativeEvidenceAppender)
 		if !ok || signal.LaunchID == "" {
 			return fmt.Errorf("%w: review run native evidence binding is unavailable", ErrInvalid)
 		}

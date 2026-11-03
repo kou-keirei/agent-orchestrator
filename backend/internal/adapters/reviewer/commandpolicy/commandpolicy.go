@@ -5,6 +5,7 @@ package commandpolicy
 
 import "regexp"
 
+// Submit command prefixes pin reviewer submissions to AO's canonical executable.
 const (
 	PosixSubmitPrefix      = `"$AO_CLI" review submit`
 	PowerShellSubmitPrefix = `& "$env:AO_CLI" review submit`
