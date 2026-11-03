@@ -2,6 +2,7 @@ package sessionmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -39,7 +40,7 @@ func (m *Manager) checkSessionHealth(ctx context.Context, rec domain.SessionReco
 				if err != nil || pending {
 					return fmt.Errorf("startup pending Chat interaction: %w", ports.ErrChatRecoveryInconclusive)
 				}
-			} else if err != domain.ErrNoConversation {
+			} else if !errors.Is(err, domain.ErrNoConversation) {
 				return err
 			}
 		}

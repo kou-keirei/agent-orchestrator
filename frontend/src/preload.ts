@@ -540,8 +540,10 @@ const api = {
 		},
 	},
 	notifications: {
+		// Only true acknowledges native admission. Legacy/test bridges returning
+		// void provide no admission evidence and must not consume cooldown.
 		show: (notification: { id: string; title: string; body?: string; type?: string }) =>
-			ipcRenderer.invoke("notifications:show", notification) as Promise<void>,
+			ipcRenderer.invoke("notifications:show", notification) as Promise<boolean | void>,
 		setBadge: (count: number) => ipcRenderer.invoke("notifications:setBadge", count) as Promise<void>,
 		devBounce: () => ipcRenderer.invoke("notifications:devBounce") as Promise<void>,
 		onClick: (listener: (id: string) => void) => {

@@ -212,7 +212,7 @@ export const aoBridge: AoBridge =
 			onImportProgress: () => () => undefined,
 		},
 		notifications: {
-			show: async () => undefined,
+			show: async () => false,
 			setBadge: async () => undefined,
 			devBounce: async () => undefined,
 			onClick: () => () => undefined,
