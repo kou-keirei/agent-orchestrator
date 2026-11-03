@@ -664,15 +664,30 @@ func TestRetryTurnRefusesUnconfirmedDispatch(t *testing.T) {
 		Origin:          domain.MessageOriginHuman,
 	})
 	h.conv.sendErr = nil
-	if err == nil {
-		t.Fatalf("Send with a failing provider = nil error, want the dispatch failure")
+	if !ports.IsChatDeliveryUnknown(err) {
+		t.Fatalf("Send with a failing provider lost typed uncertainty: %v", err)
 	}
-	if turn.ID == "" || turn.State != domain.TurnStateFailed {
-		t.Fatalf("undispatched turn = %+v, want a failed turn with an AO id", turn)
+	if turn.ID == "" || turn.State != domain.TurnStateQueued || turn.ProviderTurnID != "" {
+		t.Fatalf("uncertain turn = %+v, want the durable queued admission", turn)
 	}
-	snapshot := failedTurnSnapshot(t, h, turn.ID)
-	if settled, ok := turnByID(snapshot, turn.ID); !ok || settled.ProviderTurnID != "" {
-		t.Fatalf("failed turn provider id = %q, want empty (never accepted)", settled.ProviderTurnID)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		stored, ok := turnByID(s, turn.ID)
+		return ok && stored.State == domain.TurnStateQueued
+	})
+	if stored, ok := turnByID(snapshot, turn.ID); !ok || stored.ProviderTurnID != "" {
+		t.Fatalf("uncertain turn acquired unproven provider identity: %+v", stored)
+	}
+	attempt, err := h.st.OrdinarySendAttempt(ctx, turn.ID)
+	if err != nil || attempt.State != domain.ConversationSendReserved || attempt.ClientMessageID != "cm-8" ||
+		attempt.SessionID != testSession || attempt.ControllerGeneration != h.ctrl.Generation() || attempt.BranchID != turn.BranchID {
+		t.Fatalf("unknown delivery lost its reserved owner: %+v %v", attempt, err)
+	}
+	if len(snapshot.Messages) != 1 || snapshot.Messages[0].ClientMessageID != "cm-8" || snapshot.Messages[0].TurnID != turn.ID {
+		t.Fatalf("unknown delivery lost its original client identity: %+v", snapshot.Messages)
+	}
+	duplicate, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "uncertain delivery", ClientMessageID: "cm-8"})
+	if !ports.IsChatDeliveryUnknown(err) || duplicate.ID != turn.ID {
+		t.Fatalf("unknown delivery falsely acknowledged or changed identity: %+v %v", duplicate, err)
 	}
 
 	if _, err := h.svc.RetryTurn(ctx, testSession, turn.ID); !errors.Is(err, chatsvc.ErrRetryDeliveryUncertain) {
@@ -680,5 +695,8 @@ func TestRetryTurnRefusesUnconfirmedDispatch(t *testing.T) {
 	}
 	if sent := h.conv.sentTexts(); len(sent) != 0 {
 		t.Fatalf("provider received %d sends after refused retry, want 0: %v", len(sent), sent)
+	}
+	if h.conv.sendCallCount() != 1 {
+		t.Fatal("unknown delivery or retry crossed the provider boundary again")
 	}
 }

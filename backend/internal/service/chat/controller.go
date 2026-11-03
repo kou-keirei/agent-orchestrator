@@ -39,6 +39,7 @@ const (
 // Store is the durable conversation surface the controller needs. Implemented by
 // the SQLite store.
 type Store interface {
+	OrdinarySendStore
 	CreateConversation(ctx context.Context, id string, scope domain.ConversationScope, project domain.ProjectID, session domain.SessionID, now time.Time) (domain.ConversationRecord, error)
 	OpenNativeConversation(ctx context.Context, id string, scope domain.ConversationScope, project domain.ProjectID, session domain.SessionID, now time.Time) (domain.ConversationRecord, error)
 	CreateProjectConversationWithContextReset(ctx context.Context, id string, project domain.ProjectID, session domain.SessionID, reset domain.ConversationActivity, now time.Time) (domain.ConversationRecord, error)
@@ -204,10 +205,6 @@ type Controller struct {
 	// activeTurn maps a provider turn id to AO's turn id for the turn currently
 	// in flight, so a completion can be attributed without a round trip.
 	pendingTurnID string
-	// dispatchingTurnID is AO's durable turn row while SendTurn is in flight.
-	// Eager providers can emit turn/started before SendTurn returns with the
-	// provider id; that event must bind this row instead of adopting a duplicate.
-	dispatchingTurnID string
 	// ackedTurnID is the turn the PROVIDER has confirmed it started, which lags
 	// pendingTurnID by the round trip between turn/start returning and the
 	// turn-started notification arriving. Interrupt needs the distinction: a
@@ -1391,6 +1388,17 @@ func (c *Controller) sendLocked(
 		return domain.ConversationTurn{}, fmt.Errorf("record user message: %w", err)
 	}
 	if !created {
+		existing, found, err := c.store.ConversationMessageByClientID(ctx, c.conversation.ID, msg.ClientMessageID)
+		if err != nil || !found {
+			return domain.ConversationTurn{}, ordinarySendUncertain(errors.Join(err, domain.ErrConversationSendUncertain))
+		}
+		turn, err := c.store.TurnByID(ctx, existing.TurnID)
+		if err != nil {
+			return domain.ConversationTurn{}, ordinarySendUncertain(err)
+		}
+		if err := c.confirmTurnDelivery(ctx, turn); err != nil {
+			return turn, err
+		}
 		// Already delivered under this client message id. Returning the empty turn
 		// signals "nothing new happened" without claiming a second dispatch.
 		c.log.Debug("duplicate chat send ignored",
@@ -1401,13 +1409,12 @@ func (c *Controller) sendLocked(
 	if queueWhenBusy && c.busy() {
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
 		// until the running turn ends. drain picks it up from there.
-		return domain.ConversationTurn{
-			ID:                 turnID,
-			ConversationID:     c.conversation.ID,
-			HandledBySessionID: c.sessionID,
-			State:              domain.TurnStateQueued,
-			RequestedAt:        now,
-		}, nil
+		queued, err := c.store.TurnByID(ctx, turnID)
+		if err != nil {
+			return domain.ConversationTurn{ID: turnID, ConversationID: c.conversation.ID,
+				HandledBySessionID: c.sessionID}, ordinarySendUncertain(err)
+		}
+		return queued, nil
 	}
 
 	return c.dispatch(ctx, turnID, msg, now)
@@ -1446,6 +1453,11 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	}
 	if source.ConversationID != c.conversation.ID {
 		return domain.ConversationTurn{}, fmt.Errorf("%w: %s", domain.ErrNoConversationTurn, turnID)
+	}
+	if source.State == domain.TurnStateQueued && source.ProviderTurnID == "" {
+		if err := c.confirmTurnDelivery(ctx, source); err != nil {
+			return source, fmt.Errorf("%w: %w", ErrRetryDeliveryUncertain, err)
+		}
 	}
 	if source.State != domain.TurnStateFailed || source.RolledBackAt != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("%w: %s", ErrTurnNotRetryable, turnID)
@@ -1672,7 +1684,24 @@ func (c *Controller) dispatch(
 	turnID string,
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
-) (domain.ConversationTurn, error) {
+) (result domain.ConversationTurn, resultErr error) {
+	// Admission survives dispatch errors. Return its actual row so edit/history
+	// callers cannot confuse uncertain delivery with an undispatched message.
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		stored, err := c.store.TurnByID(context.WithoutCancel(ctx), turnID)
+		if err == nil {
+			result = stored
+			return
+		}
+		// Even a read outage cannot erase the known durable admission identity.
+		result.ID = turnID
+		result.ConversationID = c.conversation.ID
+		result.HandledBySessionID = c.sessionID
+		resultErr = ordinarySendProviderUncertain(resultErr, err)
+	}()
 	// Every dispatch carries the conversation's choices, including one AO makes on
 	// the user's behalf: a queued message draining, or a relay from `ao send`. A
 	// setting that only applied when the user pressed send would silently stop
@@ -1709,58 +1738,40 @@ func (c *Controller) dispatch(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	c.mu.Lock()
-	c.dispatchingTurnID = turnID
-	c.mu.Unlock()
-	ref, err := c.conv.SendTurn(ctx, msg)
+	owner, msg, err := c.reserveOrdinarySend(ctx, turnID, msg)
 	if err != nil {
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
+		return domain.ConversationTurn{}, fmt.Errorf("reserve turn: %w", err)
+	}
+	ref, err := c.conv.SendTurn(ctx, msg)
+	if ref.ProviderTurnID == "" {
+		var nonDelivery ports.ChatSendNonDelivery
+		if err != nil && !ports.IsChatDeliveryUnknown(err) && errors.As(err, &nonDelivery) {
+			if resolveErr := c.store.ConfirmOrdinarySendNotDelivered(context.WithoutCancel(ctx), owner,
+				nonDelivery.NonDeliveryEvidence(), c.now()); resolveErr != nil {
+				return domain.ConversationTurn{}, ordinarySendProviderUncertain(err, resolveErr)
+			}
+			return domain.ConversationTurn{}, fmt.Errorf("send turn: %w", err)
 		}
-		c.mu.Unlock()
-		// The provider may or may not have accepted it. Settle the turn as failed
-		// rather than retrying: a duplicate turn would run the work twice. Settling
-		// by AO's own turn id is required here — an undispatched turn has no
-		// provider id, so looking one up by the empty string would hit whichever
-		// undispatched turn the database returned first.
-		completedAt := c.now()
-		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
-			c.log.Error("failed to settle turn after send error", "error", settleErr)
-		}
-		return domain.ConversationTurn{
-			ID:                 turnID,
-			ConversationID:     c.conversation.ID,
-			HandledBySessionID: c.sessionID,
-			State:              domain.TurnStateFailed,
-			ErrorMessage:       err.Error(),
-			RequestedAt:        requestedAt,
-			CompletedAt:        &completedAt,
-		}, fmt.Errorf("send turn: %w", err)
+		// A lost reference, timeout or empty success never proves non-delivery.
+		return domain.ConversationTurn{}, ordinarySendProviderUncertain(err, domain.ErrConversationSendUncertain)
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
+	if bindErr := c.store.BindReservedOrdinarySend(context.WithoutCancel(ctx), owner, ref.ProviderTurnID, c.now()); bindErr != nil {
 		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
 		}
-		return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+		return domain.ConversationTurn{}, ordinarySendProviderUncertain(err, bindErr)
 	}
 
 	c.mu.Lock()
 	c.pendingTurnID = ref.ProviderTurnID
-	if c.dispatchingTurnID == turnID {
-		c.dispatchingTurnID = ""
-	}
 	// Dispatched, not yet acknowledged: turn/start returning is AO's fact, and the
 	// provider's own turn-started notification is the one an interrupt needs.
 	c.ackedTurnID = ""
 	c.mu.Unlock()
+	if err != nil {
+		return domain.ConversationTurn{}, ordinarySendProviderUncertain(err, domain.ErrConversationSendUncertain)
+	}
 
 	// ACP's session/prompt request stays open until the turn finishes, so an ACP
 	// driver prepares the request in SendTurn and starts it here. The durable
@@ -1860,7 +1871,7 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) {
 		Origin:          queued.Origin,
 		ClientMessageID: queued.ClientMessageID,
 	}, c.now()); err != nil {
-		// dispatch already settled this turn as failed. Stopping here rather than
+		// dispatch retains uncertain reservations. Stopping here rather than
 		// walking the rest of the queue: whatever broke the send is likely to break
 		// the next one too, and failing them all on one bad provider state would
 		// discard messages the user can otherwise still see waiting.
@@ -2717,7 +2728,6 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 			return false
 		}
 		c.pendingTurnID = ""
-		c.dispatchingTurnID = ""
 		if c.ackedTurnID == event.ProviderTurnID {
 			c.ackedTurnID = ""
 		}
@@ -2733,25 +2743,13 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 
 	switch event.Kind {
 	case ports.ChatEventTurnStarted:
-		c.mu.Lock()
-		dispatchingTurnID := c.dispatchingTurnID
-		c.mu.Unlock()
 		if event.ProviderTurnID != "" {
-			rootConversation := event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID()
-			if dispatchingTurnID != "" && rootConversation {
-				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
-					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
-				}
-			} else {
-				// A turn AO dispatched already has a row, bound in dispatch. This covers
-				// the turn AO did NOT dispatch: a compaction, or work the provider resumed
-				// from its own history. Adopting it is what keeps every item it emits
-				// correlated, and without that the activities arrive with no turn and the
-				// timeline quietly stops grouping them.
-				if err := c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID,
-					c.generation, c.newID(), event.ProviderTurnID, now); err != nil {
-					return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, err)
-				}
+			// Lifecycle projection holds sendMu, so a dispatched turn is already
+			// bound from its returned reference. An event alone cannot resolve an
+			// unknown send; this idempotent adoption records independent native work.
+			if err := c.store.AdoptProviderTurn(ctx, c.conversation.ID, c.sessionID,
+				c.generation, c.newID(), event.ProviderTurnID, now); err != nil {
+				return fmt.Errorf("adopt provider-started turn %s: %w", event.ProviderTurnID, err)
 			}
 		}
 		return nil
