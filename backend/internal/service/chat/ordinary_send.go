@@ -31,7 +31,7 @@ func ordinarySendUncertain(err error) error {
 func ordinarySendProviderUncertain(providerErr, cause error) error {
 	var refusal providerRefusal
 	if errors.As(providerErr, &refusal) && refusal.ChatRefusal() {
-		return ordinarySendUncertain(fmt.Errorf("native result %v: %w", providerErr, cause))
+		return ordinarySendUncertain(fmt.Errorf("native result %s: %w", fmt.Sprintf("%v", providerErr), cause))
 	}
 	return ordinarySendUncertain(errors.Join(providerErr, cause))
 }
