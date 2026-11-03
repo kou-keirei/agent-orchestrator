@@ -142,6 +142,10 @@ func TestLegacy169Compatibility(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatal(err)
 	}
+	var journalUpgraded string
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalUpgraded); err != nil {
+		t.Fatal(err)
+	}
 	for table, columns := range map[string][]string{
 		"sessions":                    {"hidden_at", "terminal_revision", "provision_state"},
 		"review_run":                  {"target_binding_json", "reviewer_provenance_json", "launch_id", "provider_native_session_id", "provider_native_first_turn_id", "provider_native_completion_id", "provider_native_observed_at"},
@@ -198,11 +202,14 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	if latest > 169 {
-		if latest != 217 || forwardClaims != "217:1" {
+		if latest != 219 || forwardClaims != "217:1|218:1|219:1" {
 			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
 		}
 	} else if forwardClaims != "" {
 		t.Fatalf("unexpected claims beyond frozen historical journal: %s", forwardClaims)
+	}
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalAfter); err != nil || journalAfter != journalUpgraded {
+		t.Fatalf("restart changed upgraded journal: %v", err)
 	}
 	if rows, err := db.Query(`PRAGMA foreign_key_check`); err != nil {
 		t.Fatal(err)
@@ -971,13 +978,13 @@ func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
 
 func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
 	newLegacy169 := legacy169Fixture(t)
-	for _, claim := range []int{170, 218} {
+	for _, claim := range []int{170, 220} {
 		t.Run(strconv.Itoa(claim), func(t *testing.T) {
 			db := historical169DB(t, newLegacy169(t), true)
 			if err := migrate(db); err != nil {
 				t.Fatal(err)
 			}
-			// 170 remains foreign even though the owned 217 is now the maximum.
+			// 170 remains foreign even though the owned 219 is now the maximum.
 			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
 			rejectDesktop169Unchanged(t, db)
 		})

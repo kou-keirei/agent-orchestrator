@@ -199,6 +199,9 @@ func (c *Controller) PromoteQueuedTurn(
 	if c.handoffActive() {
 		return PromoteQueuedTurnResult{}, ErrControllerHandoff
 	}
+	if err := c.guardOrdinarySend(ctx); err != nil {
+		return PromoteQueuedTurnResult{}, err
+	}
 
 	source, err := c.store.TurnByID(ctx, turnID)
 	if err != nil {
@@ -372,6 +375,9 @@ func (c *Controller) steerLocked(ctx context.Context, msg ports.ChatUserMessage)
 				persistContext: "persist interface-transition refusal",
 			})
 	}
+	if err := c.guardOrdinarySend(ctx); err != nil {
+		return SteerResult{}, err
+	}
 	steerer, ok := c.conv.(ports.ChatSteerer)
 	if !ok {
 		return c.rejectSteerBeforeDispatch(ctx, msg.ClientMessageID, requestJSON,
@@ -475,6 +481,9 @@ func (c *Controller) SteerOrSend(
 		if err != nil {
 			return SteerOrSendResult{}, fmt.Errorf("recover sent turn: %w", err)
 		}
+		if err := c.confirmTurnDelivery(ctx, turn); err != nil {
+			return SteerOrSendResult{Turn: turn}, err
+		}
 		return SteerOrSendResult{Duplicate: true, Turn: turn}, nil
 	}
 
@@ -513,9 +522,11 @@ func (c *Controller) SteerOrSend(
 		}
 	}
 
-	turn, err := c.sendLocked(ctx, msg, false)
+	// A steer refusal does not settle the known running turn. Admit untouched
+	// work behind it; only correlated terminal projection may drain this row.
+	turn, err := c.sendLocked(ctx, msg, true)
 	if err != nil {
-		return SteerOrSendResult{}, err
+		return SteerOrSendResult{Turn: turn}, err
 	}
 	return SteerOrSendResult{Turn: turn}, nil
 }

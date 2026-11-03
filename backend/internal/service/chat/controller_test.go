@@ -3984,6 +3984,66 @@ func TestProviderEventsAreArchived(t *testing.T) {
 	}
 }
 
+func TestCompactArchivePreservesOrderDedupeAndProjection(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "go", ClientMessageID: "compact-client"}); err != nil {
+		t.Fatal(err)
+	}
+	identified := ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderEventID: "compact-delta", ProviderTurnID: "provider-turn-1", ProviderItemID: "compact-message", Delta: "identified "}
+	anonymous := ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: "provider-turn-1", ProviderItemID: "compact-message", Delta: "anonymous "}
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderEventID: "compact-start", ProviderTurnID: "provider-turn-1"},
+		identified, identified, anonymous, anonymous,
+		ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderEventID: "compact-end", ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted},
+	)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State.Terminal()
+	})
+	var assistantText string
+	for _, message := range snapshot.Messages {
+		if message.Role == domain.MessageRoleAssistant {
+			assistantText += message.Text
+		}
+	}
+	if assistantText != "identified anonymous anonymous " {
+		t.Fatalf("projection after replay = %q", assistantText)
+	}
+	rows, err := h.st.ProviderEventsSince(ctx, h.ctrl.ConversationID(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{"compact-start", "compact-delta", "", "", "compact-end"}
+	if len(rows) != len(wantIDs) {
+		t.Fatalf("archive rows = %d, want %d", len(rows), len(wantIDs))
+	}
+	var replayText strings.Builder
+	var previousID int64
+	for i, row := range rows {
+		if row.ProviderEventID != wantIDs[i] || row.ID <= previousID || row.SessionID != testSession {
+			t.Fatalf("row %d identity/order changed: %+v", i, row)
+		}
+		previousID = row.ID
+		var event struct {
+			Kind            ports.ChatEventKind
+			Delta           string
+			ProviderEventID string
+		}
+		if err := json.Unmarshal([]byte(row.PayloadJson), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.ProviderEventID != row.ProviderEventID {
+			t.Fatalf("payload identity changed: %s", row.PayloadJson)
+		}
+		if event.Kind == ports.ChatEventMessageDelta {
+			replayText.WriteString(event.Delta)
+		}
+	}
+	if replayText.String() != assistantText {
+		t.Fatalf("archive replay %q != projection %q", replayText.String(), assistantText)
+	}
+}
+
 /* ---- the send queue ---------------------------------------------------- */
 
 // turnStateByText is how the queue tests read the timeline: a turn matters here

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +122,15 @@ type refusedError struct{ msg string }
 
 func (e refusedError) Error() string     { return e.msg }
 func (e refusedError) ChatRefusal() bool { return true }
+
+// A display refusal alone is not a delivery receipt. This fixture additionally
+// supplies the native request correlation required by the accepted send store.
+type refusedSendError struct {
+	refusedError
+	evidence string
+}
+
+func (e refusedSendError) NonDeliveryEvidence() string { return e.evidence }
 
 // completeTurn sends a message and drives it to completion, leaving one settled turn.
 func completeTurn(t *testing.T, h *harness, text, providerTurn string) string {
@@ -1238,11 +1248,18 @@ func TestEditMessageAmbiguousApproximateFailureRemainsNavigableAcrossRestart(t *
 	failed, err := h.svc.EditMessage(ctx, testSession, second, ports.ChatUserMessage{
 		Text: "B edited", ClientMessageID: "edit-b-failed-replay", Origin: domain.MessageOriginHuman,
 	})
-	if err == nil {
-		t.Fatal("EditMessage succeeded after approximate provider send failure")
+	if !ports.IsChatDeliveryUnknown(err) || !errors.Is(err, chatsvc.ErrEditDeliveryUncertain) {
+		t.Fatalf("EditMessage lost typed delivery uncertainty: %v", err)
 	}
-	if failed.Turn.ID == "" {
+	if failed.Turn.ID == "" || failed.Turn.State != domain.TurnStateQueued || failed.Turn.ProviderTurnID != "" {
 		t.Fatalf("failed edit has no durable turn: %+v", failed)
+	}
+	message, found, loadErr := h.st.ConversationMessageByClientID(ctx, failed.Turn.ConversationID, "edit-b-failed-replay")
+	attempt, attemptErr := h.st.OrdinarySendAttempt(ctx, failed.Turn.ID)
+	if loadErr != nil || !found || message.TurnID != failed.Turn.ID || attemptErr != nil ||
+		attempt.State != domain.ConversationSendReserved || attempt.ClientMessageID != message.ClientMessageID ||
+		attempt.SessionID != testSession || attempt.BranchID != failed.Turn.BranchID || attempt.ControllerGeneration == "" {
+		t.Fatalf("uncertain edit lost its owner/client identity: %+v %+v %v %v", message, attempt, loadErr, attemptErr)
 	}
 	failedSnapshot, err := h.svc.Snapshot(ctx, testSession)
 	if err != nil {
@@ -1299,6 +1316,14 @@ func TestEditMessageAmbiguousApproximateFailureRemainsNavigableAcrossRestart(t *
 	}
 	requireMessageTexts(t, restartedSnapshot.Messages, []string{"A", "reply to A", "B edited"})
 	requireBranchPoint(t, restartedSnapshot, failed.Turn.ID, failed.SourceBranchID, "")
+	afterAttempt, err := h.st.OrdinarySendAttempt(ctx, failed.Turn.ID)
+	if err != nil || !reflect.DeepEqual(attempt, afterAttempt) {
+		t.Fatalf("restart changed the unresolved owner: %+v %v", afterAttempt, err)
+	}
+	_, err = restarted.Send(ctx, testSession, ports.ChatUserMessage{Text: "B edited", ClientMessageID: message.ClientMessageID})
+	if !ports.IsChatDeliveryUnknown(err) {
+		t.Fatalf("restart falsely acknowledged edited input: %v", err)
+	}
 }
 
 type failEditCompletionStore struct{ chatsvc.Store }
@@ -1364,13 +1389,16 @@ type failEditOperationStore struct {
 	mu                    sync.Mutex
 	bindErr               error
 	bindFailures          int
+	nonDeliveryErr        error
+	nonDeliveryCalls      int
 	branchInstallErr      error
 	branchInstallFailures int
 }
 
-func (s *failEditOperationStore) BindTurnToProvider(
+func (s *failEditOperationStore) BindReservedOrdinarySend(
 	ctx context.Context,
-	turnID, providerTurnID string,
+	owner domain.ConversationSendOwner,
+	providerTurnID string,
 	now time.Time,
 ) error {
 	s.mu.Lock()
@@ -1382,7 +1410,18 @@ func (s *failEditOperationStore) BindTurnToProvider(
 	if err != nil {
 		return err
 	}
-	return s.Store.BindTurnToProvider(ctx, turnID, providerTurnID, now)
+	return s.Store.BindReservedOrdinarySend(ctx, owner, providerTurnID, now)
+}
+
+func (s *failEditOperationStore) ConfirmOrdinarySendNotDelivered(ctx context.Context, owner domain.ConversationSendOwner, evidence string, now time.Time) error {
+	s.mu.Lock()
+	s.nonDeliveryCalls++
+	err := s.nonDeliveryErr
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.Store.ConfirmOrdinarySendNotDelivered(ctx, owner, evidence, now)
 }
 
 func (s *failEditOperationStore) CreateAndActivateConversationBranch(
@@ -1915,7 +1954,7 @@ func TestEditMessageExplicitRefusalRestoresSourceBranch(t *testing.T) {
 	driver.mu.Lock()
 	replacement := driver.resumed["thread-forked"]
 	replacement.mu.Lock()
-	replacement.sendErr = refusedError{msg: "provider declined edit"}
+	replacement.sendErr = refusedSendError{refusedError{msg: "provider declined edit"}, "native-refusal-edit-b-failed"}
 	replacement.mu.Unlock()
 	driver.mu.Unlock()
 
@@ -1942,6 +1981,70 @@ func TestEditMessageExplicitRefusalRestoresSourceBranch(t *testing.T) {
 	}
 	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "source remains usable"}); err != nil {
 		t.Fatalf("Send on restored source: %v", err)
+	}
+}
+
+func TestEditMessageRefusalWithoutCommittedDeliveryProofStaysUncertain(t *testing.T) {
+	for _, proofWriteFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(proofWriteFails), func(t *testing.T) {
+			var faults *failEditOperationStore
+			h, _, driver := newEditHarnessWithStore(t, false, func(st *store.Store) chatsvc.Store {
+				faults = &failEditOperationStore{Store: st}
+				return faults
+			})
+			completeTurn(t, h, "original", "provider-turn-1")
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Messages) == 2 })
+			second := completeTurn(t, h, "next", "provider-turn-2")
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Messages) == 4 })
+			driver.mu.Lock()
+			replacement := driver.resumed["thread-forked"]
+			replacement.mu.Lock()
+			replacement.sendErr = refusedError{msg: "native display refusal without delivery proof"}
+			if proofWriteFails {
+				replacement.sendErr = refusedSendError{refusedError{msg: "native refusal"}, "native-proof-for-held-edit"}
+				faults.mu.Lock()
+				faults.nonDeliveryErr = errors.New("non-delivery commit unavailable")
+				faults.mu.Unlock()
+			}
+			replacement.mu.Unlock()
+			driver.mu.Unlock()
+			msg := ports.ChatUserMessage{Text: "replacement", ClientMessageID: "held-edit"}
+			result, err := h.svc.EditMessage(t.Context(), testSession, second, msg)
+			if !ports.IsChatDeliveryUnknown(err) || !errors.Is(err, chatsvc.ErrEditDeliveryUncertain) || errors.Is(err, chatsvc.ErrProviderRefused) {
+				t.Fatalf("uncommitted refusal became a definitive edit rejection: %+v %v", result, err)
+			}
+			snapshot, err := h.svc.Snapshot(t.Context(), testSession)
+			if err != nil || snapshot.ActiveBranch.ID != result.ActiveBranchID || result.ActiveBranchID == result.SourceBranchID {
+				t.Fatalf("unproven refusal restored the source branch: %+v %v", snapshot, err)
+			}
+			attempt, err := h.st.OrdinarySendAttempt(t.Context(), result.Turn.ID)
+			if err != nil || attempt.State != domain.ConversationSendReserved || attempt.ClientMessageID != msg.ClientMessageID ||
+				attempt.SessionID != testSession || attempt.BranchID != result.ActiveBranchID || attempt.ControllerGeneration == "" {
+				t.Fatalf("unproven refusal lost exact reservation: %+v %v", attempt, err)
+			}
+			duplicate, err := h.svc.Send(t.Context(), testSession, msg)
+			if !ports.IsChatDeliveryUnknown(err) || duplicate.ID != result.Turn.ID {
+				t.Fatalf("unproven refusal falsely acknowledged original input: %+v %v", duplicate, err)
+			}
+			_, err = h.svc.Send(t.Context(), testSession, ports.ChatUserMessage{Text: "B must wait", ClientMessageID: "held-edit-B"})
+			if !ports.IsChatDeliveryUnknown(err) || replacement.sendCallCount() != 1 {
+				t.Fatalf("new input crossed unresolved edit: calls=%d %v", replacement.sendCallCount(), err)
+			}
+			after, err := h.st.OrdinarySendAttempt(t.Context(), result.Turn.ID)
+			if err != nil || !reflect.DeepEqual(attempt, after) {
+				t.Fatalf("recovery changed original reserving owner: %+v %v", after, err)
+			}
+			faults.mu.Lock()
+			calls := faults.nonDeliveryCalls
+			faults.mu.Unlock()
+			wantCalls := 0
+			if proofWriteFails {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("native proof commits=%d want=%d", calls, wantCalls)
+			}
+		})
 	}
 }
 
@@ -2249,7 +2352,7 @@ func TestTypedProviderEditRefusalDurablyReplaysWithoutProviderRedispatch(t *test
 	first := completeTurn(t, h, "A", "provider-turn-1")
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Messages) == 2 })
 	driver.fresh.mu.Lock()
-	driver.fresh.sendErr = refusedError{msg: "provider declined the replacement"}
+	driver.fresh.sendErr = refusedSendError{refusedError{msg: "provider declined the replacement"}, "native-refusal-edit-provider-refused"}
 	driver.fresh.mu.Unlock()
 	msg := ports.ChatUserMessage{
 		Text: "A edited", ClientMessageID: "edit-provider-refused", Origin: domain.MessageOriginHuman,

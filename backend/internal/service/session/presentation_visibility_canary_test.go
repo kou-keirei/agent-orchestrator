@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 )
@@ -104,7 +106,17 @@ func TestPresentationVisibilityCanary300Workers(t *testing.T) {
 		// Read counters are instrumentation, not durable session/PR facts.
 		got.listPRFactsCalls = wantStore.listPRFactsCalls
 		got.listReviewRunsCalls = wantStore.listReviewRunsCalls
-		if len(st.sessions) != workers || !reflect.DeepEqual(got, *wantStore) {
+		// The fixture has no injected errors. Check their nil semantics explicitly
+		// rather than comparing error implementation details with DeepEqual.
+		for _, err := range []error{
+			got.getSessionErr, got.activeSwitchGetErr, got.activeSwitchListErr,
+			got.reviewsErr, got.commentsErr,
+		} {
+			if err != nil {
+				t.Fatalf("%s: store error changed: %v", stage, err)
+			}
+		}
+		if len(st.sessions) != workers || !assert.Equal(t, *wantStore, got) {
 			t.Fatalf("%s: rows or lifecycle/resource/PR/review/CI/ownership facts changed", stage)
 		}
 	}
