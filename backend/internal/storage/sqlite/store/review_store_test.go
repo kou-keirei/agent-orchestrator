@@ -737,7 +737,7 @@ func TestReviewUpsertReusesRowAndRunRoundTrip(t *testing.T) {
 	// A run inserts running and updates to complete/changes_requested.
 	if err := s.InsertReviewRun(ctx, domain.ReviewRun{
 		ID: "run-1", ReviewID: got.ID, SessionID: rec.ID, BatchID: "batch-1", Harness: domain.ReviewerHarness("greptile"),
-		PRURL: got.PRURL, TargetSHA: "sha1", Status: domain.ReviewRunRunning, Verdict: domain.VerdictNone,
+		PRURL: got.PRURL, TargetSHA: "sha1", LaunchID: got.ReviewerLaunchID, Status: domain.ReviewRunRunning, Verdict: domain.VerdictNone,
 		CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("insert run: %v", err)

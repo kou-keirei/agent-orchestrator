@@ -116,11 +116,9 @@ WHERE id = ? AND session_id = ? AND review_id = ? AND run_id = ?
 			return err
 		}
 		for _, predecessor := range predecessors {
-			updated, err := q.UpdateReviewRunResult(ctx, gen.UpdateReviewRunResultParams{
+			updated, err := q.SettleReviewRun(ctx, gen.SettleReviewRunParams{
 				Status:           domain.ReviewRunCancelled,
-				Verdict:          domain.VerdictNone,
 				Body:             "replaced by a launch-bound reviewer generation",
-				GithubReviewID:   "",
 				AutoInjectReview: predecessor.AutoInjectReview,
 				ID:               predecessor.ID,
 			})
@@ -536,10 +534,18 @@ func (s *Store) InsertReviewRun(ctx context.Context, r domain.ReviewRun) error {
 }
 
 // UpdateReviewRunResult sets the status/verdict/body and the GitHub review id of
-// a running review pass.
+// a running review pass only while its owning review still claims its launch.
+// Failed/cancelled settlement with no verdict or provider review id remains
+// possible before launch acceptance or after reviewer replacement.
 func (s *Store) UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if (status == domain.ReviewRunFailed || status == domain.ReviewRunCancelled) && verdict == domain.VerdictNone && githubReviewID == "" {
+		n, err := s.qw.SettleReviewRun(ctx, gen.SettleReviewRunParams{
+			Status: status, Body: body, AutoInjectReview: autoInjectReview, ID: id,
+		})
+		return n > 0, err
+	}
 	n, err := s.qw.UpdateReviewRunResult(ctx, gen.UpdateReviewRunResultParams{
 		Status:           status,
 		Verdict:          verdict,

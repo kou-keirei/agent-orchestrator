@@ -20,7 +20,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
 )
 
-// errRunSuperseded marks a run that became terminal before its result arrived.
+// errRunSuperseded marks a run that became terminal or lost its reviewer launch
+// before its result arrived.
 // SubmitMany treats it as stale input so it cannot strand valid sibling results
 // in the same reviewer submission.
 var errRunSuperseded = errors.New("review: run is no longer running")
@@ -763,7 +764,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			return domain.ReviewRun{}, err
 		}
 		if !updated {
-			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is not running", errRunSuperseded, runID)
+			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q is no longer running under its reviewer launch", errRunSuperseded, runID)
 		}
 		run.Status = domain.ReviewRunComplete
 		run.Verdict = verdict
