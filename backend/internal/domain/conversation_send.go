@@ -23,9 +23,12 @@ const (
 	// ConversationSendPending is untouched work eligible for one reservation.
 	ConversationSendPending ConversationSendState = "pending"
 	// ConversationSendReserved records a send reserved for possible delivery.
-	ConversationSendReserved     ConversationSendState = "reserved"
-	ConversationSendLegacy       ConversationSendState = "legacy"
-	ConversationSendBound        ConversationSendState = "bound"
+	ConversationSendReserved ConversationSendState = "reserved"
+	// ConversationSendLegacy records absent attempt history requiring owner acknowledgement.
+	ConversationSendLegacy ConversationSendState = "legacy"
+	// ConversationSendBound records a send bound to a correlated provider turn.
+	ConversationSendBound ConversationSendState = "bound"
+	// ConversationSendNotDelivered records correlated evidence of non-delivery.
 	ConversationSendNotDelivered ConversationSendState = "not_delivered"
 )
 
