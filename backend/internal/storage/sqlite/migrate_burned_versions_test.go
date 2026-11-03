@@ -164,6 +164,7 @@ var shippedMigrations = map[int64]string{
 	217: "0217_conversation_ordinary_send.sql",
 	218: "0218_work_item_identity.sql",
 	219: "0219_work_item_lease.sql",
+	220: "0220_worker_reports.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

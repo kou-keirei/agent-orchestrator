@@ -202,7 +202,7 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	if latest > 169 {
-		if latest != 219 || forwardClaims != "217:1|218:1|219:1" {
+		if latest != 220 || forwardClaims != "217:1|218:1|219:1|220:1" {
 			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
 		}
 	} else if forwardClaims != "" {
@@ -978,13 +978,13 @@ func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
 
 func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
 	newLegacy169 := legacy169Fixture(t)
-	for _, claim := range []int{170, 220} {
+	for _, claim := range []int{170, 221} {
 		t.Run(strconv.Itoa(claim), func(t *testing.T) {
 			db := historical169DB(t, newLegacy169(t), true)
 			if err := migrate(db); err != nil {
 				t.Fatal(err)
 			}
-			// 170 remains foreign even though the owned 219 is now the maximum.
+			// 170 remains foreign even though the owned 220 is now the maximum.
 			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
 			rejectDesktop169Unchanged(t, db)
 		})

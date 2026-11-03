@@ -397,6 +397,7 @@ type OrchestrationEvent struct {
 	AcknowledgedAt       sql.NullTime
 	AttentionRequiredAt  sql.NullTime
 	LastError            string
+	WorkerReportID       sql.NullString
 }
 
 type OrchestrationSourceState struct {
@@ -783,6 +784,18 @@ type WorkItemLease struct {
 	ExpiresAtMs     int64
 	AllowedEffects  string
 	State           string
+}
+
+type WorkerReport struct {
+	ID              string
+	WorkItemID      string
+	AttemptID       string
+	OwnerGeneration int64
+	ReportType      string
+	Envelope        string
+	EventID         string
+	SourceRevision  string
+	AcceptedAtMs    int64
 }
 
 type WorkspaceRepo struct {
