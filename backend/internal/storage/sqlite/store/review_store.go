@@ -271,7 +271,7 @@ ORDER BY created_at ASC, id ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("list unresolved reviewer cleanup obligations for %s: %w", sessionID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.ReviewerCleanupObligation
 	for rows.Next() {
 		var obligation domain.ReviewerCleanupObligation

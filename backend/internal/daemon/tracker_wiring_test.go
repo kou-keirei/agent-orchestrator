@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	trackergitlab "github.com/aoagents/agent-orchestrator/backend/internal/adapters/tracker/gitlab"
@@ -332,6 +333,9 @@ func TestWiring_NewMultiTracker_DoesNotProbeGHCLIAtBoot(t *testing.T) {
 	// PATH contains only binDir: no real gh/glab can leak in. The GitLab leg
 	// fails to resolve `glab` and is omitted; the GitHub leg stays lazy.
 	t.Setenv("PATH", binDir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("PATHEXT", ".EXE")
+	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	tracker := newMultiTracker(config.GitLabConfig{}, log)
@@ -345,9 +349,23 @@ func TestWiring_NewMultiTracker_DoesNotProbeGHCLIAtBoot(t *testing.T) {
 	// First use triggers the probe. It fails (fake gh exits 1) — the error is
 	// fine, the marker proves the probe happened now and not at boot.
 	_, _ = tracker.Get(context.Background(), domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#1"})
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("gh CLI not invoked on first tracker use; stat marker: %v", err)
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "auth token\n" {
+		t.Fatalf("first tracker use: fake gh invocation = %q, err = %v, want auth token", got, err)
 	}
+}
+
+// The Windows fixture is a native executable because bare gh is launched via
+// os/exec, which does not interpret batch files. Only the copied helper exits
+// here; the ordinary daemon test executable always runs its tests normally.
+func init() {
+	executable, err := os.Executable()
+	if runtime.GOOS != "windows" || err != nil || filepath.Base(executable) != "gh.exe" || os.Getenv("GH_MARKER") == "" {
+		return
+	}
+	if err := os.WriteFile(os.Getenv("GH_MARKER"), []byte(strings.Join(os.Args[1:], " ")+"\n"), 0o600); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(1)
 }
 
 // writeRecordingGHExecutable installs a fake `gh` that records every
@@ -355,13 +373,20 @@ func TestWiring_NewMultiTracker_DoesNotProbeGHCLIAtBoot(t *testing.T) {
 func writeRecordingGHExecutable(t *testing.T, dir string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		content := "@echo off\r\necho called >> %GH_MARKER%\r\nexit /b 1\r\n"
-		if err := os.WriteFile(filepath.Join(dir, "gh.cmd"), []byte(content), 0o755); err != nil {
-			t.Fatalf("write fake gh.cmd: %v", err)
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, err := os.ReadFile(executable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "gh.exe"), content, 0o755); err != nil {
+			t.Fatalf("write fake gh.exe: %v", err)
 		}
 		return
 	}
-	content := "#!/bin/sh\necho called >> \"$GH_MARKER\"\nexit 1\n"
+	content := "#!/bin/sh\necho \"$*\" >> \"$GH_MARKER\"\nexit 1\n"
 	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(content), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
 	}
