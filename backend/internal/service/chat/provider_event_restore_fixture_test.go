@@ -148,9 +148,13 @@ func ao16ReadTable(db *sql.DB, name string) (ao16Table, error) {
 	if err != nil {
 		return table, err
 	}
+	defer rows.Close()
 	table.Columns, err = rows.Columns()
 	if err != nil {
 		_ = rows.Close()
+		return table, err
+	}
+	if err := rows.Err(); err != nil {
 		return table, err
 	}
 	if err := rows.Close(); err != nil {
@@ -220,7 +224,10 @@ func ao16Decode(data []byte, out any) error {
 		return err
 	}
 	if err := dec.Decode(new(any)); err != io.EOF {
-		return fmt.Errorf("trailing archive content: %v", err)
+		if err == nil {
+			return fmt.Errorf("trailing archive content: <nil>")
+		}
+		return fmt.Errorf("trailing archive content: %w", err)
 	}
 	return nil
 }

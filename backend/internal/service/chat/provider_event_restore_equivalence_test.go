@@ -109,6 +109,7 @@ func TestAO16RestoreIndependentRowsAndBranches(t *testing.T) {
 	}
 	turns, err := db.Query(`SELECT id,state,error_message FROM conversation_turns ORDER BY id`)
 	ao16Must(t, err)
+	defer turns.Close()
 	var outcomes []string
 	for turns.Next() {
 		var id, state, message string
@@ -211,6 +212,7 @@ func ao16AssertResumeProjection(t *testing.T, db *sql.DB) {
 	t.Helper()
 	rows, err := db.Query(`SELECT m.id,m.conversation_id,m.turn_id,m.sequence,m.role,m.origin,m.text,m.provider_item_id,m.branch_id,m.streaming,t.provider_turn_id,t.handled_by_session_id,t.state,t.branch_id FROM conversation_messages m JOIN conversation_turns t ON t.id=m.turn_id WHERE m.conversation_id='ao16' ORDER BY m.sequence,m.id`)
 	ao16Must(t, err)
+	defer rows.Close()
 	var got [][]string
 	for rows.Next() {
 		cells := make([]string, 14)
