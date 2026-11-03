@@ -1007,27 +1007,27 @@ func nativePermissionEvidencePayload(evidence ports.ChatNativeEvidence) NativePe
 		ControllerGeneration:   evidence.ControllerGeneration,
 		ProviderConversationID: evidence.ProviderConversationID,
 		ProviderTurnID:         evidence.ProviderTurnID,
-		Provider:             evidence.Provider,
-		RequestedPermission:  evidence.RequestedPermission,
-		EffectivePermission:  evidence.EffectivePermission,
-		ApprovalPolicy:       evidence.ApprovalPolicy,
-		ThreadSandbox:        evidence.ThreadSandbox,
-		TurnSandbox:          evidence.TurnSandbox,
-		PreventiveCapability: evidence.PreventiveCapability,
-		ProofStatus:          evidence.ProofStatus,
+		Provider:               evidence.Provider,
+		RequestedPermission:    evidence.RequestedPermission,
+		EffectivePermission:    evidence.EffectivePermission,
+		ApprovalPolicy:         evidence.ApprovalPolicy,
+		ThreadSandbox:          evidence.ThreadSandbox,
+		TurnSandbox:            evidence.TurnSandbox,
+		PreventiveCapability:   evidence.PreventiveCapability,
+		ProofStatus:            evidence.ProofStatus,
 	}
 }
 
 func dispatchConformancePayload(conformance ports.ChatDispatchConformance) ChatDispatchConformance {
 	return ChatDispatchConformance{
-		Status:           string(conformance.Status),
-		Reason:           conformance.Reason,
-		ChildResultValid: conformance.ChildResultValid,
-		EffortOverride:   conformance.EffortOverride,
-		Requested:        dispatchEvidencePayload(conformance.Requested),
-		Configured:       dispatchEvidencePayload(conformance.Configured),
-		Dispatched:       dispatchEvidencePayload(conformance.Dispatched),
-		ProviderSelected: dispatchEvidencePayload(conformance.ProviderSelected),
+		Status:            string(conformance.Status),
+		Reason:            conformance.Reason,
+		ChildResultValid:  conformance.ChildResultValid,
+		EffortOverride:    conformance.EffortOverride,
+		Requested:         dispatchEvidencePayload(conformance.Requested),
+		Configured:        dispatchEvidencePayload(conformance.Configured),
+		Dispatched:        dispatchEvidencePayload(conformance.Dispatched),
+		ProviderSelected:  dispatchEvidencePayload(conformance.ProviderSelected),
 		ObservedFirstTurn: dispatchEvidencePayload(conformance.ObservedFirstTurn),
 		Variant: ChatDispatchVariant{
 			Value: conformance.Variant.Value, Availability: conformance.Variant.Availability,
@@ -1041,7 +1041,7 @@ func dispatchEvidencePayload(evidence ports.ChatDispatchEvidence) ChatDispatchEv
 		Model: evidence.Values.Model, Effort: evidence.Values.Effort,
 		Provenance: string(evidence.Provenance), SessionID: string(evidence.SessionID),
 		ProviderConversationID: evidence.ProviderConversationID,
-		ProviderTurnID: evidence.ProviderTurnID, Fresh: evidence.Fresh,
+		ProviderTurnID:         evidence.ProviderTurnID, Fresh: evidence.Fresh,
 		Correlated: evidence.Correlated, ProviderRejected: evidence.ProviderRejected,
 	}
 }

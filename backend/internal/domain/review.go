@@ -105,8 +105,10 @@ type ReviewerCleanupObligation struct {
 type ReviewerCleanupObligationStatus string
 
 const (
+	// ReviewerCleanupUnresolved marks a runtime whose cleanup is not yet confirmed.
 	ReviewerCleanupUnresolved ReviewerCleanupObligationStatus = "unresolved"
-	ReviewerCleanupCleared    ReviewerCleanupObligationStatus = "cleared"
+	// ReviewerCleanupCleared marks a reviewer cleanup obligation as resolved.
+	ReviewerCleanupCleared ReviewerCleanupObligationStatus = "cleared"
 )
 
 // ReviewTargetBinding is the immutable launch-time binding for one review pass.
@@ -134,11 +136,16 @@ type ReviewTargetBinding struct {
 type ReviewEvidenceLevel string
 
 const (
-	ReviewEvidenceRequested         ReviewEvidenceLevel = "REQUESTED"
-	ReviewEvidenceConfigured        ReviewEvidenceLevel = "CONFIGURED"
-	ReviewEvidenceAOResolved        ReviewEvidenceLevel = "AO_RESOLVED"
+	// ReviewEvidenceRequested identifies settings requested for a review.
+	ReviewEvidenceRequested ReviewEvidenceLevel = "REQUESTED"
+	// ReviewEvidenceConfigured identifies AO-configured settings, not provider-native evidence.
+	ReviewEvidenceConfigured ReviewEvidenceLevel = "CONFIGURED"
+	// ReviewEvidenceAOResolved identifies settings resolved by AO.
+	ReviewEvidenceAOResolved ReviewEvidenceLevel = "AO_RESOLVED"
+	// ReviewEvidenceProviderEffective identifies effective settings observed from the provider.
 	ReviewEvidenceProviderEffective ReviewEvidenceLevel = "PROVIDER_EFFECTIVE"
-	ReviewEvidenceProviderNative    ReviewEvidenceLevel = "PROVIDER_NATIVE"
+	// ReviewEvidenceProviderNative identifies evidence read directly from the provider.
+	ReviewEvidenceProviderNative ReviewEvidenceLevel = "PROVIDER_NATIVE"
 )
 
 // ReviewerSettings is one truth-level snapshot of reviewer execution settings.
@@ -187,10 +194,15 @@ type ReviewRunStatus = contract.AOReviewRunStatus
 
 // Review run statuses.
 const (
-	ReviewRunRunning   = contract.AOReviewRunRunning
-	ReviewRunComplete  = contract.AOReviewRunComplete
+	// ReviewRunRunning identifies an in-progress review run.
+	ReviewRunRunning = contract.AOReviewRunRunning
+	// ReviewRunComplete identifies a completed review run.
+	ReviewRunComplete = contract.AOReviewRunComplete
+	// ReviewRunDelivered identifies a delivered review result.
 	ReviewRunDelivered = contract.AOReviewRunDelivered
-	ReviewRunFailed    = contract.AOReviewRunFailed
+	// ReviewRunFailed identifies a failed review run.
+	ReviewRunFailed = contract.AOReviewRunFailed
+	// ReviewRunCancelled identifies a cancelled review run.
 	ReviewRunCancelled = contract.AOReviewRunCancelled
 )
 
@@ -200,8 +212,11 @@ type ReviewVerdict = contract.AOReviewVerdict
 
 // Review verdicts.
 const (
-	VerdictNone             = contract.AOReviewVerdictNone
-	VerdictApproved         = contract.AOReviewVerdictApproved
+	// VerdictNone denotes a review with no verdict yet.
+	VerdictNone = contract.AOReviewVerdictNone
+	// VerdictApproved denotes an approved review verdict.
+	VerdictApproved = contract.AOReviewVerdictApproved
+	// VerdictChangesRequested denotes a review requesting changes.
 	VerdictChangesRequested = contract.AOReviewVerdictChangesRequested
 )
 
