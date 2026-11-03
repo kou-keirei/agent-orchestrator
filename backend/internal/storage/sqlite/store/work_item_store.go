@@ -12,6 +12,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
+// ErrWorkItemNotFound reports an owner claim for a work item that does not exist.
 var ErrWorkItemNotFound = errors.New("work item not found")
 
 // WorkItemRecord persists the frozen domain identity plus the original worker's
