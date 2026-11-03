@@ -463,6 +463,83 @@ INSERT INTO conversation_turns (
     controller_generation, retry_of_turn_id, state, requested_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
+-- Only the atomic AppendUserMessage transaction establishes never attempted.
+-- name: InsertConversationSendPending :exec
+INSERT INTO conversation_send_attempts (turn_id, conversation_id, state)
+VALUES (?, ?, 'pending');
+
+-- Internal recovery projection; state=reserved is NOT provider acceptance.
+-- name: SelectConversationSendAttempt :one
+SELECT t.id, t.conversation_id, t.branch_id, t.handled_by_session_id,
+       m.client_message_id, a.state, a.controller_generation, a.reserved_at
+FROM conversation_send_attempts a
+JOIN conversation_turns t ON t.id = a.turn_id AND t.conversation_id = a.conversation_id
+JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+WHERE a.turn_id = ?;
+
+-- name: HasUnresolvedConversationSend :one
+SELECT EXISTS (SELECT 1 FROM conversation_send_attempts
+WHERE conversation_id = ? AND state IN ('reserved', 'legacy'));
+
+-- name: HasUnresolvedTurnSend :one
+SELECT EXISTS (SELECT 1 FROM conversation_send_attempts
+WHERE turn_id = ? AND state IN ('reserved', 'legacy'));
+
+-- Load only the durable prompt, inside the successful reservation transaction.
+-- name: SelectOrdinarySendMessage :one
+SELECT t.id, m.text, m.client_message_id, m.origin, m.delivery_content_json
+FROM conversation_turns t
+JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+WHERE t.id = ? LIMIT 1;
+
+-- Atomic owner-fenced admission. A successful commit grants one provider call;
+-- a retry, even by the same owner, never grants another call.
+-- name: ReserveConversationOrdinarySend :execrows
+UPDATE conversation_send_attempts
+SET state = 'reserved', controller_generation = sqlc.arg(generation),
+    reserved_at = sqlc.arg(reserved_at)
+WHERE conversation_send_attempts.turn_id = sqlc.arg(turn_id)
+  AND conversation_send_attempts.conversation_id = sqlc.arg(conversation_id) AND conversation_send_attempts.state = 'pending'
+  AND sqlc.arg(generation) <> ''
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts held
+      WHERE held.conversation_id = sqlc.arg(conversation_id) AND held.state IN ('reserved', 'legacy'))
+  AND EXISTS (
+      SELECT 1 FROM conversation_turns t
+      JOIN conversations c ON c.id = t.conversation_id
+      JOIN sessions s ON s.id = t.handled_by_session_id
+      JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+      WHERE t.id = sqlc.arg(turn_id) AND t.conversation_id = sqlc.arg(conversation_id)
+        AND t.branch_id = sqlc.arg(branch_id) AND t.branch_id = c.active_branch_id
+        AND t.handled_by_session_id = sqlc.arg(session_id) AND c.current_session_id = s.id
+        AND s.controller_generation = sqlc.arg(generation) AND s.session_mode = 'chat' AND s.is_terminated = 0
+        AND m.client_message_id = sqlc.arg(client_message_id)
+        AND t.state = 'queued' AND t.provider_turn_id = '' AND t.rolled_back_at IS NULL
+        AND t.promotion_started_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM conversation_turns running
+            WHERE running.conversation_id = c.id AND running.branch_id = c.active_branch_id
+              AND running.state = 'running' AND running.rolled_back_at IS NULL)
+  );
+
+-- Resolution belongs to the still-current reserving generation. Successors
+-- retain uncertainty; this API does not invent cross-generation native proof.
+-- name: ResolveConversationOrdinarySend :execrows
+UPDATE conversation_send_attempts
+SET state = sqlc.arg(resolution), non_delivery_evidence = sqlc.arg(non_delivery_evidence)
+WHERE conversation_send_attempts.turn_id = sqlc.arg(turn_id) AND conversation_send_attempts.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_send_attempts.state = 'reserved' AND conversation_send_attempts.controller_generation = sqlc.arg(generation)
+  AND EXISTS (
+      SELECT 1 FROM conversation_turns t
+      JOIN conversations c ON c.id = t.conversation_id
+      JOIN sessions s ON s.id = t.handled_by_session_id
+      JOIN conversation_messages m ON m.turn_id = t.id AND m.role = 'user'
+      WHERE t.id = sqlc.arg(turn_id) AND t.conversation_id = sqlc.arg(conversation_id)
+        AND t.branch_id = sqlc.arg(branch_id) AND t.branch_id = c.active_branch_id
+        AND t.handled_by_session_id = sqlc.arg(session_id) AND c.current_session_id = s.id
+        AND s.controller_generation = sqlc.arg(generation) AND s.session_mode = 'chat' AND s.is_terminated = 0
+        AND m.client_message_id = sqlc.arg(client_message_id)
+        AND t.state = 'queued' AND t.provider_turn_id = '' AND t.rolled_back_at IS NULL
+  );
+
 -- A turn the PROVIDER started that AO never dispatched: a compaction runs as its
 -- own turn, and so does work resumed inside the provider's own history. Without a
 -- row every item it emits correlates to no turn, which silently unpicks the
@@ -485,17 +562,23 @@ LIMIT 1;
 -- name: BindConversationTurnProviderID :exec
 UPDATE conversation_turns
 SET provider_turn_id = ?, started_at = COALESCE(started_at, ?)
-WHERE id = ?;
+WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- name: MarkConversationTurnStarted :exec
 UPDATE conversation_turns
 SET state = 'running', started_at = COALESCE(started_at, ?)
-WHERE id = ?;
+WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- name: SettleConversationTurn :exec
 UPDATE conversation_turns
 SET state = ?, error_message = ?, completed_at = COALESCE(completed_at, ?)
-WHERE id = ?;
+WHERE id = ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- A streamed assistant item may not receive item/completed when steering causes
 -- the provider to finish the turn without replaying it: the accumulated text is
@@ -553,7 +636,9 @@ UPDATE conversation_turns
 SET state = 'failed',
     error_message = 'controller ended before the turn completed',
     completed_at = ?
-WHERE handled_by_session_id = ? AND state IN ('queued', 'running');
+WHERE conversation_turns.handled_by_session_id = ? AND conversation_turns.state IN ('queued', 'running')
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- The running turns visible on the active branch, in the same order as the
 -- snapshot. Interrupt uses this exact projection when in-memory turn tracking
@@ -716,7 +801,9 @@ WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.rolled_back_at IS NULL
   AND conversation_turns.rowid >= (
       SELECT anchor.rowid FROM conversation_turns AS anchor WHERE anchor.id = ?
-  );
+  )
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- A discarded turn that never reached the provider settles as interrupted rather
 -- than staying queued forever. Nothing went wrong and nothing failed: the user
@@ -725,9 +812,11 @@ WHERE conversation_turns.conversation_id = ?
 -- name: InterruptRolledBackQueuedTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ?
-  AND state IN ('queued', 'running')
-  AND rolled_back_at IS NOT NULL;
+WHERE conversation_turns.conversation_id = ?
+  AND conversation_turns.state IN ('queued', 'running')
+  AND conversation_turns.rolled_back_at IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- Older AO builds stored compaction boundaries without their provider turn.
 -- Correlate those at or after the rollback anchor so the normal rolled-back-turn
@@ -802,6 +891,9 @@ JOIN conversation_messages
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
+
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.conversation_id = conversation_turns.conversation_id AND send.state IN ('reserved', 'legacy'))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
 
@@ -811,10 +903,12 @@ LIMIT 1;
 -- name: ReserveQueuedConversationTurnForPromotion :execrows
 UPDATE conversation_turns
 SET promotion_started_at = sqlc.arg(promotion_started_at)
-WHERE id = sqlc.arg(id)
-  AND conversation_id = sqlc.arg(conversation_id)
-  AND state = 'queued'
-  AND promotion_started_at IS NULL;
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.conversation_id = conversation_turns.conversation_id AND send.state IN ('reserved', 'legacy'));
 
 -- The content is loaded after the compare-and-set, from AO's durable message
 -- rather than from a client request that could be stale or substituted.
@@ -865,7 +959,9 @@ WHERE id = sqlc.arg(id)
 -- name: CancelQueuedConversationTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ? AND state = 'queued' AND requested_at <= ?;
+WHERE conversation_turns.conversation_id = ? AND conversation_turns.state = 'queued' AND conversation_turns.requested_at <= ?
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- An interrupt interface handoff closes intake under the controller's dispatch
 -- lock before this runs. There can be no later accepted row to preserve, so the
@@ -874,16 +970,20 @@ WHERE conversation_id = ? AND state = 'queued' AND requested_at <= ?;
 -- name: CancelAllQueuedConversationTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
-WHERE conversation_id = ? AND state = 'queued';
+WHERE conversation_turns.conversation_id = ? AND conversation_turns.state = 'queued'
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- Remove one queued turn without disturbing the running turn or later queue items.
 -- name: CancelQueuedConversationTurnByID :execrows
 UPDATE conversation_turns
 SET state = 'cancelled', completed_at = ?
-WHERE id = ?
-  AND conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL;
+WHERE conversation_turns.id = ?
+  AND conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- Read only an undispatched human prompt for editing.
 -- name: SelectQueuedConversationMessage :one
@@ -895,7 +995,9 @@ WHERE conversation_messages.conversation_id = ?
   AND conversation_messages.role = 'user'
   AND conversation_messages.origin = 'human'
   AND conversation_turns.state = 'queued'
-  AND conversation_turns.promotion_started_at IS NULL;
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- Rewrite text and content together, only if the edited revision is current.
 -- name: UpdateQueuedConversationMessageText :execrows
@@ -915,25 +1017,32 @@ WHERE conversation_messages.conversation_id = ?
         AND conversation_turns.conversation_id = conversation_messages.conversation_id
         AND conversation_turns.state = 'queued'
         AND conversation_turns.promotion_started_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+            WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
   );
 
 -- Current queue order for reorder validation and timestamp permutation.
 -- name: SelectQueuedConversationTurnOrder :many
 SELECT id, requested_at
 FROM conversation_turns
-WHERE conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
+WHERE conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'))
 ORDER BY requested_at, rowid;
 
 -- Reassign one queued turn's dispatch position without changing its state.
 -- name: UpdateQueuedConversationTurnRequestedAt :execrows
 UPDATE conversation_turns
 SET requested_at = ?
-WHERE id = ?
-  AND conversation_id = ?
-  AND state = 'queued'
-  AND promotion_started_at IS NULL;
+WHERE conversation_turns.id = ?
+  AND conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM conversation_send_attempts send
+      WHERE send.turn_id = conversation_turns.id AND send.state IN ('reserved', 'legacy'));
 
 -- name: InsertConversationMessage :exec
 INSERT INTO conversation_messages (
