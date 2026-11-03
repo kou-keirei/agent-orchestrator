@@ -11,9 +11,11 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
+// Category identifies the kind of storage reported by an observation.
 type Category string
 
 const (
+	// Database and the remaining categories classify caller-supplied storage.
 	Database Category = "database"
 	WAL      Category = "wal"
 	SHM      Category = "shm"
@@ -26,14 +28,17 @@ const (
 type Fact string
 
 const (
+	// Unknown records an absent fact; Yes and No are explicit observations.
 	Unknown Fact = ""
 	Yes     Fact = "yes"
 	No      Fact = "no"
 )
 
+// FactState describes the usability of an observation's supplied facts.
 type FactState string
 
 const (
+	// FactsUnknown and the remaining states describe supplied fact provenance.
 	FactsUnknown FactState = ""
 	FactsCurrent FactState = "current"
 	FactsStale   FactState = "stale"
@@ -41,7 +46,8 @@ const (
 	FactsForeign FactState = "foreign"
 )
 
-// MeasurementID identifies one measurement, while Extent identifies its coverage.
+// Measurement describes a measurement whose MeasurementID identifies it and
+// whose Extent identifies its coverage.
 // Extents are canonical, case-sensitive hierarchical keys, not filesystem paths.
 // Parents cover all descendants. Callers must give aliases the same extent and
 // split disjoint coverage into separate observations; this core cannot resolve
@@ -63,6 +69,7 @@ type CleanupObservation struct {
 	Record        domain.SessionCleanupRecord
 }
 
+// WorktreeObservation carries caller-supplied worktree protection and cleanup facts.
 type WorktreeObservation struct {
 	SessionID         domain.SessionID
 	CurrentGeneration int64
@@ -74,6 +81,7 @@ type WorktreeObservation struct {
 	UniqueCommits     Fact
 }
 
+// Observation binds storage identity, measurement and protection provenance.
 type Observation struct {
 	ID       string
 	Category Category
@@ -93,6 +101,7 @@ type ByteTotal struct {
 	Complete       bool
 }
 
+// Inventory contains sorted observations and their measured subtotal.
 type Inventory struct {
 	Entries []Observation
 	Total   ByteTotal

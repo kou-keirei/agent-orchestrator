@@ -14,6 +14,7 @@ import (
 // such a result reports metadata and retained unknowns, never physical totals.
 var ErrSourceGap = errors.New("SOURCE_GAP")
 
+// MaxMetadataObservations bounds the number of roots and descriptors per collection.
 const MaxMetadataObservations = 256
 
 // MetadataRoot expresses LSTAT_ONLY_TRUSTED_QUIESCENT_ROOTS. Every Fact must
@@ -59,6 +60,7 @@ type FileMetadata struct {
 	Reason           string
 }
 
+// MetadataCollection pairs logical metadata with a retained, unknown-size plan.
 type MetadataCollection struct {
 	Metadata []FileMetadata
 	Plan     Plan
@@ -125,7 +127,8 @@ func collectMetadata(roots []MetadataRoot, descriptors []FileDescriptor, lstat f
 	// overlapping extents, protection provenance, copying and deterministic order.
 	plan, err := BuildPlan(observations)
 	if err != nil {
-		return MetadataCollection{}, fmt.Errorf("%w: invalid descriptors: %v", ErrSourceGap, err)
+		// Keep the planner diagnostic as text; only ErrSourceGap is wrapped.
+		return MetadataCollection{}, fmt.Errorf("%w: invalid descriptors: %s", ErrSourceGap, err.Error())
 	}
 	result := MetadataCollection{Plan: plan, Metadata: make([]FileMetadata, 0, len(descriptors))}
 	for _, o := range plan.Inventory.Entries {
@@ -181,7 +184,8 @@ func explicitMetadata(root, path string, lstat func(string) (os.FileInfo, error)
 	// provenance. Never query descendants after an observed link or bad parent.
 	rel, _ := filepath.Rel(root, path)
 	components := strings.Split(rel, string(filepath.Separator))
-	paths := []string{root}
+	paths := make([]string, 1, 1+len(components))
+	paths[0] = root
 	for _, component := range components {
 		paths = append(paths, filepath.Join(paths[len(paths)-1], component))
 	}

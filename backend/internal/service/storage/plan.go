@@ -1,5 +1,6 @@
 package storage
 
+// Decision reports retention and its reasons for one observation.
 type Decision struct {
 	ID      string
 	Retain  bool
@@ -14,6 +15,7 @@ type Plan struct {
 	ExecutableCandidates int
 }
 
+// BuildPlan validates observations and builds a dry-run report retaining every entry.
 func BuildPlan(observations []Observation) (Plan, error) {
 	inventory, err := BuildInventory(observations)
 	if err != nil {

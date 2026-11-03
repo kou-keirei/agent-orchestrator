@@ -136,6 +136,32 @@ func TestCollectMetadataRejectsBeforeIO(t *testing.T) {
 	}
 }
 
+func TestCollectMetadataInvalidDescriptorsErrorContract(t *testing.T) {
+	root := t.TempDir()
+	d := metadataDescriptor(root, "invalid", Other)
+	d.Observation.ID = ""
+	_, planErr := BuildPlan([]Observation{d.Observation})
+	if planErr == nil {
+		t.Fatal("invalid descriptor accepted by planner")
+	}
+	calls := 0
+	got, err := collectMetadata([]MetadataRoot{trustedMetadataRoot(root)}, []FileDescriptor{d}, func(string) (os.FileInfo, error) {
+		calls++
+		return nil, fs.ErrPermission
+	})
+	if err == nil || err.Error() != ErrSourceGap.Error()+": invalid descriptors: "+planErr.Error() {
+		t.Fatalf("descriptor diagnostic changed: %v", err)
+	}
+	// Equal compares the immediate error's concrete value; ErrSourceGap is a
+	// comparable pointer, so this requires the exact sentinel object.
+	if !errors.Is(err, ErrSourceGap) || !reflect.ValueOf(errors.Unwrap(err)).Equal(reflect.ValueOf(ErrSourceGap)) {
+		t.Fatalf("descriptor error must wrap only ErrSourceGap: %v", err)
+	}
+	if calls != 0 || !reflect.DeepEqual(got, MetadataCollection{}) {
+		t.Fatalf("invalid descriptor produced metadata: calls=%d result=%+v", calls, got)
+	}
+}
+
 func TestCollectMetadataMissingDeniedAndDirectory(t *testing.T) {
 	root := t.TempDir()
 	for _, tc := range []struct {
