@@ -14,9 +14,13 @@ type WorkItemID string
 type WorkAttemptID string
 
 var (
-	ErrInvalidWorkIdentity   = errors.New("invalid work identity")
-	ErrWorkIdentityMismatch  = errors.New("work identity mismatch")
-	ErrStaleWorkOwner        = errors.New("stale work owner generation")
+	// ErrInvalidWorkIdentity indicates an incomplete or malformed work identity.
+	ErrInvalidWorkIdentity = errors.New("invalid work identity")
+	// ErrWorkIdentityMismatch indicates an identity differs from the accepted record.
+	ErrWorkIdentityMismatch = errors.New("work identity mismatch")
+	// ErrStaleWorkOwner indicates an owner generation older than the accepted record.
+	ErrStaleWorkOwner = errors.New("stale work owner generation")
+	// ErrDuplicateWorkIdentity indicates a repeated work ID, attempt ID or worktree path.
 	ErrDuplicateWorkIdentity = errors.New("duplicate work identity")
 )
 
