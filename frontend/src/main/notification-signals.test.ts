@@ -8,7 +8,13 @@ import {
 	type NotificationType,
 } from "./notification-signals";
 
-const ALL_TYPES: NotificationType[] = ["needs_input", "ready_to_merge", "pr_merged", "pr_closed_unmerged", "orchestration_attention"];
+const ALL_TYPES: NotificationType[] = [
+	"needs_input",
+	"ready_to_merge",
+	"pr_merged",
+	"pr_closed_unmerged",
+	"orchestration_attention",
+];
 
 describe("shouldToast", () => {
 	it("fires a toast for every backend notification type", () => {
@@ -21,6 +27,10 @@ describe("shouldToast", () => {
 		expect(shouldToast({ title: "" }, true)).toBe(false);
 		expect(shouldToast({}, true)).toBe(false);
 		expect(shouldToast({ title: "needs input" }, false)).toBe(false);
+	});
+
+	it("accepts title-only toast requests without requiring grouping IPC fields", () => {
+		expect(shouldToast({ title: "Future notification" }, true)).toBe(true);
 	});
 });
 
