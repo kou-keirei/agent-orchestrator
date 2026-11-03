@@ -302,6 +302,15 @@ type ConversationQueuedEditDelivery struct {
 	CreatedAt       time.Time
 }
 
+type ConversationSendAttempt struct {
+	TurnID               string
+	ConversationID       string
+	State                string
+	ControllerGeneration string
+	ReservedAt           sql.NullTime
+	NonDeliveryEvidence  string
+}
+
 type ConversationSteerDelivery struct {
 	ConversationID   string
 	ClientMessageID  string

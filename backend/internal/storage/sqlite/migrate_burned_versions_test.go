@@ -162,6 +162,7 @@ var shippedMigrations = map[int64]string{
 	155: "0155_review_run_second_opinion_uniqueness.sql",
 	156: "0156_reviewer_cleanup_obligation.sql",
 	170: "0170_project_dispatch_hold.sql",
+	217: "0217_conversation_ordinary_send.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
@@ -170,8 +171,7 @@ var shippedMigrations = map[int64]string{
 // new file claiming one would be skipped silently there.
 //
 //   - 22 shipped in a nightly (#2412) and was deleted by the revert.
-//   - 157-169 are reserved by the observed foreign desktop lineage; the
-//     unshipped dispatch-hold candidate was moved from 157 to native 170.
+//   - 157-169 belong to the observed foreign desktop lineage.
 //
 // Beware of the adjacent hazard this cannot catch: at least one field profile
 // has versions 40 through 51 recorded as applied by a foreign build
