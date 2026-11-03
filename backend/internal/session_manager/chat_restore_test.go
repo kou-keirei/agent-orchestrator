@@ -81,10 +81,11 @@ func (d *lazyChatDriver) Resume(ctx context.Context, cfg ports.ChatResumeConfig)
 	d.mu.Lock()
 	d.conversations = append(d.conversations, conversation)
 	d.mu.Unlock()
+	var resumed ports.ChatConversation = conversation
 	if d.sendErr != nil {
-		return uncertainColdConversation{conversation, d.sendErr}, nil
+		resumed = uncertainColdConversation{conversation, d.sendErr}
 	}
-	return conversation, nil
+	return resumed, nil
 }
 
 func lazyChatFixture(t *testing.T) (*Manager, *chatsvc.Service, *sqlite.Store, *lazyChatDriver, domain.SessionRecord) {
@@ -1003,7 +1004,8 @@ func TestR5StaleExitedSnapshotPreservesProtectedWork(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if kind == "queued" || kind == "running" || kind == "reserved" {
+			switch kind {
+			case "queued", "running", "reserved":
 				if _, err := st.AppendUserMessage(ctx, conversation.ID, rec.ID, rec.Metadata.ControllerGeneration, domain.ConversationMessage{ID: "r5-protected-message", Text: "preserve protected work", Origin: domain.MessageOriginHuman}, "r5-protected-turn", time.Now()); err != nil {
 					t.Fatal(err)
 				}
@@ -1017,7 +1019,7 @@ func TestR5StaleExitedSnapshotPreservesProtectedWork(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-			} else if kind == "checkpoint" {
+			case "checkpoint":
 				current, _, err := st.GetSession(ctx, rec.ID)
 				if err != nil {
 					t.Fatal(err)
@@ -1026,7 +1028,7 @@ func TestR5StaleExitedSnapshotPreservesProtectedWork(t *testing.T) {
 				if err := st.UpdateSession(ctx, current); err != nil {
 					t.Fatal(err)
 				}
-			} else {
+			default:
 				if err := st.UpsertActivity(ctx, conversation.ID, "", domain.ConversationActivity{ID: "r5-pending", Kind: domain.ActivityKind(kind), Status: domain.ActivityStatusPending, RequestID: "r5-pending"}, time.Now()); err != nil {
 					t.Fatal(err)
 				}

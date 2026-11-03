@@ -24,6 +24,31 @@ func legacy169(t *testing.T) *sql.DB {
 	db := openTestDB(t)
 	db.SetMaxOpenConns(1)
 	upTo(t, db, 149)
+	seedLegacy169(t, db)
+	return db
+}
+
+// legacy169Fixture shares only the historical migrations within one test group.
+// Each subcase opens its own copy and seeds the foreign-169 data independently;
+// the compatibility migration and all rejection checks still run on every copy.
+func legacy169Fixture(t *testing.T) func(*testing.T) *sql.DB {
+	t.Helper()
+	fixture := migrationFixture(t, 149)
+	return func(t *testing.T) *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite", databaseURI(fixture(t))+"?_pragma=busy_timeout(5000)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.SetMaxOpenConns(1)
+		t.Cleanup(func() { _ = db.Close() })
+		seedLegacy169(t, db)
+		return db
+	}
+}
+
+func seedLegacy169(t *testing.T, db *sql.DB) {
+	t.Helper()
 	for _, statement := range []string{
 		`ALTER TABLE sessions ADD COLUMN provision_state TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE foreign_history (id TEXT PRIMARY KEY, content TEXT NOT NULL)`,
@@ -50,7 +75,55 @@ func legacy169(t *testing.T) *sql.DB {
 			t.Fatal(err)
 		}
 	}
-	return db
+}
+
+func TestLegacy169FixtureMatchesDirectSetupAndIsolatesCopies(t *testing.T) {
+	// Only wall-clock fields differ between independently seeded databases.
+	normalizeTimes := func(t *testing.T, db *sql.DB) {
+		t.Helper()
+		for _, statement := range []string{
+			`UPDATE goose_db_version SET tstamp='2000-01-01 00:00:00'`,
+			`UPDATE app_settings SET updated_at='2000-01-01 00:00:00'`,
+			`UPDATE agent_switch_failure_policy SET updated_at='2000-01-01 00:00:00'`,
+			`UPDATE projects SET registered_at='2000-01-01 00:00:00'`,
+			`UPDATE sessions SET activity_last_at='2000-01-01 00:00:00',created_at='2000-01-01 00:00:00',updated_at='2000-01-01 00:00:00'`,
+			`UPDATE notifications SET created_at='2000-01-01 00:00:00'`,
+			`UPDATE change_log SET created_at='2000-01-01 00:00:00'`,
+		} {
+			mustExec(t, db, statement)
+		}
+	}
+	direct := legacy169(t)
+	normalizeTimes(t, direct)
+	want := desktop169Snapshot(t, direct)
+	newLegacy169 := legacy169Fixture(t)
+	for _, name := range []string{"first", "after_first_copy_closes"} {
+		t.Run(name, func(t *testing.T) {
+			db := newLegacy169(t)
+			var foreignKeys, busyTimeout int
+			if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+				t.Fatal(err)
+			}
+			if foreignKeys != 0 || busyTimeout != 5000 {
+				t.Fatalf("copy connection foreign_keys/busy_timeout=%d/%d, want 0/5000", foreignKeys, busyTimeout)
+			}
+			normalizeTimes(t, db)
+			if got := desktop169Snapshot(t, db); got != want {
+				t.Fatalf("copy differs from direct setup: got=%s want=%s", got, want)
+			}
+			// Mutate schema, data and ledger, then close this copy before the
+			// next subcase proves that none of those mutations escaped.
+			mustExec(t, db, `DROP INDEX idx_review_run_session_pr_sha_harness;
+UPDATE foreign_history SET content='copy-only';
+DELETE FROM goose_db_version WHERE version_id=169;`)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestLegacy169Compatibility(t *testing.T) {
@@ -58,6 +131,13 @@ func TestLegacy169Compatibility(t *testing.T) {
 	var journalBefore string
 	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalBefore); err != nil {
 		t.Fatal(err)
+	}
+	if err := reconcileDesktop169(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var checkpointJournal string
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&checkpointJournal); err != nil || checkpointJournal != journalBefore {
+		t.Fatalf("physical compatibility changed exact historical journal: %v", err)
 	}
 	if err := migrate(db); err != nil {
 		t.Fatal(err)
@@ -104,8 +184,25 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatalf("repeat startup: %v", err)
 	}
 	var journalAfter string
-	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
+	// Preserve every historical row byte-for-byte. New source migrations may
+	// append their own claims above 169; they may not relabel the old journal.
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version WHERE version_id <= 169`).Scan(&journalAfter); err != nil || journalAfter != journalBefore {
 		t.Fatalf("journal changed: %v", err)
+	}
+	latest, err := expectedMigrationVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forwardClaims string
+	if err := db.QueryRow(`SELECT COALESCE(group_concat(version_id||':'||is_applied,'|'),'') FROM goose_db_version WHERE version_id > 169`).Scan(&forwardClaims); err != nil {
+		t.Fatal(err)
+	}
+	if latest > 169 {
+		if latest != 217 || forwardClaims != "217:1" {
+			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
+		}
+	} else if forwardClaims != "" {
+		t.Fatalf("unexpected claims beyond frozen historical journal: %s", forwardClaims)
 	}
 	if rows, err := db.Query(`PRAGMA foreign_key_check`); err != nil {
 		t.Fatal(err)
@@ -114,10 +211,14 @@ func TestLegacy169Compatibility(t *testing.T) {
 		if rows.Next() {
 			t.Fatal("foreign key violation")
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
 func TestLegacy169CompatibilityRejectsAmbiguityBeforeWrites(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, tc := range []struct{ name, sql string }{
 		{"foreign higher version", `INSERT INTO goose_db_version(version_id,is_applied) VALUES (170,1)`},
 		{"out of order journal", `DELETE FROM goose_db_version WHERE version_id=153`},
@@ -129,7 +230,7 @@ func TestLegacy169CompatibilityRejectsAmbiguityBeforeWrites(t *testing.T) {
 		{"terminal column without trigger", `ALTER TABLE sessions ADD COLUMN terminal_revision INTEGER NOT NULL DEFAULT 0`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(tc.sql); err != nil {
 				t.Fatal(err)
 			}
@@ -185,6 +286,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 	var tables []string
 	for rows.Next() {
 		var kind, name, owner, ddl string
@@ -207,6 +309,7 @@ func desktop169Snapshot(t *testing.T, db *sql.DB) string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		columns, err := rows.Columns()
 		if err != nil {
 			t.Fatal(err)
@@ -244,9 +347,10 @@ func rejectDesktop169Unchanged(t *testing.T, db *sql.DB) {
 }
 
 func TestLegacy169R2IncomingForeignKey(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, parent := range []string{"Notifications", `"NOTIFICATIONS"`, "nOtIfIcAtIoNs"} {
 		t.Run(parent, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(`PRAGMA foreign_keys=ON; CREATE TABLE foreign_child(id TEXT PRIMARY KEY, notice_id TEXT REFERENCES ` + parent + `(id) ON DELETE CASCADE, content TEXT); INSERT INTO foreign_child VALUES ('child','notice','retain child')`); err != nil {
 				t.Fatal(err)
 			}
@@ -260,9 +364,10 @@ func TestLegacy169R2IncomingForeignKey(t *testing.T) {
 }
 
 func TestLegacy169R2NotificationPhysicalColumns(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, shape := range []string{"reordered", "generated hidden"} {
 		t.Run(shape, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if shape == "reordered" {
 				if _, err := db.Exec(`ALTER TABLE notifications RENAME TO original_notifications;
 CREATE TABLE notifications(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,pr_url TEXT NOT NULL DEFAULT '',type TEXT NOT NULL CHECK(type IN ('needs_input','ready_to_merge','pr_merged','pr_closed_unmerged')),body TEXT NOT NULL DEFAULT '',title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'unread' CHECK(status IN ('read','unread')),created_at TIMESTAMP NOT NULL,resolved_at TIMESTAMP);
@@ -290,11 +395,12 @@ DROP TABLE original_notifications;`); err != nil {
 }
 
 func TestLegacy169R2ReviewIndex(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	const predicate = ` WHERE target_sha != '' AND status NOT IN ('failed', 'cancelled') AND (status = 'running' OR verdict NOT IN ('', 'changes_requested'))`
 	for _, restart := range []bool{false, true} {
 		for _, shape := range []string{"nonunique", "not partial", "wrong predicate", "foreign owner", "literal case"} {
 			t.Run(fmt.Sprintf("restart=%v/%s", restart, shape), func(t *testing.T) {
-				db := legacy169(t)
+				db := newLegacy169(t)
 				columns := "session_id, pr_url, target_sha, harness"
 				if restart {
 					if err := migrate(db); err != nil {
@@ -328,6 +434,7 @@ func TestLegacy169R2ReviewIndex(t *testing.T) {
 }
 
 func TestLegacy169R2DestinationCollisions(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, ddl := range []string{
 		`CREATE INDEX idx_orchestration_events_due ON foreign_history(content)`,
 		`CREATE INDEX IDX_ORCHESTRATION_EVENTS_PROJECT ON foreign_history(content)`,
@@ -339,7 +446,7 @@ func TestLegacy169R2DestinationCollisions(t *testing.T) {
 		`DROP INDEX idx_notifications_history; CREATE INDEX idx_notifications_history ON foreign_history(content)`,
 	} {
 		t.Run(ddl, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(ddl); err != nil {
 				t.Fatal(err)
 			}
@@ -361,6 +468,7 @@ status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('read', 'unread')),
 created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 
 func TestLegacy169R3NotificationDeclarations(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, tc := range []struct{ name, old, replacement string }{
 		{"real affinity", "title TEXT NOT NULL", "title REAL NOT NULL"},
 		{"integer affinity", "title TEXT NOT NULL", "title INTEGER NOT NULL"},
@@ -384,7 +492,7 @@ func TestLegacy169R3NotificationDeclarations(t *testing.T) {
 		{"strict storage", "TIMESTAMP", "TEXT"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			ddl := strings.ReplaceAll(legacy169NotificationsDDL, tc.old, tc.replacement)
 			if tc.name == "composite primary key" {
 				ddl = strings.TrimSuffix(ddl, ")") + ", PRIMARY KEY(id,title))"
@@ -425,9 +533,10 @@ CREATE INDEX idx_notifications_unresolved ON notifications(resolved_at,created_a
 }
 
 func TestLegacy169R3NotificationDependencies(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, reference := range []string{"notifications", "Notifications", `"NOTIFICATIONS"`, "[nOtIfIcAtIoNs]", "`notifications`", "'notifications'", `main."NOTIFICATIONS"`} {
 		t.Run(reference, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(`CREATE VIEW foreign_notice_view AS SELECT id,title FROM ` + reference); err != nil {
 				t.Fatal(err)
 			}
@@ -445,7 +554,7 @@ func TestLegacy169R3NotificationDependencies(t *testing.T) {
 		`CREATE VIEW foreign_broken_view AS SELECT * FROM missing_foreign_table`,
 	} {
 		t.Run(ddl, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(ddl); err != nil {
 				t.Fatal(err)
 			}
@@ -455,6 +564,7 @@ func TestLegacy169R3NotificationDependencies(t *testing.T) {
 }
 
 func TestLegacy169R3OtherDestructiveActions(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, ddl := range []string{
 		`DROP INDEX idx_notifications_history; CREATE UNIQUE INDEX idx_notifications_history ON notifications(title)`,
 		`CREATE TRIGGER foreign_session_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='unexpected backfill side effect'; END`,
@@ -464,7 +574,7 @@ func TestLegacy169R3OtherDestructiveActions(t *testing.T) {
 		`ALTER TABLE sessions ADD COLUMN TERMINAL_REVISION INTEGER NOT NULL DEFAULT 0`,
 	} {
 		t.Run(ddl, func(t *testing.T) {
-			db := legacy169(t)
+			db := newLegacy169(t)
 			if _, err := db.Exec(ddl); err != nil {
 				t.Fatal(err)
 			}
@@ -529,6 +639,7 @@ func TestLegacy169BackupCopy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer rows.Close()
 		var columns []string
 		for rows.Next() {
 			var name string
@@ -554,6 +665,7 @@ func TestLegacy169BackupCopy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer rows.Close()
 			columns, err := rows.Columns()
 			if err != nil {
 				t.Fatal(err)
@@ -670,27 +782,33 @@ BEGIN
         NEW.updated_at);
 END`
 
-func historical169DB(t *testing.T, reconciled bool) *sql.DB {
+func historical169DB(t *testing.T, db *sql.DB, reconciled bool) *sql.DB {
 	t.Helper()
 	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(historical169CDC))); got != "a029ee1be09785960daaa41277c16e6d11150c97ccae9a46fa227b1ca4c48f0f" {
 		t.Fatalf("historical fixture changed: %s", got)
 	}
-	db := legacy169(t)
 	if reconciled {
-		if err := migrate(db); err != nil {
+		// This fixture is the physical compatibility checkpoint at 169,
+		// before any source forward migration is allowed to advance Goose.
+		if err := reconcileDesktop169(t.Context(), db); err != nil {
 			t.Fatal(err)
 		}
 	} else {
 		mustExec(t, db, `ALTER TABLE sessions ADD COLUMN hidden_at TIMESTAMP`)
 	}
 	mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+historical169CDC)
+	var version int
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&version); err != nil || version != 169 {
+		t.Fatalf("historical fixture must remain at 169: version=%d err=%v", version, err)
+	}
 	return db
 }
 
 func TestLegacy169HistoricalCDCUpgrade(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, reconciled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reconciled=%v", reconciled), func(t *testing.T) {
-			db := historical169DB(t, reconciled)
+			db := historical169DB(t, newLegacy169(t), reconciled)
 			// Retain a real historical event byte-for-byte across startup.
 			mustExec(t, db, `UPDATE sessions SET display_name='before upgrade' WHERE id='legacy-1'`)
 			var before string
@@ -759,6 +877,7 @@ func TestLegacy169HistoricalCDCUpgrade(t *testing.T) {
 }
 
 func TestLegacy169HistoricalCDCRejectsForeign(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
 	for _, tc := range []struct{ name, old, replacement string }{
 		{"foreign literal", "'session_updated'", "'SESSION_UPDATED'"},
 		{"foreign payload", "'hiddenAt'", "'hidden_at'"},
@@ -768,7 +887,7 @@ func TestLegacy169HistoricalCDCRejectsForeign(t *testing.T) {
 		{"extra side effect", "\nEND", "\nUPDATE foreign_history SET content='unexpected'; END"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := historical169DB(t, false)
+			db := historical169DB(t, newLegacy169(t), false)
 			mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+strings.Replace(historical169CDC, tc.old, tc.replacement, 1))
 			rejectDesktop169Unchanged(t, db)
 		})
@@ -781,7 +900,7 @@ func TestLegacy169HistoricalCDCRejectsForeign(t *testing.T) {
 		{"foreign CDC owner", `DROP TRIGGER sessions_cdc_update; CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db := historical169DB(t, false)
+			db := historical169DB(t, newLegacy169(t), false)
 			mustExec(t, db, tc.ddl)
 			rejectDesktop169Unchanged(t, db)
 		})
@@ -789,7 +908,7 @@ func TestLegacy169HistoricalCDCRejectsForeign(t *testing.T) {
 }
 
 func TestLegacy169HistoricalCDCTransactionalReplacement(t *testing.T) {
-	db := historical169DB(t, true)
+	db := historical169DB(t, legacy169(t), true)
 	before := desktop169Snapshot(t, db)
 	// Native per-connection SQL length limit lets DROP succeed and forces the
 	// larger CREATE to fail. The reconciler must roll the DROP back, with no
@@ -827,5 +946,124 @@ func TestLegacy169HistoricalCDCTransactionalReplacement(t *testing.T) {
 	}
 	if err := migrate(db); err != nil {
 		t.Fatalf("retry after rollback: %v", err)
+	}
+}
+
+func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, tc := range []struct{ name, old, replacement string }{
+		{"foreign literal", "'session_updated'", "'SESSION_UPDATED'"},
+		{"foreign payload", "'hiddenAt'", "'hidden_at'"},
+		{"missing old predicate", "OR OLD.display_name <> NEW.display_name", ""},
+		{"provision predicate only", "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at OR OLD.provision_state <> NEW.provision_state"},
+		{"extra side effect", "\nEND", "\nUPDATE foreign_history SET content='unexpected'; END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), true)
+			if err := migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, db, `DROP TRIGGER sessions_cdc_update; `+strings.Replace(historical169CDC, tc.old, tc.replacement, 1))
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, claim := range []int{170, 218} {
+		t.Run(strconv.Itoa(claim), func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), true)
+			if err := migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			// 170 remains foreign even though the owned 217 is now the maximum.
+			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
+			rejectDesktop169Unchanged(t, db)
+		})
+	}
+}
+
+func TestLegacy169NormalizationFailureDoesNotAdvanceForward(t *testing.T) {
+	db := historical169DB(t, legacy169(t), true)
+	before := desktop169Snapshot(t, db)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exact historical CREATE fits; the canonical provisioning-aware
+	// replacement does not. DROP must roll back before Goose can commit 217.
+	old, err := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, len(historical169CDC)+1)
+	_ = conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = migrate(db)
+	conn, connErr := db.Conn(t.Context())
+	if connErr != nil {
+		t.Fatal(connErr)
+	}
+	_, resetErr := modernsqlite.Limit(conn, sqlitelib.SQLITE_LIMIT_SQL_LENGTH, old)
+	_ = conn.Close()
+	if resetErr != nil {
+		t.Fatal(resetErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "replay session hidden CDC trigger") {
+		t.Fatalf("expected canonical CREATE failure: %v", err)
+	}
+	var version, forwardTable int
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='conversation_send_attempts'`).Scan(&forwardTable); err != nil {
+		t.Fatal(err)
+	}
+	if version != 169 || forwardTable != 0 || desktop169Snapshot(t, db) != before {
+		t.Fatalf("normalization failure advanced or mutated historical checkpoint: version=%d forwardTable=%d", version, forwardTable)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("retry after failed normalization: %v", err)
+	}
+	after := desktop169Snapshot(t, db)
+	if err := migrate(db); err != nil || desktop169Snapshot(t, db) != after {
+		t.Fatalf("restart after forward migration: %v", err)
+	}
+}
+
+func TestLegacy169ForwardDoesNotReplayMissingHistoricalEffects(t *testing.T) {
+	db := historical169DB(t, legacy169(t), true)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `DROP TABLE reviewer_cleanup_obligation`)
+	rejectDesktop169Unchanged(t, db)
+}
+
+func TestLegacy169MissingCDCAndOccupiedName(t *testing.T) {
+	newLegacy169 := legacy169Fixture(t)
+	for _, tc := range []struct{ name, ddl string }{
+		{"absent", ""},
+		{"temporary dependency", `CREATE TEMP TRIGGER temp_update AFTER UPDATE ON main.sessions BEGIN SELECT 1; END`},
+		{"foreign backfill dependency", `CREATE TRIGGER foreign_update AFTER UPDATE ON sessions BEGIN UPDATE foreign_history SET content='unexpected'; END`},
+		{"wrong owner", `CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON foreign_history BEGIN SELECT 1; END`},
+		{"wrong type", `CREATE TABLE sessions_cdc_update (content TEXT)`},
+		{"case variant", `CREATE TRIGGER SESSIONS_CDC_UPDATE AFTER UPDATE ON sessions BEGIN SELECT 1; END`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := historical169DB(t, newLegacy169(t), false)
+			mustExec(t, db, `DROP TRIGGER sessions_cdc_update`)
+			if tc.ddl != "" {
+				mustExec(t, db, tc.ddl)
+				rejectDesktop169Unchanged(t, db)
+				return
+			}
+			if err := migrate(db); err != nil {
+				t.Fatalf("restore genuinely absent CDC before forward migration: %v", err)
+			}
+			snapshot := desktop169Snapshot(t, db)
+			if err := migrate(db); err != nil || desktop169Snapshot(t, db) != snapshot {
+				t.Fatalf("restart after absent CDC repair: %v", err)
+			}
+		})
 	}
 }
