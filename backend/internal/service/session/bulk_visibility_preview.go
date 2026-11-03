@@ -15,8 +15,9 @@ type BulkVisibilityEvidence uint8
 const (
 	// BulkVisibilityUnknown indicates that evidence was not supplied.
 	BulkVisibilityUnknown BulkVisibilityEvidence = iota
-	// BulkVisibilityNo and BulkVisibilityYes indicate explicit negative and positive evidence.
+	// BulkVisibilityNo indicates explicit negative evidence.
 	BulkVisibilityNo
+	// BulkVisibilityYes indicates explicit positive evidence.
 	BulkVisibilityYes
 )
 
@@ -52,10 +53,13 @@ type BulkVisibilityReasonCode string
 const (
 	// BulkVisibilityMissingEvidence indicates that a required fact was not supplied.
 	BulkVisibilityMissingEvidence BulkVisibilityReasonCode = "missing_evidence"
-	// BulkVisibilityInvalidEvidence and the following codes identify invalid or blocking evidence.
+	// BulkVisibilityInvalidEvidence indicates that supplied evidence is unrecognized.
 	BulkVisibilityInvalidEvidence BulkVisibilityReasonCode = "invalid_evidence"
-	BulkVisibilityProtected       BulkVisibilityReasonCode = "protected"
+	// BulkVisibilityProtected indicates that a supplied fact blocks eligibility.
+	BulkVisibilityProtected BulkVisibilityReasonCode = "protected"
+	// BulkVisibilityProjectMismatch indicates that the supplied project differs from the requested project.
 	BulkVisibilityProjectMismatch BulkVisibilityReasonCode = "project_mismatch"
+	// BulkVisibilityRevisionChanged indicates that a supplied revision differs from its readback.
 	BulkVisibilityRevisionChanged BulkVisibilityReasonCode = "revision_changed"
 )
 
