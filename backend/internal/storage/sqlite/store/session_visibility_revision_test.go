@@ -70,55 +70,68 @@ func requireVisibilityStale(t *testing.T, err error, id domain.SessionID, revisi
 // through SessionRecord, plus history, cleanup, workspaces and provider archive.
 func visibilityUnchangedFacts(t *testing.T, db *sql.DB) map[string][][]any {
 	t.Helper()
-	names, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'change_log' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var tables []string
-	for names.Next() {
-		var table string
-		if err := names.Scan(&table); err != nil {
-			t.Fatal(err)
-		}
-		tables = append(tables, table)
-	}
-	if err := names.Err(); err != nil {
-		t.Fatal(err)
-	}
-	_ = names.Close()
-	snapshot := make(map[string][][]any)
-	for _, table := range tables {
-		rows, err := db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `"`)
+	// Release each result set before the next query needs the single connection.
+	func() {
+		names, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'change_log' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
 		if err != nil {
 			t.Fatal(err)
 		}
-		columns, err := rows.Columns()
-		if err != nil {
-			t.Fatal(err)
-		}
-		snapshot[table] = nil
-		for rows.Next() {
-			values := make([]any, len(columns))
-			dest := make([]any, len(columns))
-			for i := range values {
-				dest[i] = &values[i]
+		defer func() {
+			if err := names.Close(); err != nil {
+				t.Error(err)
 			}
-			if err := rows.Scan(dest...); err != nil {
+		}()
+		for names.Next() {
+			var table string
+			if err := names.Scan(&table); err != nil {
 				t.Fatal(err)
 			}
-			for i, column := range columns {
-				if table == "sessions" && (column == "hidden_at" || column == "revision") {
-					values[i] = nil
-				} else if bytes, ok := values[i].([]byte); ok {
-					values[i] = string(bytes)
-				}
-			}
-			snapshot[table] = append(snapshot[table], values)
+			tables = append(tables, table)
 		}
-		if err := rows.Err(); err != nil {
+		if err := names.Err(); err != nil {
 			t.Fatal(err)
 		}
-		_ = rows.Close()
+	}()
+	snapshot := make(map[string][][]any)
+	for _, table := range tables {
+		func() {
+			rows, err := db.Query(`SELECT * FROM "` + strings.ReplaceAll(table, `"`, `""`) + `"`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			columns, err := rows.Columns()
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot[table] = nil
+			for rows.Next() {
+				values := make([]any, len(columns))
+				dest := make([]any, len(columns))
+				for i := range values {
+					dest[i] = &values[i]
+				}
+				if err := rows.Scan(dest...); err != nil {
+					t.Fatal(err)
+				}
+				for i, column := range columns {
+					if table == "sessions" && (column == "hidden_at" || column == "revision") {
+						values[i] = nil
+					} else if bytes, ok := values[i].([]byte); ok {
+						values[i] = string(bytes)
+					}
+				}
+				snapshot[table] = append(snapshot[table], values)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 	}
 	return snapshot
 }
