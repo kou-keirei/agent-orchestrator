@@ -97,6 +97,7 @@ type integrationChatConversation struct {
 	providerID string
 	events     chan ports.ChatEvent
 	closeOnce  sync.Once
+	beforeSend func(context.Context) error
 
 	mu   sync.Mutex
 	sent []ports.ChatUserMessage
@@ -121,9 +122,14 @@ func (c *integrationChatConversation) Capabilities() ports.ChatCapabilities {
 }
 
 func (c *integrationChatConversation) SendTurn(
-	_ context.Context,
+	ctx context.Context,
 	message ports.ChatUserMessage,
 ) (ports.ChatTurnRef, error) {
+	if c.beforeSend != nil {
+		if err := c.beforeSend(ctx); err != nil {
+			return ports.ChatTurnRef{}, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sent = append(c.sent, message)
@@ -289,6 +295,7 @@ type chatSwitchIntegrationFixture struct {
 	manager    *Manager
 	lifecycle  *observingActivationLifecycle
 	session    domain.SessionRecord
+	sourceChat *integrationChatConversation
 	targetChat *integrationChatConversation
 }
 
@@ -338,13 +345,14 @@ func newChatSwitchIntegrationFixture(t *testing.T, stale bool) *chatSwitchIntegr
 		t.Fatalf("seed integration conversation: %v", err)
 	}
 
+	sourceChat := newIntegrationChatConversation(chatSwitchIntegrationSourceProvider)
 	sourceDriver := integrationChatDriver{
 		harness: domain.HarnessClaudeCode,
 		start: func() ports.ChatConversation {
-			return newIntegrationChatConversation(chatSwitchIntegrationSourceProvider)
+			return sourceChat
 		},
 		resume: func() ports.ChatConversation {
-			return newIntegrationChatConversation(chatSwitchIntegrationSourceProvider)
+			return sourceChat
 		},
 	}
 	targetChat := newIntegrationChatConversation(chatSwitchIntegrationTargetProvider)
@@ -417,10 +425,11 @@ func newChatSwitchIntegrationFixture(t *testing.T, stale bool) *chatSwitchIntegr
 	})
 	manager.handoffWait = time.Millisecond
 	manager.switchPostStopWait = time.Second
+	service.SetInputAdmission(manager.AcquireChatInput)
 
 	return &chatSwitchIntegrationFixture{
 		store: store, service: service, manager: manager, lifecycle: observedLifecycle,
-		session: session, targetChat: targetChat,
+		session: session, sourceChat: sourceChat, targetChat: targetChat,
 	}
 }
 
@@ -579,4 +588,74 @@ func TestSwitchAgentRealChatServiceSQLiteActivationCAS(t *testing.T) {
 			t.Fatalf("stale target boundary lookup error = %v, want ErrNoConversationBranch", err)
 		}
 	})
+}
+
+func (l integrationChatLauncher) RelayChatTurnAccepted(ctx context.Context, id domain.SessionID, text, clientMessageID, generation string, validateOwner func() error) (string, error) {
+	return l.service.RelayChatTurnAccepted(ctx, id, text, clientMessageID, generation, validateOwner)
+}
+
+type unconfirmedSwitchChatLauncher struct{ integrationChatLauncher }
+
+func (unconfirmedSwitchChatLauncher) RelayChatTurnAccepted(context.Context, domain.SessionID, string, string, string, func() error) (string, error) {
+	return "local-preparation-only", domain.ErrConversationSendUncertain
+}
+
+type changedSwitchOwnerChatLauncher struct {
+	integrationChatLauncher
+	beforeRelay func(context.Context, domain.SessionID) error
+}
+
+func (l changedSwitchOwnerChatLauncher) RelayChatTurnAccepted(ctx context.Context, id domain.SessionID, text, clientMessageID, generation string, validateOwner func() error) (string, error) {
+	if err := l.beforeRelay(ctx, id); err != nil {
+		return "", err
+	}
+	return l.integrationChatLauncher.RelayChatTurnAccepted(ctx, id, text, clientMessageID, generation, validateOwner)
+}
+
+func TestSwitchChatContinuationRequiresExclusiveOwnerAndNativeHistory(t *testing.T) {
+	for _, lost := range []string{"gate", "generation", "native-history"} {
+		t.Run(lost, func(t *testing.T) {
+			f := newChatSwitchIntegrationFixture(t, false)
+			f.manager.chat = changedSwitchOwnerChatLauncher{
+				integrationChatLauncher: integrationChatLauncher{service: f.service},
+				beforeRelay: func(ctx context.Context, id domain.SessionID) error {
+					if lost == "gate" {
+						f.manager.endAgentSwitch(id)
+						return nil
+					}
+					rec, found, err := f.store.GetSession(ctx, id)
+					if err != nil || !found {
+						return fmt.Errorf("read target: found=%v: %w", found, err)
+					}
+					if lost == "generation" {
+						rec.Metadata.ControllerGeneration = "replacement"
+					} else {
+						rec.Metadata.ProviderConversationID = "other-history"
+					}
+					return f.store.UpdateSession(ctx, rec)
+				},
+			}
+			admitted := f.runSwitch(t, "lost-"+lost)
+			sw, found, err := f.store.GetAgentSwitch(t.Context(), admitted.ID)
+			if err != nil || !found || sw.TargetAcknowledgedAt != nil || sw.State != domain.AgentSwitchFailed {
+				t.Fatalf("lost owner acknowledged: switch=%+v found=%v error=%v", sw, found, err)
+			}
+			f.targetChat.mu.Lock()
+			defer f.targetChat.mu.Unlock()
+			if len(f.targetChat.sent) != 0 {
+				t.Fatalf("lost owner dispatched %d prompts", len(f.targetChat.sent))
+			}
+		})
+	}
+}
+
+func TestSwitchAgentDoesNotAcknowledgeUnconfirmedChatTarget(t *testing.T) {
+	fixture := newChatSwitchIntegrationFixture(t, false)
+	fixture.manager.chat = unconfirmedSwitchChatLauncher{integrationChatLauncher{service: fixture.service}}
+	admitted := fixture.runSwitch(t, "unconfirmed-chat-target")
+	sw, found, err := fixture.store.GetAgentSwitch(t.Context(), admitted.ID)
+	if err != nil || !found || sw.State != domain.AgentSwitchFailed ||
+		sw.TargetAcknowledgedAt != nil || sw.ErrorCode != domain.AgentSwitchErrorDeliveryUnconfirmed {
+		t.Fatalf("unconfirmed target acknowledged: switch=%+v found=%v error=%v", sw, found, err)
+	}
 }
