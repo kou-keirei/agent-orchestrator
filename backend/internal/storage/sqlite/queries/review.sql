@@ -49,7 +49,22 @@ INSERT INTO review_run (id, review_id, session_id, batch_id, harness, trigger_so
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdateReviewRunResult :execrows
-UPDATE review_run SET status = ?, verdict = ?, body = ?, github_review_id = ?, auto_inject_review = ? WHERE id = ? AND status = 'running';
+UPDATE review_run SET status = ?, verdict = ?, body = ?, github_review_id = ?, auto_inject_review = ?
+WHERE review_run.id = ? AND review_run.status = 'running'
+  AND EXISTS (
+      SELECT 1 FROM review
+      WHERE review.id = review_run.review_id
+        AND review.session_id = review_run.session_id
+        AND review.harness = review_run.harness
+        AND review.reviewer_launch_id = review_run.launch_id
+  );
+
+-- name: SettleReviewRun :execrows
+-- Failure before launch acceptance and predecessor cancellation after replacement
+-- do not assert fresh reviewer authority. This path cannot record a verdict.
+UPDATE review_run SET status = sqlc.arg(status), verdict = '', body = sqlc.arg(body), github_review_id = '', auto_inject_review = sqlc.arg(auto_inject_review)
+WHERE id = sqlc.arg(id) AND status = 'running'
+  AND (sqlc.arg(status) = 'failed' OR sqlc.arg(status) = 'cancelled');
 
 -- name: AppendReviewRunNativeEvidence :execrows
 UPDATE review_run SET
