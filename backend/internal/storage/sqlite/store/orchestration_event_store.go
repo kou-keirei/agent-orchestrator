@@ -17,6 +17,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -377,10 +378,13 @@ func (s *Store) ListDueOrchestrationEvents(ctx context.Context, project domain.P
 		SELECT COALESCE(NULLIF(TRIM(lease_token), ''), '') AS lease_token
 		FROM orchestration_events
 		WHERE project_id=? AND state='pending' AND next_attempt_at<=?
+		AND kind<>'worker_report' AND NOT EXISTS (
+		  SELECT 1 FROM orchestration_events r WHERE r.project_id=orchestration_events.project_id
+		  AND r.kind='worker_report' AND r.lease_token=orchestration_events.lease_token)
 		ORDER BY enqueued_at,id LIMIT 1
 	)
 	SELECT `+orchestrationColumns+` FROM orchestration_events AS event
-	 WHERE event.project_id=?
+	 WHERE event.project_id=? AND event.kind<>'worker_report'
 	   AND COALESCE(NULLIF(TRIM(event.lease_token), ''), '')=(SELECT lease_token FROM first_due)
 	   AND ((SELECT lease_token FROM first_due)<>'' OR (event.state='pending' AND event.next_attempt_at<=?))
 	 ORDER BY event.enqueued_at,event.id LIMIT ?`, project, now, project, now, limit+1)
@@ -456,7 +460,7 @@ func (s *Store) ClearOrchestrationAttention(ctx context.Context, ids []string) e
 	defer s.writeMu.Unlock()
 	return s.inTxDB(ctx, "clear orchestration attention", func(_ *gen.Queries, db gen.DBTX) error {
 		for _, id := range ids {
-			if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET attention_required_at=NULL WHERE id=?`, id); err != nil {
+			if _, err := db.ExecContext(ctx, `UPDATE orchestration_events SET attention_required_at=NULL WHERE id=? AND kind<>'worker_report'`, id); err != nil {
 				return err
 			}
 		}
@@ -469,9 +473,11 @@ func (s *Store) RetryDeadLetterOrchestrationEvent(ctx context.Context, project d
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='pending',attempt_count=0,next_attempt_at=?,lease_expires_at=NULL,submitted_at=NULL,acknowledged_at=NULL,attention_required_at=NULL,last_error=''
-		WHERE project_id=? AND state='dead_letter' AND (
+		WHERE project_id=? AND state='dead_letter' AND kind<>'worker_report'
+		AND NOT EXISTS (SELECT 1 FROM orchestration_events r WHERE r.project_id=orchestration_events.project_id
+		 AND r.kind='worker_report' AND (r.id=? OR r.lease_token=orchestration_events.lease_token)) AND (
 			id=? OR (lease_token IS NOT NULL AND lease_token=(SELECT lease_token FROM orchestration_events WHERE id=? AND project_id=? AND state='dead_letter'))
-		)`, now, project, id, id, project)
+		)`, now, project, id, id, id, project)
 	if err != nil {
 		return false, err
 	}
@@ -509,7 +515,8 @@ func (s *Store) MarkOrchestrationEventsSubmitted(ctx context.Context, ids []stri
 	})
 }
 
-// AcknowledgeOrchestrationEvents acknowledges events matching the lease token.
+// AcknowledgeOrchestrationEvents records legacy transport admission only.
+// updateOrchestrationBatch rejects reports: transport is not semantic ACK.
 func (s *Store) AcknowledgeOrchestrationEvents(ctx context.Context, ids []string, token string, at time.Time) error {
 	return s.updateOrchestrationBatch(ctx, "acknowledge orchestration events", ids, token, func(db gen.DBTX, id string) (sql.Result, error) {
 		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='acknowledged',acknowledged_at=?,lease_expires_at=NULL,last_error='' WHERE id=? AND state IN ('leased','submitted') AND lease_token=?`, at, id, token)
@@ -524,9 +531,9 @@ func (s *Store) AcknowledgeOrchestrationBatchAccepted(ctx context.Context, desti
 	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='acknowledged',acknowledged_at=?,lease_expires_at=NULL,last_error=''
  WHERE destination_session_id=? AND lease_token=? AND state IN ('leased','submitted')
  AND project_id=(SELECT project_id FROM sessions WHERE id=? AND kind='orchestrator')
- AND NOT EXISTS (SELECT 1 FROM orchestration_events AS member WHERE member.lease_token=?
-   AND member.project_id=(SELECT project_id FROM sessions WHERE id=?)
-   AND (member.destination_session_id IS NOT ? OR member.state NOT IN ('leased','submitted')))`, at, destination, token, destination, token, destination, destination)
+	 AND NOT EXISTS (SELECT 1 FROM orchestration_events AS member WHERE member.lease_token=?
+	   AND member.project_id=(SELECT project_id FROM sessions WHERE id=?)
+	   AND (member.kind='worker_report' OR member.destination_session_id IS NOT ? OR member.state NOT IN ('leased','submitted')))`, at, destination, token, destination, token, destination, destination)
 	if err != nil {
 		return 0, err
 	}
@@ -612,6 +619,17 @@ func (s *Store) updateOrchestrationBatch(ctx context.Context, what string, ids [
 		}
 		if project == "" || projects != 1 || supplied != len(ids) {
 			return fmt.Errorf("orchestration batch %q has invalid project membership", token)
+		}
+		// Fence direct callers and stale due reads before any row changes. Also
+		// reject a legacy-only subset of a previously mixed report batch.
+		var reports int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM orchestration_events
+		 WHERE project_id=? AND kind='worker_report'
+		 AND (id IN (SELECT value FROM json_each(?)) OR lease_token=?)`, project, string(encoded), token).Scan(&reports); err != nil {
+			return err
+		}
+		if reports != 0 {
+			return ports.ErrWorkerReportDeliveryHeld
 		}
 		// Within that project a token names one immutable payload and destination.
 		// Check its entire membership before the first row update so omitted,

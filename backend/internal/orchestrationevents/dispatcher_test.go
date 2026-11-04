@@ -14,6 +14,9 @@ import (
 )
 
 type fakeStore struct {
+	reportsHeld                       bool
+	reportHoldErr                     error
+	reportHoldCalls                   int
 	held                              bool
 	holdErr                           error
 	afterLease                        func()
@@ -27,6 +30,11 @@ type fakeStore struct {
 	getErr                            error
 	attentionChanged                  int64
 	sessionLists                      int
+}
+
+func (f *fakeStore) HoldWorkerReportDeliveries(context.Context, domain.ProjectID, time.Time) (bool, error) {
+	f.reportHoldCalls++
+	return f.reportsHeld, f.reportHoldErr
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
