@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"regexp"
@@ -17,14 +18,97 @@ import (
 // Goose still owns SQL parsing and per-migration transactions. Only wholly
 // absent effects of the unchanged embedded migrations are eligible for replay.
 // Inspect the entire plan before writing; partial/colliding shapes need review.
-func reconcileDesktop169(ctx context.Context, db *sql.DB) error {
+func reconcileDesktop169(ctx context.Context, db *sql.DB) (resultErr error) {
+	// Inspect before any historical replay or Goose migration can write. Adopt
+	// an unshipped candidate table only with the exact declaration and valid
+	// existing operator rows; never replace its hold/release decisions.
+	var holdObjects int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='project_dispatch_hold' COLLATE NOCASE`).Scan(&holdObjects); err != nil {
+		return err
+	}
+	if holdObjects != 0 {
+		var ddl string
+		if holdObjects != 1 {
+			return fmt.Errorf("desktop schema compatibility: conflicting dispatch hold objects")
+		}
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name='project_dispatch_hold' AND type='table'`).Scan(&ddl); err != nil {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold owner: %w", err)
+		}
+		const want = `CREATE TABLE project_dispatch_hold (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, held INTEGER NOT NULL CHECK (held IN (0, 1)))`
+		if desktop169SQL(ddl) != desktop169SQL(want) {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold declaration")
+		}
+		var invalid int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_dispatch_hold h WHERE typeof(held)!='integer' OR held NOT IN (0,1) OR project_id IS NULL OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.id=h.project_id)`).Scan(&invalid); err != nil {
+			return err
+		}
+		if invalid != 0 {
+			return fmt.Errorf("desktop schema compatibility: invalid dispatch hold rows")
+		}
+	}
 	var journal int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='goose_db_version' AND type='table'`).Scan(&journal); err != nil || journal == 0 {
 		return err
 	}
+	// A later independent migration (e.g. 0217) says nothing about whether
+	// 0170 ran. Goose owns out-of-order application and rollback semantics.
+	var holdApplied int
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=170 ORDER BY id DESC LIMIT 1),0)`).Scan(&holdApplied); err != nil {
+		return err
+	}
+	if holdApplied == 1 && holdObjects == 0 {
+		return fmt.Errorf("desktop schema compatibility: migration 170 claimed without dispatch hold table")
+	}
 	version, err := goose.GetDBVersionContext(ctx, db)
 	if err != nil || version <= 156 {
 		return err
+	}
+	// A source migration above the observed desktop journal does not turn a
+	// native database into the foreign-169 lineage, or erase that lineage on
+	// upgrade. Goose owns source version numbers; inspect effective foreign
+	// claims separately without rewriting any journal row.
+	sources, err := goose.CollectMigrations("migrations", 0, goose.MaxVersion)
+	if err != nil {
+		return err
+	}
+	nativeVersions := make(map[int64]bool, len(sources))
+	for _, source := range sources {
+		nativeVersions[source.Version] = true
+	}
+	foreignVersion, err := func() (foreignVersion int64, resultErr error) {
+		claims, err := db.QueryContext(ctx, `SELECT version_id FROM goose_db_version
+		WHERE id IN (SELECT MAX(id) FROM goose_db_version GROUP BY version_id)
+		  AND is_applied = 1 AND version_id > 156`)
+		if err != nil {
+			return 0, err
+		}
+		// Release the iterator before later queries, including on scan failure.
+		defer func() { resultErr = errors.Join(resultErr, claims.Close()) }()
+		for claims.Next() {
+			var claimed int64
+			if err := claims.Scan(&claimed); err != nil {
+				return 0, err
+			}
+			if !nativeVersions[claimed] && claimed > foreignVersion {
+				foreignVersion = claimed
+			}
+		}
+		return foreignVersion, claims.Err()
+	}()
+	if err != nil {
+		return err
+	}
+	if foreignVersion == 0 {
+		// Native forward history retains native schema repair rules, but an
+		// occupied CDC name must pass the same preflight before any writes.
+		var hidden int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='hidden_at'`).Scan(&hidden); err != nil {
+			return err
+		}
+		return checkDesktop169SessionTriggers(ctx, db, hidden == 0, false, 0)
+	}
+	if foreignVersion != 169 {
+		return fmt.Errorf("desktop schema compatibility: unqualified foreign journal version %d; expected observed lineage 169", foreignVersion)
 	}
 	for v := 150; v <= 156; v++ {
 		var applied int
@@ -167,12 +251,12 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 		if err != nil {
 			return err
 		}
+		defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
 		columnCount, ordered := 0, true
 		for rows.Next() {
 			var cid, hidden int
 			var name string
 			if err := rows.Scan(&cid, &name, &hidden); err != nil {
-				_ = rows.Close()
 				return err
 			}
 			if columnCount >= len(wantColumns) || cid != columnCount || hidden != 0 || name != wantColumns[columnCount] {
@@ -181,7 +265,6 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 			columnCount++
 		}
 		err = rows.Err()
-		_ = rows.Close()
 		if err != nil {
 			return err
 		}
@@ -238,17 +321,16 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 	if err != nil {
 		return err
 	}
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
 	var indexColumns []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			_ = rows.Close()
 			return err
 		}
 		indexColumns = append(indexColumns, name)
 	}
 	err = rows.Err()
-	_ = rows.Close()
 	if err != nil {
 		return err
 	}
@@ -302,14 +384,16 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 	}
 	// The later schema reconciliation also replaces CDC on restart. Validate
 	// its known owner/behavior even when no historical SQL needs replay.
-	if err := checkDesktop169SessionTriggers(ctx, db, plan[150], plan[153], version); err != nil {
+	if err := checkDesktop169SessionTriggers(ctx, db, plan[150], plan[153], foreignVersion); err != nil {
 		return err
 	}
 	if !needed {
-		return nil
+		// Normalize only the qualified owner/SQL, transactionally, before
+		// Goose can advance the journal to a forward source migration.
+		return reconcileSessionHiddenCDCTrigger(db)
 	}
 	if version != 169 {
-		return fmt.Errorf("desktop schema compatibility: unqualified foreign journal version %d; expected observed lineage 169", version)
+		return fmt.Errorf("desktop schema compatibility: missing historical effects at version %d; replay requires exact checkpoint 169", version)
 	}
 	// The physical terminal backfill requires the original revision fence.
 	if plan[153] {
@@ -346,7 +430,7 @@ created_at TIMESTAMP NOT NULL, resolved_at TIMESTAMP)`
 	if _, err := provider.Up(ctx); err != nil {
 		return fmt.Errorf("desktop schema compatibility: replay absent source effects: %w", err)
 	}
-	return nil
+	return reconcileSessionHiddenCDCTrigger(db)
 }
 
 // Token equality is a conservative declaration allowlist, not a SQL parser or
@@ -393,23 +477,22 @@ func checkDesktop169NotificationIndexes(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-func checkDesktop169NotificationDependencies(ctx context.Context, db *sql.DB) error {
+func checkDesktop169NotificationDependencies(ctx context.Context, db *sql.DB) (resultErr error) {
 	rows, err := db.QueryContext(ctx, `SELECT type,name,sql FROM sqlite_master WHERE type IN ('view','trigger')`)
 	if err != nil {
 		return err
 	}
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
 	var views []string
 	for rows.Next() {
 		var kind, name, ddl string
 		if err := rows.Scan(&kind, &name, &ddl); err != nil {
-			_ = rows.Close()
 			return err
 		}
 		// Conservative text containment covers quoted/case-folded references,
 		// including triggers on other owners and the first view in a chain.
 		// False positives (e.g. literals/comments) require lineage review.
 		if strings.Contains(strings.ToLower(ddl), "notifications") {
-			_ = rows.Close()
 			return fmt.Errorf("desktop schema compatibility: possible notifications dependency in %s %s", kind, name)
 		}
 		if kind == "view" {
@@ -417,23 +500,22 @@ func checkDesktop169NotificationDependencies(ctx context.Context, db *sql.DB) er
 		}
 	}
 	err = rows.Err()
-	_ = rows.Close()
 	if err != nil {
 		return err
 	}
-	// SQLite's ALTER TABLE validates unrelated views too. Prepare each without
-	// reading rows so an existing broken view cannot cause a late replay error.
+	// SQLite resolves a view's SELECT while inspecting its columns, without
+	// reading view rows. Bind the name as data rather than interpolating an SQL
+	// identifier, preserving rejection of broken prerequisite views.
 	for _, name := range views {
-		rows, err := db.QueryContext(ctx, `SELECT * FROM "`+strings.ReplaceAll(name, `"`, `""`)+`" LIMIT 0`)
-		if err != nil {
+		var columns int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_xinfo(?)`, name).Scan(&columns); err != nil {
 			return fmt.Errorf("desktop schema compatibility: invalid prerequisite view %s: %w", name, err)
 		}
-		_ = rows.Close()
 	}
 	return nil
 }
 
-func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissing, terminalMissing bool, journalVersion int64) error {
+func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissing, terminalMissing bool, journalVersion int64) (resultErr error) {
 	var temporary int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_temp_master`).Scan(&temporary); err != nil {
 		return err
@@ -475,12 +557,19 @@ func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissi
 		canonical = strings.Replace(canonical, "OR OLD.hidden_at IS NOT NEW.hidden_at", "OR OLD.hidden_at IS NOT NEW.hidden_at OR OLD.provision_state <> NEW.provision_state", 1)
 		canonical = strings.Replace(canonical, "'hiddenAt', NEW.hidden_at", "'hiddenAt', NEW.hidden_at, 'provisionState', NEW.provision_state", 1)
 	}
+	// An absent name may reach the existing transactional restoration after
+	// all backfill dependencies have been checked. An occupied name must
+	// identify the exact canonical owner, including identifier spelling.
+	var count, owned int
 	var actual string
-	if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='sessions' AND name='sessions_cdc_update'`).Scan(&actual); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(type='trigger' AND tbl_name='sessions' AND name='sessions_cdc_update'),0),COALESCE(MAX(sql),'') FROM sqlite_master WHERE name='sessions_cdc_update' COLLATE NOCASE`).Scan(&count, &owned, &actual); err != nil {
 		return err
 	}
+	if count != 0 && (count != 1 || owned != 1) {
+		return fmt.Errorf("desktop schema compatibility: foreign session CDC owner; refusing replacement")
+	}
 	knownHistorical := journalVersion == 169 && !hiddenMissing && provisioning != 0 && desktop169SQL(actual) == desktop169SQL(historical150)
-	if desktop169SQL(actual) != desktop169SQL(canonical) && !knownHistorical {
+	if count != 0 && desktop169SQL(actual) != desktop169SQL(canonical) && !knownHistorical {
 		return fmt.Errorf("desktop schema compatibility: foreign session CDC behavior; refusing replacement")
 	}
 	if !terminalMissing {
@@ -490,7 +579,7 @@ func checkDesktop169SessionTriggers(ctx context.Context, db *sql.DB, hiddenMissi
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
 	for rows.Next() {
 		var name, ddl string
 		if err := rows.Scan(&name, &ddl); err != nil {

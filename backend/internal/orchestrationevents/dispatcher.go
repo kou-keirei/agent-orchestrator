@@ -29,8 +29,18 @@ const (
 	tuiRetryAttempts  = 2
 )
 
+// ErrDispatchHeld means no new automatic submission was admitted.
+var ErrDispatchHeld = errors.New("orchestration dispatch held")
+
+// ErrReportDeliveryHeld is a durable safe hold, not provider or semantic ACK.
+var ErrReportDeliveryHeld = ports.ErrWorkerReportDeliveryHeld
+
 // Store is the durable outbox surface required by Dispatcher.
 type Store interface {
+	ports.WorkerReportDeliveryStore
+	GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error)
+	OrchestrationDispatchHeld(context.Context, domain.ProjectID) (bool, error)
+	WithOrchestrationDispatch(context.Context, domain.ProjectID, func() error) error
 	ListSessions(context.Context, domain.ProjectID) ([]domain.SessionRecord, error)
 	ListDueOrchestrationEvents(context.Context, domain.ProjectID, time.Time, int) ([]domain.OrchestrationEvent, error)
 	ListOrchestrationEventsRequiringAttention(context.Context, domain.ProjectID) ([]domain.OrchestrationEvent, error)
@@ -56,6 +66,7 @@ type Batch struct {
 }
 
 // Submission distinguishes a transport write from exact turn admission.
+// Neither field proves a parent's semantic reconciliation of a worker report.
 type Submission struct{ Submitted, Acknowledged bool }
 
 // Dispatcher leases and submits due events for one project.
@@ -71,10 +82,33 @@ type Dispatcher struct {
 }
 
 // DispatchProject performs at most one bounded delivery attempt.
-func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.ProjectID) error {
+func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.ProjectID) (err error) {
+	held, err := d.Store.OrchestrationDispatchHeld(ctx, project)
+	if err != nil {
+		return err
+	}
+	if held {
+		return ErrDispatchHeld
+	}
 	now := time.Now().UTC()
 	if d.Now != nil {
 		now = d.Now()
+	}
+	reportsHeld, err := d.Store.HoldWorkerReportDeliveries(ctx, project, now)
+	if err != nil {
+		return err
+	}
+	// Independent legacy work still runs. Preserve a real failure rather than
+	// masking it with a hold that startup recovery intentionally tolerates.
+	defer func() {
+		if err == nil && reportsHeld {
+			err = ErrReportDeliveryHeld
+		}
+	}()
+	if reportsHeld {
+		if err := d.ReconcileAttention(ctx, project, now); err != nil {
+			return err
+		}
 	}
 	events, err := d.Store.ListDueOrchestrationEvents(ctx, project, now, MaxBatchEvents)
 	if err != nil || len(events) == 0 {
@@ -84,11 +118,52 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	// original submission. Keep the durable batch membership stable so the
 	// client id never names a different payload on retry.
 	events = stableBatchEvents(events)
-	target, ok, err := d.destination(ctx, project)
-	if err != nil {
-		return err
+	for _, event := range events {
+		if event.ProjectID != project {
+			return fmt.Errorf("orchestration event project mismatch")
+		}
+		// Defense at the transport boundary, including a stale or alternate
+		// store implementation. Never split an already bound mixed payload.
+		if event.Kind == domain.OrchestrationWorkerReport {
+			return ErrReportDeliveryHeld
+		}
+	}
+	// A token and destination are assigned together by the first lease. Retry
+	// must consume that exact pair, including after reclaim or explicit rearm.
+	destination := events[0].DestinationSessionID
+	token := events[0].LeaseToken
+	if (token == "" && destination != "") || strings.TrimSpace(token) != token {
+		return fmt.Errorf("incomplete orchestration batch binding")
+	}
+	deadLetter := false
+	for _, event := range events {
+		if event.LeaseToken != token || event.DestinationSessionID != destination ||
+			(token == "" && (event.AttemptCount != 0 || !event.SubmittedAt.IsZero())) ||
+			(token != "" && event.ProjectID != project) {
+			return fmt.Errorf("inconsistent orchestration batch binding")
+		}
+		if event.State == domain.OrchestrationDeadLetter {
+			deadLetter = true
+		}
+	}
+	var target domain.SessionRecord
+	var ok bool
+	// Older reclaim/rearm code retained the token but erased the destination.
+	// That identity cannot be recovered safely. Hold the persisted batch without
+	// discovering a replacement or turning this legacy state into a startup error.
+	// A retained token can also span pending/dead_letter after per-event expiry.
+	// Hold the entire payload, even with a live recorded destination, until an
+	// explicit retry rearms its dead-letter members. Never lease or ACK a subset.
+	if !deadLetter && (token == "" || destination != "") {
+		target, ok, err = d.destination(ctx, project, destination)
+		if err != nil {
+			return err
+		}
 	}
 	if !ok {
+		// Unavailable destinations are a durable hold, including exact recorded
+		// targets. Leave the batch binding and attempts intact so recovery can
+		// continue with other projects and retry this target when it is ready.
 		changed, markErr := d.Store.MarkProjectNoDestinationAttention(ctx, project, now)
 		if markErr != nil {
 			return markErr
@@ -114,30 +189,34 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	if err := d.Store.LeaseOrchestrationEvents(ctx, ids, batchID, target.ID, now.Add(LeaseDuration)); err != nil {
 		return err
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
-	defer cancel()
-	result, submitErr := d.Transport.Submit(attemptCtx, target, Batch{ID: batchID, Payload: payload, EventIDs: ids})
-	if result.Submitted {
-		if err := d.Store.MarkOrchestrationEventsSubmitted(ctx, ids, batchID, now); err != nil {
+	// The store serializes this final admission with explicit hold activation.
+	// A hold that wins after leasing leaves the original lease untouched.
+	return d.Store.WithOrchestrationDispatch(ctx, project, func() error {
+		attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
+		defer cancel()
+		result, submitErr := d.Transport.Submit(attemptCtx, target, Batch{ID: batchID, Payload: payload, EventIDs: ids})
+		if result.Submitted {
+			if err := d.Store.MarkOrchestrationEventsSubmitted(ctx, ids, batchID, now); err != nil {
+				return err
+			}
+		}
+		if submitErr != nil {
+			if err := d.Store.RetryOrchestrationEvents(ctx, events, batchID, sanitizeError(submitErr), now, target.Mode); err != nil {
+				return err
+			}
+			if events[0].AttemptCount+1 >= retryAttemptLimit(target.Mode) || now.Sub(events[0].EnqueuedAt) >= 15*time.Minute {
+				return d.notifyAttentionForEvents(ctx, events, now)
+			}
+			return nil
+		}
+		if !result.Acknowledged {
+			return nil
+		}
+		if err := d.Store.AcknowledgeOrchestrationEvents(ctx, ids, batchID, now); err != nil {
 			return err
 		}
-	}
-	if submitErr != nil {
-		if err := d.Store.RetryOrchestrationEvents(ctx, events, batchID, sanitizeError(submitErr), now, target.Mode); err != nil {
-			return err
-		}
-		if events[0].AttemptCount+1 >= retryAttemptLimit(target.Mode) || now.Sub(events[0].EnqueuedAt) >= 15*time.Minute {
-			return d.notifyAttentionForEvents(ctx, events, now)
-		}
-		return nil
-	}
-	if !result.Acknowledged {
-		return nil
-	}
-	if err := d.Store.AcknowledgeOrchestrationEvents(ctx, ids, batchID, now); err != nil {
-		return err
-	}
-	return d.resolveAttention(ctx, events, now)
+		return d.resolveAttention(ctx, events, now)
+	})
 }
 
 // ReconcileAttention recreates the human-visible side of every durable
@@ -167,7 +246,7 @@ func (d *Dispatcher) reconcileAttentionForEvents(ctx context.Context, events []d
 			ordered = append(ordered, group)
 		}
 		group.events = append(group.events, event)
-		if event.State != domain.OrchestrationAcknowledged {
+		if event.Kind == domain.OrchestrationWorkerReport || event.State != domain.OrchestrationAcknowledged {
 			group.acknowledged = false
 		}
 	}
@@ -210,10 +289,25 @@ func (d *Dispatcher) resolveAttention(ctx context.Context, events []domain.Orche
 	if d.Notifier == nil {
 		return nil
 	}
+	unresolved := map[domain.SessionID]bool{}
+	if len(events) > 0 {
+		attention, err := d.Store.ListOrchestrationEventsRequiringAttention(ctx, events[0].ProjectID)
+		if err != nil {
+			return err
+		}
+		for _, event := range attention {
+			if event.Kind == domain.OrchestrationWorkerReport || event.State != domain.OrchestrationAcknowledged {
+				unresolved[event.WorkerID] = true
+			}
+		}
+	}
 	seen := map[domain.SessionID]bool{}
 	idsByWorker := map[domain.SessionID][]string{}
 	var workers []domain.SessionID
 	for _, event := range events {
+		if unresolved[event.WorkerID] {
+			continue
+		}
 		idsByWorker[event.WorkerID] = append(idsByWorker[event.WorkerID], event.ID)
 		if seen[event.WorkerID] {
 			continue
@@ -232,12 +326,29 @@ func (d *Dispatcher) resolveAttention(ctx context.Context, events []domain.Orche
 	return nil
 }
 
-func (d *Dispatcher) destination(ctx context.Context, project domain.ProjectID) (domain.SessionRecord, bool, error) {
-	sessions, err := d.Store.ListSessions(ctx, project)
-	if err != nil {
-		return domain.SessionRecord{}, false, err
+func (d *Dispatcher) destination(ctx context.Context, project domain.ProjectID, recorded domain.SessionID) (domain.SessionRecord, bool, error) {
+	var sessions []domain.SessionRecord
+	if recorded != "" {
+		// Retry uses an exact native lookup, never replacement discovery.
+		s, found, err := d.Store.GetSession(ctx, recorded)
+		if err != nil || !found {
+			return domain.SessionRecord{}, false, err
+		}
+		if s.ID != recorded || s.ProjectID != project {
+			return domain.SessionRecord{}, false, nil
+		}
+		sessions = []domain.SessionRecord{s}
+	} else {
+		var err error
+		sessions, err = d.Store.ListSessions(ctx, project)
+		if err != nil {
+			return domain.SessionRecord{}, false, err
+		}
 	}
 	for _, s := range sessions {
+		if s.ProjectID != project {
+			return domain.SessionRecord{}, false, fmt.Errorf("orchestration destination project mismatch")
+		}
 		if s.Kind != domain.KindOrchestrator || s.IsTerminated {
 			continue
 		}

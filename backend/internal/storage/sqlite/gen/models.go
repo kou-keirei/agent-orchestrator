@@ -302,6 +302,15 @@ type ConversationQueuedEditDelivery struct {
 	CreatedAt       time.Time
 }
 
+type ConversationSendAttempt struct {
+	TurnID               string
+	ConversationID       string
+	State                string
+	ControllerGeneration string
+	ReservedAt           sql.NullTime
+	NonDeliveryEvidence  string
+}
+
 type ConversationSteerDelivery struct {
 	ConversationID   string
 	ClientMessageID  string
@@ -388,6 +397,7 @@ type OrchestrationEvent struct {
 	AcknowledgedAt       sql.NullTime
 	AttentionRequiredAt  sql.NullTime
 	LastError            string
+	WorkerReportID       sql.NullString
 }
 
 type OrchestrationSourceState struct {
@@ -513,6 +523,11 @@ type Project struct {
 	ArchivedAt    sql.NullTime
 	Config        sql.NullString
 	Kind          string
+}
+
+type ProjectDispatchHold struct {
+	ProjectID string
+	Held      int64
 }
 
 type Review struct {
@@ -748,6 +763,44 @@ type UsageSource struct {
 	NextRetryAt     sql.NullTime
 	LastErrorCode   string
 	UpdatedAt       time.Time
+}
+
+type WorkItem struct {
+	ID                      string
+	AttemptID               string
+	ProjectID               string
+	Repository              string
+	ExecutionBaseSha        string
+	OriginalParentSessionID string
+	OriginalWorkerSessionID string
+	OriginalNativeSessionID string
+	OwnerSessionID          string
+	OwnerGeneration         int64
+	WorktreePath            string
+	Branch                  string
+}
+
+type WorkItemLease struct {
+	WorkItemID      string
+	OwnerGeneration int64
+	Revision        int64
+	LeaseID         string
+	DurationMs      int64
+	ExpiresAtMs     int64
+	AllowedEffects  string
+	State           string
+}
+
+type WorkerReport struct {
+	ID              string
+	WorkItemID      string
+	AttemptID       string
+	OwnerGeneration int64
+	ReportType      string
+	Envelope        string
+	EventID         string
+	SourceRevision  string
+	AcceptedAtMs    int64
 }
 
 type WorkspaceRepo struct {

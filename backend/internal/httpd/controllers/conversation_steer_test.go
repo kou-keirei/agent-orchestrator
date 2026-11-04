@@ -253,6 +253,14 @@ func TestSteerOrSendRouteReturnsAtomicOutcome(t *testing.T) {
 	}
 }
 
+func TestSteerOrSendRouteRefusesExclusiveOperation(t *testing.T) {
+	svc := &steerStub{fakeConversationService: &fakeConversationService{}, atomicErr: ports.ErrChatInputBlocked}
+	status, _, body := postSteerOrSend(t, svc, map[string]any{"text": "peer", "clientMessageId": "peer"})
+	if status != http.StatusConflict || body.Code != "CHAT_INPUT_BLOCKED" || len(svc.atomicSeen) != 1 {
+		t.Fatalf("status=%d error=%+v calls=%d", status, body, len(svc.atomicSeen))
+	}
+}
+
 // 202, not 200: the provider takes the guidance and acts on it at its next model
 // boundary. The body names the turn it joined so a client can attach it.
 func TestSteerRouteAcceptsGuidanceAndNamesTheTurn(t *testing.T) {

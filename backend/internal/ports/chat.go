@@ -724,7 +724,8 @@ type (
 	}
 )
 
-// ChatTurnRef identifies a turn the provider accepted.
+// ChatTurnRef identifies a provider turn, or a locally prepared deferred turn.
+// A deferred reference alone is not evidence of native acceptance.
 type ChatTurnRef struct {
 	ProviderTurnID string
 }
@@ -744,6 +745,15 @@ type ChatDeferredTurnStarter interface {
 	// correlation id. No provider request has started at this point.
 	DiscardDeferredTurn(providerTurnID string)
 }
+
+// ChatTurnAcceptance waits for a correlated native response. Deferred drivers
+// must implement this before a caller can acknowledge semantic delivery.
+type ChatTurnAcceptance interface {
+	WaitTurnAccepted(context.Context, string) error
+}
+
+// ErrChatInputBlocked refuses external writes during an exclusive operation.
+var ErrChatInputBlocked = errors.New("chat input is blocked by a session operation")
 
 // ChatDecisionOption is one choice the provider says is valid for a pending
 // request. Providers vary the offered set per request — some do not offer a

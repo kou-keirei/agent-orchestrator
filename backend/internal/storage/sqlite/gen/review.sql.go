@@ -911,6 +911,34 @@ func (q *Queries) MarkReviewRunDelivered(ctx context.Context, arg MarkReviewRunD
 	return result.RowsAffected()
 }
 
+const settleReviewRun = `-- name: SettleReviewRun :execrows
+UPDATE review_run SET status = ?1, verdict = '', body = ?2, github_review_id = '', auto_inject_review = ?3
+WHERE id = ?4 AND status = 'running'
+  AND (?1 = 'failed' OR ?1 = 'cancelled')
+`
+
+type SettleReviewRunParams struct {
+	Status           domain.ReviewRunStatus
+	Body             string
+	AutoInjectReview bool
+	ID               string
+}
+
+// Failure before launch acceptance and predecessor cancellation after replacement
+// do not assert fresh reviewer authority. This path cannot record a verdict.
+func (q *Queries) SettleReviewRun(ctx context.Context, arg SettleReviewRunParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, settleReviewRun,
+		arg.Status,
+		arg.Body,
+		arg.AutoInjectReview,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const supersedeStaleRunningReviewRuns = `-- name: SupersedeStaleRunningReviewRuns :execrows
 UPDATE review_run SET status = 'failed', body = ? WHERE session_id = ? AND pr_url = ? AND target_sha != ? AND status = 'running' AND verdict = ''
 `
@@ -991,7 +1019,15 @@ func (q *Queries) UpdateReviewAgentSessionID(ctx context.Context, arg UpdateRevi
 }
 
 const updateReviewRunResult = `-- name: UpdateReviewRunResult :execrows
-UPDATE review_run SET status = ?, verdict = ?, body = ?, github_review_id = ?, auto_inject_review = ? WHERE id = ? AND status = 'running'
+UPDATE review_run SET status = ?, verdict = ?, body = ?, github_review_id = ?, auto_inject_review = ?
+WHERE review_run.id = ? AND review_run.status = 'running'
+  AND EXISTS (
+      SELECT 1 FROM review
+      WHERE review.id = review_run.review_id
+        AND review.session_id = review_run.session_id
+        AND review.harness = review_run.harness
+        AND review.reviewer_launch_id = review_run.launch_id
+  )
 `
 
 type UpdateReviewRunResultParams struct {

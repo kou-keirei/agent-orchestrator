@@ -57,7 +57,7 @@ type Service struct {
 	onCodexCapacityChanged func(domain.SessionID, string, ports.CodexCapacityObservation)
 	stopProviderHost       func(context.Context, domain.SessionID) error
 	restoreController      func(context.Context, domain.SessionID) error
-	acquireSessionInput    func(domain.SessionID) (func(), bool)
+	admitInput             func(context.Context, domain.SessionID, string) (func(), error)
 
 	mu           sync.RWMutex
 	controllers  map[domain.SessionID]*Controller
@@ -993,29 +993,22 @@ func (s *Service) requireChatSession(ctx context.Context, id domain.SessionID) (
 	return record, nil
 }
 
-// SetSessionInputAdmission is wired before serving, alongside the restorer.
-// The manager owns the lease; Chat acquires it only after selecting a controller.
-func (s *Service) SetSessionInputAdmission(acquire func(domain.SessionID) (func(), bool)) {
-	s.acquireSessionInput = acquire
-}
-
-// Send delivers a message through the same admission boundary as manager relay.
+// Send delivers a message to a session's agent.
 func (s *Service) Send(
 	ctx context.Context,
 	id domain.SessionID,
 	msg ports.ChatUserMessage,
 ) (domain.ConversationTurn, error) {
-	var admit func() (func(), error)
-	if s.acquireSessionInput != nil {
-		admit = func() (func(), error) {
-			release, ok := s.acquireSessionInput(id)
-			if !ok {
-				return nil, ErrControllerHandoff
-			}
-			return release, nil
-		}
+	if s.admitInput == nil {
+		return s.sendWithAdmission(ctx, id, msg, nil)
 	}
-	return s.sendWithAdmission(ctx, id, msg, admit)
+	return s.sendWithAdmission(ctx, id, msg, func() (func(), error) {
+		controller, err := s.Controller(id)
+		if err != nil {
+			return nil, err
+		}
+		return s.admitInput(ctx, id, controller.Generation())
+	})
 }
 
 func (s *Service) sendWithAdmission(
@@ -1035,42 +1028,11 @@ func (s *Service) sendWithAdmission(
 	}
 	defer release()
 	if admit != nil {
-		selected, err := s.requireChatSession(ctx, id)
-		if err != nil {
-			return domain.ConversationTurn{}, err
-		}
-		s.mu.RLock()
-		cfg := s.startConfigs[id]
-		s.mu.RUnlock()
-		if selected.ID != id || selected.IsTerminated ||
-			selected.ControllerOwner() != cfg.ExpectedControllerOwner ||
-			selected.Metadata.WorkspacePath != cfg.WorkspacePath ||
-			selected.Metadata.ControllerGeneration != controller.Generation() ||
-			selected.Metadata.ProviderConversationID != controller.ProviderConversationID() {
-			return domain.ConversationTurn{}, ErrControllerHandoff
-		}
-		releaseInput, err := admit()
+		releaseInput, err := s.acquireControllerInput(ctx, id, controller, admit)
 		if err != nil {
 			return domain.ConversationTurn{}, err
 		}
 		defer releaseInput()
-		current, err := s.requireChatSession(ctx, id)
-		if err != nil {
-			return domain.ConversationTurn{}, err
-		}
-		if current.ID != id || current.ControllerOwner() != selected.ControllerOwner() ||
-			current.Metadata.RuntimeHandleID != selected.Metadata.RuntimeHandleID ||
-			current.Metadata.WorkspacePath != selected.Metadata.WorkspacePath ||
-			current.Metadata.WorkspaceRepoPath != selected.Metadata.WorkspaceRepoPath {
-			return domain.ConversationTurn{}, ErrControllerHandoff
-		}
-		live, err := s.Controller(id)
-		if err != nil || live != controller || controller.State() == ports.ChatControllerStopped {
-			return domain.ConversationTurn{}, ErrControllerHandoff
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return domain.ConversationTurn{}, err
 	}
 	return controller.Send(ctx, msg)
 }
@@ -1728,10 +1690,11 @@ func (s *Service) SetConfigOption(
 	if err != nil {
 		return nil, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	configurer, ok := controller.conv.(ports.ChatConfigOptionController)
 	if !ok {
 		return nil, ErrConfigOptionsUnsupported
@@ -1836,10 +1799,11 @@ func (s *Service) Compact(ctx context.Context, id domain.SessionID) (ports.ChatC
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return ports.ChatCompactionResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return ports.ChatCompactionResult{}, err
 	}
+	defer release()
 	return controller.Compact(ctx)
 }
 
@@ -1861,10 +1825,11 @@ func (s *Service) ReloadMCPServers(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return nil, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return controller.ReloadMCPServers(ctx)
 }
 
@@ -1879,10 +1844,11 @@ func (s *Service) RetryTurn(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return domain.ConversationTurn{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return domain.ConversationTurn{}, err
 	}
+	defer release()
 	result, err := controller.RetryTurn(ctx, turnID)
 	if err != nil {
 		return domain.ConversationTurn{}, err
@@ -1902,10 +1868,11 @@ func (s *Service) SetTurnSettings(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return domain.ConversationSettings{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return domain.ConversationSettings{}, err
 	}
+	defer release()
 	controller.configMu.Lock()
 	defer controller.configMu.Unlock()
 	// The turn-settings endpoint does not own provider session mode choices.
@@ -1933,7 +1900,8 @@ func (s *Service) RelayChatTurn(ctx context.Context, id domain.SessionID, text s
 // RelayChatTurnWithID is RelayChatTurn with a durable caller-supplied
 // idempotency key. Interface-transition outbox retries use it so a crash after
 // provider acceptance but before the outbox acknowledgement cannot create a
-// duplicate Chat turn.
+// duplicate Chat turn. Ordinary relays use the same restore-then-input-admission
+// path as human sends; switch-owned and automation admission have separate APIs.
 func (s *Service) RelayChatTurnWithID(
 	ctx context.Context,
 	id domain.SessionID,
@@ -1953,9 +1921,6 @@ func (s *Service) RelayChatTurnWithID(
 // RelayChatTurnWithAdmission retains automation's position in the same input
 // order as human sends. Admission rechecks manager facts and acquires its input
 // lease after restoration, holding it until the durable send has completed.
-// A nonempty returned ID additionally proves this call received a provider turn
-// ID. Queued and duplicate inputs remain successful durable admissions, but do
-// not supply a positive dispatch result to callers waiting for target ACK.
 func (s *Service) RelayChatTurnWithAdmission(
 	ctx context.Context,
 	id domain.SessionID,
@@ -1965,9 +1930,6 @@ func (s *Service) RelayChatTurnWithAdmission(
 	turn, err := s.sendWithAdmission(ctx, id, ports.ChatUserMessage{
 		Text: text, ClientMessageID: clientMessageID, Origin: domain.MessageOriginAutomation,
 	}, admit)
-	if err == nil && turn.ProviderTurnID == "" {
-		return "", nil
-	}
 	return turn.ID, err
 }
 

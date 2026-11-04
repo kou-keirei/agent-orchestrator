@@ -14,6 +14,12 @@ import (
 )
 
 type fakeStore struct {
+	reportsHeld                       bool
+	reportHoldErr                     error
+	reportHoldCalls                   int
+	held                              bool
+	holdErr                           error
+	afterLease                        func()
 	sessions                          []domain.SessionRecord
 	events                            []domain.OrchestrationEvent
 	attentionEvents                   []domain.OrchestrationEvent
@@ -21,14 +27,58 @@ type fakeStore struct {
 	cleared                           []string
 	destination                       domain.SessionID
 	leaseErr, submitErr, ackErr       error
+	getErr                            error
 	attentionChanged                  int64
+	sessionLists                      int
 }
 
-func (f *fakeStore) ListSessions(context.Context, domain.ProjectID) ([]domain.SessionRecord, error) {
-	return f.sessions, nil
+func (f *fakeStore) HoldWorkerReportDeliveries(context.Context, domain.ProjectID, time.Time) (bool, error) {
+	f.reportHoldCalls++
+	return f.reportsHeld, f.reportHoldErr
 }
-func (f *fakeStore) ListDueOrchestrationEvents(context.Context, domain.ProjectID, time.Time, int) ([]domain.OrchestrationEvent, error) {
-	return f.events, nil
+
+func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
+	if f.getErr != nil {
+		return domain.SessionRecord{}, false, f.getErr
+	}
+	for _, s := range f.sessions {
+		if s.ID == id {
+			return s, true, nil
+		}
+	}
+	return domain.SessionRecord{}, false, nil
+}
+
+func (f *fakeStore) OrchestrationDispatchHeld(context.Context, domain.ProjectID) (bool, error) {
+	return f.held, f.holdErr
+}
+func (f *fakeStore) WithOrchestrationDispatch(_ context.Context, _ domain.ProjectID, fn func() error) error {
+	if f.holdErr != nil {
+		return f.holdErr
+	}
+	if f.held {
+		return ErrDispatchHeld
+	}
+	return fn()
+}
+func (f *fakeStore) ListSessions(_ context.Context, p domain.ProjectID) ([]domain.SessionRecord, error) {
+	f.sessionLists++
+	out := slices.Clone(f.sessions)
+	for i := range out {
+		if out[i].ProjectID == "" {
+			out[i].ProjectID = p
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) ListDueOrchestrationEvents(_ context.Context, p domain.ProjectID, _ time.Time, _ int) ([]domain.OrchestrationEvent, error) {
+	out := slices.Clone(f.events)
+	for i := range out {
+		if out[i].ProjectID == "" {
+			out[i].ProjectID = p
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) ListOrchestrationEventsRequiringAttention(context.Context, domain.ProjectID) ([]domain.OrchestrationEvent, error) {
 	return f.attentionEvents, nil
@@ -39,6 +89,9 @@ func (f *fakeStore) LeaseOrchestrationEvents(_ context.Context, ids []string, _ 
 	}
 	f.leased = ids
 	f.destination = d
+	if f.afterLease != nil {
+		f.afterLease()
+	}
 	return nil
 }
 func (f *fakeStore) MarkOrchestrationEventsSubmitted(_ context.Context, ids []string, _ string, _ time.Time) error {
@@ -117,6 +170,9 @@ func TestChatRetryReusesStableBatchIdentityAfterLeaseRecovery(t *testing.T) {
 	if first == "" {
 		t.Fatal("first batch id is empty")
 	}
+	// Model the durable binding written by the first lease and retained on retry.
+	store.events[0].LeaseToken = first
+	store.events[0].DestinationSessionID = "o"
 	if err := d.DispatchProject(context.Background(), "p"); err != nil {
 		t.Fatal(err)
 	}
@@ -189,12 +245,12 @@ func TestReclaimedBatchCannotChangePayloadAtPromptBounds(t *testing.T) {
 			now := time.Now().UTC()
 			events := make([]domain.OrchestrationEvent, count)
 			for i := range events {
-				events[i] = domain.OrchestrationEvent{ID: strconv.Itoa(i), LeaseToken: "reclaimed", Kind: domain.OrchestrationWorkerBlocked}
+				events[i] = domain.OrchestrationEvent{ID: strconv.Itoa(i), ProjectID: "p", LeaseToken: "reclaimed", DestinationSessionID: "o", Kind: domain.OrchestrationWorkerBlocked}
 			}
 			if count == 1 {
 				events[0].ID = strings.Repeat("x", MaxPayloadBytes)
 			}
-			store := &fakeStore{events: events, sessions: []domain.SessionRecord{{ID: "o", Kind: domain.KindOrchestrator, Mode: domain.SessionModeChat, FirstSignalAt: now}}}
+			store := &fakeStore{events: events, sessions: []domain.SessionRecord{{ID: "o", ProjectID: "p", Kind: domain.KindOrchestrator, Mode: domain.SessionModeChat, FirstSignalAt: now}}}
 			transport := &fakeTransport{}
 			if err := (&Dispatcher{Store: store, Transport: transport}).DispatchProject(context.Background(), "p"); err == nil {
 				t.Fatal("oversized reclaimed payload was accepted")
@@ -438,5 +494,130 @@ func TestPromptIsBoundedAndExcludesUntrustedProviderText(t *testing.T) {
 	}
 	if !strings.Contains(payload, "grants no permission or authorization") {
 		t.Fatal("authorization warning absent")
+	}
+}
+
+func TestRetryDestinationFence(t *testing.T) {
+	now := time.Now().UTC()
+	original := domain.SessionRecord{ID: "original", ProjectID: "p", Kind: domain.KindOrchestrator, Mode: domain.SessionModeChat, Activity: domain.Activity{State: domain.ActivityIdle}, FirstSignalAt: now}
+	replacement := original
+	replacement.ID = "replacement"
+	for _, tc := range []struct {
+		name    string
+		change  func(*fakeStore)
+		wantOK  bool
+		wantErr bool
+	}{
+		{"retained_destination", func(*fakeStore) {}, true, false},
+		{"retired_with_eligible_replacement", func(s *fakeStore) { s.sessions[1].IsTerminated = true }, false, false},
+		{"missing_with_eligible_replacement", func(s *fakeStore) { s.sessions = s.sessions[:1] }, false, false},
+		{"changed_kind", func(s *fakeStore) { s.sessions[1].Kind = domain.KindWorker }, false, false},
+		{"changed_project", func(s *fakeStore) { s.sessions[1].ProjectID = "foreign" }, false, false},
+		{"blocked", func(s *fakeStore) { s.sessions[1].Activity.State = domain.ActivityBlocked }, false, false},
+		{"startup_pending", func(s *fakeStore) { s.sessions[1].FirstSignalAt = time.Time{} }, false, false},
+		{"unknown_mode", func(s *fakeStore) { s.sessions[1].Mode = "future" }, false, false},
+		{"missing_member_destination", func(s *fakeStore) { s.events[1].DestinationSessionID = "" }, false, true},
+		{"legacy_missing_destination", func(s *fakeStore) {
+			for i := range s.events {
+				s.events[i].DestinationSessionID = ""
+			}
+		}, false, false},
+		{"legacy_mixed_age_dead_letter_and_pending", func(s *fakeStore) {
+			for i := range s.events {
+				s.events[i].DestinationSessionID = ""
+				s.events[i].AttemptCount = 1
+			}
+			s.events[0].State = domain.OrchestrationDeadLetter
+			s.events[0].EnqueuedAt = now.Add(-15*time.Minute - time.Second)
+			s.events[0].AttentionRequiredAt = now
+			s.events[1].State = domain.OrchestrationPending
+			s.events[1].EnqueuedAt = now.Add(-15*time.Minute + time.Second)
+		}, false, false},
+		{"inconsistent_member_destination", func(s *fakeStore) { s.events[1].DestinationSessionID = "replacement" }, false, true},
+		{"bound_mixed_age_dead_letter_and_pending", func(s *fakeStore) {
+			s.events[0].State = domain.OrchestrationDeadLetter
+			s.events[0].EnqueuedAt = now.Add(-15*time.Minute - time.Second)
+			s.events[0].AttentionRequiredAt = now
+			s.events[1].State = domain.OrchestrationPending
+			s.events[1].EnqueuedAt = now.Add(-15*time.Minute + time.Second)
+		}, false, false},
+		{"missing_retry_token", func(s *fakeStore) {
+			for i := range s.events {
+				s.events[i].LeaseToken = ""
+			}
+		}, false, true},
+		{"missing_retry_binding", func(s *fakeStore) {
+			for i := range s.events {
+				s.events[i].LeaseToken = ""
+				s.events[i].DestinationSessionID = ""
+				s.events[i].AttemptCount = 1
+			}
+		}, false, true},
+		{"padded_token", func(s *fakeStore) {
+			for i := range s.events {
+				s.events[i].LeaseToken = " batch "
+			}
+		}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{sessions: []domain.SessionRecord{replacement, original}, events: []domain.OrchestrationEvent{
+				{ID: "a", ProjectID: "p", LeaseToken: "batch", DestinationSessionID: original.ID, EnqueuedAt: now},
+				{ID: "b", ProjectID: "p", LeaseToken: "batch", DestinationSessionID: original.ID, EnqueuedAt: now},
+			}}
+			tc.change(store)
+			transport := &fakeTransport{result: Submission{Submitted: true, Acknowledged: true}}
+			d := Dispatcher{Store: store, Transport: transport, Now: func() time.Time { return now }, NewID: func() string { t.Fatal("retry allocated a new batch token"); return "" }}
+			err := d.DispatchProject(context.Background(), "p")
+			if store.sessionLists != 0 {
+				t.Fatal("retry scanned sessions for a replacement")
+			}
+			if tc.wantOK {
+				if err != nil || transport.calls != 1 || transport.target != original.ID || store.destination != original.ID || transport.batch.ID != "batch" || len(store.acked) != 2 {
+					t.Fatalf("err=%v calls=%d target=%s lease=%s batch=%s acked=%v", err, transport.calls, transport.target, store.destination, transport.batch.ID, store.acked)
+				}
+			} else if (err != nil) != tc.wantErr || transport.calls != 0 || len(store.leased) != 0 || len(store.acked) != 0 {
+				t.Fatalf("fence err=%v calls=%d leased=%v acked=%v", err, transport.calls, store.leased, store.acked)
+			}
+		})
+	}
+}
+
+func TestRecoverRecordedDestinationLookupErrorFailsClosed(t *testing.T) {
+	want := errors.New("session lookup unavailable")
+	store := &fakeStore{getErr: want, events: []domain.OrchestrationEvent{{ID: "e", ProjectID: "p", LeaseToken: "batch", DestinationSessionID: "original"}}}
+	transport := &fakeTransport{}
+	d := &Dispatcher{Store: store, Transport: transport}
+	err := Recover(context.Background(), &recoveryStoreFake{projects: []domain.ProjectRecord{{ID: "p"}}}, d)
+	if !errors.Is(err, want) || transport.calls != 0 || len(store.leased) != 0 {
+		t.Fatalf("lookup failure err=%v calls=%d leased=%v", err, transport.calls, store.leased)
+	}
+}
+
+func TestDispatchHoldBoundaries(t *testing.T) {
+	for _, phase := range []string{"held", "unknown", "after-lease", "wrong-event", "wrong-destination"} {
+		t.Run(phase, func(t *testing.T) {
+			now := time.Now()
+			s := &fakeStore{sessions: []domain.SessionRecord{{ID: "o", ProjectID: "p", Kind: domain.KindOrchestrator, Mode: domain.SessionModeChat, Activity: domain.Activity{State: domain.ActivityIdle}, FirstSignalAt: now}}, events: []domain.OrchestrationEvent{{ID: "e", ProjectID: "p", EnqueuedAt: now}}}
+			switch phase {
+			case "held":
+				s.held = true
+			case "unknown":
+				s.holdErr = errors.New("database unavailable")
+			case "after-lease":
+				s.afterLease = func() { s.held = true }
+			case "wrong-event":
+				s.events[0].ProjectID = "other"
+			case "wrong-destination":
+				s.sessions[0].ProjectID = "other"
+			}
+			tr := &fakeTransport{}
+			err := (&Dispatcher{Store: s, Transport: tr}).DispatchProject(context.Background(), "p")
+			if err == nil || tr.calls != 0 || len(s.retried) != 0 || len(s.acked) != 0 {
+				t.Fatalf("err=%v sends=%d retries=%v acks=%v", err, tr.calls, s.retried, s.acked)
+			}
+			if phase != "after-lease" && len(s.leased) != 0 {
+				t.Fatal("unexpected lease")
+			}
+		})
 	}
 }

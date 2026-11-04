@@ -206,6 +206,7 @@ func TestSend_SteerFailureDoesNotSilentlyQueue(t *testing.T) {
 		status int
 		code   string
 	}{
+		{name: "switch owns input", status: http.StatusConflict, code: "CHAT_INPUT_BLOCKED"},
 		{name: "unsupported", status: http.StatusConflict, code: "CHAT_STEER_UNSUPPORTED"},
 		{name: "provider failure", status: http.StatusBadGateway, code: "CHAT_PROVIDER_FAILED"},
 	}

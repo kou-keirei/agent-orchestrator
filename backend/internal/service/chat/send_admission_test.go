@@ -33,15 +33,19 @@ func (r *w168SessionReader) GetSession(ctx context.Context, id domain.SessionID)
 	return rec, found, err
 }
 
-func w168AdmissionFixture(t *testing.T) (*chatsvc.Service, *fakeConversation, *sqlite.Store, *w168SessionReader, *chatsvc.Controller) {
+func w168AdmissionFixture(t *testing.T, conversations ...ports.ChatConversation) (*chatsvc.Service, *fakeConversation, *sqlite.Store, *w168SessionReader, *chatsvc.Controller) {
 	t.Helper()
 	st := openStore(t)
 	reader := &w168SessionReader{Store: st}
 	provider := newFakeConversation()
+	var conversation ports.ChatConversation = provider
+	if len(conversations) != 0 {
+		conversation = conversations[0]
+	}
 	var seq atomic.Int64
 	svc := chatsvc.New(chatsvc.Options{
 		Store: st, Sessions: reader, Reader: fullSnapshotReader(st),
-		Drivers: fakeRegistry{driver: fakeDriver{conv: provider}},
+		Drivers: fakeRegistry{driver: fakeDriver{conv: conversation}},
 		NewID:   func() string { return fmt.Sprintf("w168-%d", seq.Add(1)) },
 	})
 	workspace := t.TempDir()
@@ -92,16 +96,16 @@ func TestW168HTTPAdmissionRejectsStaleSelectionWithoutDispatch(t *testing.T) {
 			if which == "already stale" {
 				reader.mutate = mutate
 			}
-			svc.SetSessionInputAdmission(func(domain.SessionID) (func(), bool) {
+			svc.SetInputAdmission(func(context.Context, domain.SessionID, string) (func(), error) {
 				if which == "refused" {
-					return nil, false
+					return nil, ports.ErrChatInputBlocked
 				}
 				acquired++
 				reader.mutate = mutate
 				if which == "cancel" {
 					cancel()
 				}
-				return func() { released++ }, true
+				return func() { released++ }, nil
 			})
 			request := httptest.NewRequest(http.MethodPost, "/sessions/p1-1/conversation/messages", strings.NewReader(`{"text":"refuse stale send","clientMessageId":"w168-stale"}`)).WithContext(ctx)
 			response := httptest.NewRecorder()
@@ -137,9 +141,9 @@ func TestW168HTTPAdmissionDedupAndRelayUseOneLease(t *testing.T) {
 		}
 		return func() { active--; released++ }, nil
 	}
-	svc.SetSessionInputAdmission(func(domain.SessionID) (func(), bool) {
+	svc.SetInputAdmission(func(context.Context, domain.SessionID, string) (func(), error) {
 		release, _ := lease()
-		return release, true
+		return release, nil
 	})
 	provider.onSend = func(string) {
 		if active != 1 {
@@ -171,9 +175,9 @@ func TestW168DirectAdmissionReleasesOnProviderFailure(t *testing.T) {
 	svc, provider, _, _, ctrl := w168AdmissionFixture(t)
 	provider.sendErr = errors.New("synthetic provider failure")
 	active := 0
-	svc.SetSessionInputAdmission(func(domain.SessionID) (func(), bool) {
+	svc.SetInputAdmission(func(context.Context, domain.SessionID, string) (func(), error) {
 		active++
-		return func() { active-- }, true
+		return func() { active-- }, nil
 	})
 	_, err := svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "fail", ClientMessageID: "w168-fail"})
 	if err == nil || active != 0 {
@@ -187,12 +191,12 @@ func TestW168DirectAdmissionReleasesOnProviderFailure(t *testing.T) {
 func TestW168AdmissionRefusesControllerStoppedDuringLease(t *testing.T) {
 	svc, provider, st, _, ctrl := w168AdmissionFixture(t)
 	released := false
-	svc.SetSessionInputAdmission(func(domain.SessionID) (func(), bool) {
+	svc.SetInputAdmission(func(context.Context, domain.SessionID, string) (func(), error) {
 		if err := provider.Close(); err != nil {
 			t.Fatal(err)
 		}
 		ctrl.Wait()
-		return func() { released = true }, true
+		return func() { released = true }, nil
 	})
 	_, err := svc.Send(context.Background(), testSession, ports.ChatUserMessage{Text: "stopped", ClientMessageID: "w168-stopped"})
 	if !errors.Is(err, chatsvc.ErrControllerHandoff) || !released {
@@ -207,10 +211,10 @@ func TestW168AdmissionRefusesControllerStoppedDuringLease(t *testing.T) {
 	}
 }
 
-func TestW186OrderedRelayReturnsPositiveIDOnlyForProviderDispatch(t *testing.T) {
+func TestSwitchRelayRequiresFreshProviderDispatch(t *testing.T) {
 	svc, provider, st, _, ctrl := w168AdmissionFixture(t)
-	admit := func() (func(), error) { return func() {}, nil }
-	id, err := svc.RelayChatTurnWithAdmission(context.Background(), testSession, "first", "w186-first", admit)
+	validate := func() error { return nil }
+	id, err := svc.RelayChatTurnAccepted(context.Background(), testSession, "first", "w186-first", ctrl.Generation(), validate)
 	if err != nil || id == "" {
 		t.Fatalf("positive provider result: id=%q err=%v", id, err)
 	}
@@ -218,8 +222,8 @@ func TestW186OrderedRelayReturnsPositiveIDOnlyForProviderDispatch(t *testing.T) 
 		{"first", "w186-first"},   // Duplicate: no positive result for this call.
 		{"queued", "w186-queued"}, // Durable admission while busy is not provider ACK.
 	} {
-		id, err := svc.RelayChatTurnWithAdmission(context.Background(), testSession, tc.text, tc.key, admit)
-		if err != nil || id != "" {
+		id, err := svc.RelayChatTurnAccepted(context.Background(), testSession, tc.text, tc.key, ctrl.Generation(), validate)
+		if !errors.Is(err, domain.ErrConversationSendUncertain) {
 			t.Fatalf("%s returned positive dispatch: id=%q err=%v", tc.key, id, err)
 		}
 	}

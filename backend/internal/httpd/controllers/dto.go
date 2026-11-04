@@ -1602,6 +1602,7 @@ type AgentInstallJobsResponse struct {
 	Jobs []systeminstall.Job `json:"jobs"`
 }
 
+// OrchestrationEventResponse describes an orchestration event and its delivery state.
 type OrchestrationEventResponse struct {
 	ID                   string                            `json:"id"`
 	ProjectID            domain.ProjectID                  `json:"projectId"`
@@ -1619,15 +1620,38 @@ type OrchestrationEventResponse struct {
 	AttentionRequiredAt  *time.Time                        `json:"attentionRequiredAt,omitempty"`
 	LastError            string                            `json:"lastError,omitempty"`
 }
+
+// ListOrchestrationEventsResponse contains the requested orchestration events.
 type ListOrchestrationEventsResponse struct {
 	Events []OrchestrationEventResponse `json:"events"`
 }
+
+// ListOrchestrationEventsQuery sets the maximum number of events to return.
 type ListOrchestrationEventsQuery struct {
 	Limit int `query:"limit,omitempty" minimum:"1" maximum:"100"`
 }
+
+// RetryOrchestrationEventResponse reports whether an explicit retry was scheduled.
 type RetryOrchestrationEventResponse struct {
 	Retried bool `json:"retried"`
 }
+
+// SetOrchestrationDispatchHoldRequest explicitly holds or releases automatic dispatch.
+type SetOrchestrationDispatchHoldRequest struct {
+	Held *bool `json:"held" required:"true" nullable:"false"`
+}
+
+// OrchestrationDispatchHoldResponse reports local automatic dispatch state.
+// HELD describes local automatic dispatch only, never provider/native-turn
+// quiescence. OUTSTANDING_DELIVERY requires separate operator reconciliation.
+type OrchestrationDispatchHoldResponse struct {
+	ProjectID             domain.ProjectID `json:"projectId"`
+	Held                  bool             `json:"held"`
+	OutstandingEventCount int              `json:"outstandingEventCount"`
+	State                 string           `json:"state" enum:"UNHELD,HELD,OUTSTANDING_DELIVERY"`
+}
+
+// OrchestrationEventIDParam identifies an event in the request path.
 type OrchestrationEventIDParam struct {
 	EventID string `path:"eventId"`
 }
@@ -2425,6 +2449,7 @@ type ChatDispatchConformance struct {
 	Variant           ChatDispatchVariant  `json:"variant"`
 }
 
+// ChatDispatchEvidence describes dispatch values and their evidence provenance.
 type ChatDispatchEvidence struct {
 	Model                  string `json:"model,omitempty"`
 	Effort                 string `json:"effort,omitempty"`
@@ -2437,6 +2462,7 @@ type ChatDispatchEvidence struct {
 	ProviderRejected       bool   `json:"providerRejected"`
 }
 
+// ChatDispatchVariant describes the observed dispatch variant and its availability.
 type ChatDispatchVariant struct {
 	Value        string `json:"value,omitempty"`
 	Availability string `json:"availability,omitempty"`

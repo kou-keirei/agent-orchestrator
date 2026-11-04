@@ -107,10 +107,11 @@ func (s *Service) Steer(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return SteerResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return SteerResult{}, err
 	}
+	defer release()
 	return controller.Steer(ctx, msg)
 }
 
@@ -161,6 +162,13 @@ func (s *Service) SteerOrSend(
 		return SteerOrSendResult{}, err
 	}
 	defer release()
+	if !recoverOnly {
+		releaseInput, err := s.acquireInput(ctx, id)
+		if err != nil {
+			return SteerOrSendResult{}, err
+		}
+		defer releaseInput()
+	}
 	return controller.SteerOrSend(ctx, msg, recoverOnly)
 }
 
@@ -174,10 +182,11 @@ func (s *Service) PromoteQueuedTurn(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return PromoteQueuedTurnResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return PromoteQueuedTurnResult{}, err
 	}
+	defer release()
 	if _, ok := controller.conv.(ports.ChatSteerer); !ok {
 		return PromoteQueuedTurnResult{}, ErrSteerUnsupported
 	}
@@ -198,6 +207,9 @@ func (c *Controller) PromoteQueuedTurn(
 	defer c.sendMu.Unlock()
 	if c.handoffActive() {
 		return PromoteQueuedTurnResult{}, ErrControllerHandoff
+	}
+	if err := c.guardOrdinarySend(ctx); err != nil {
+		return PromoteQueuedTurnResult{}, err
 	}
 
 	source, err := c.store.TurnByID(ctx, turnID)
@@ -372,6 +384,9 @@ func (c *Controller) steerLocked(ctx context.Context, msg ports.ChatUserMessage)
 				persistContext: "persist interface-transition refusal",
 			})
 	}
+	if err := c.guardOrdinarySend(ctx); err != nil {
+		return SteerResult{}, err
+	}
 	steerer, ok := c.conv.(ports.ChatSteerer)
 	if !ok {
 		return c.rejectSteerBeforeDispatch(ctx, msg.ClientMessageID, requestJSON,
@@ -475,6 +490,9 @@ func (c *Controller) SteerOrSend(
 		if err != nil {
 			return SteerOrSendResult{}, fmt.Errorf("recover sent turn: %w", err)
 		}
+		if err := c.confirmTurnDelivery(ctx, turn); err != nil {
+			return SteerOrSendResult{Turn: turn}, err
+		}
 		return SteerOrSendResult{Duplicate: true, Turn: turn}, nil
 	}
 
@@ -513,9 +531,11 @@ func (c *Controller) SteerOrSend(
 		}
 	}
 
-	turn, err := c.sendLocked(ctx, msg, false)
+	// A steer refusal does not settle the known running turn. Admit untouched
+	// work behind it; only correlated terminal projection may drain this row.
+	turn, err := c.sendLocked(ctx, msg, true)
 	if err != nil {
-		return SteerOrSendResult{}, err
+		return SteerOrSendResult{Turn: turn}, err
 	}
 	return SteerOrSendResult{Turn: turn}, nil
 }
