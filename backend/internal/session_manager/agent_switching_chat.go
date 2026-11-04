@@ -563,7 +563,7 @@ func (m *Manager) executeChatAgentSwitch(
 	}
 	recorder.durable(result)
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.relayChatSwitchAccepted(
+	if err := m.relayChatSwitchAccepted(
 		ctx, store, result); err != nil {
 		recorder.userImpact = domain.AgentSwitchUserImpactDeliveryUnknown
 		return result, fmt.Errorf("switch Chat agent %s: deliver continuation: %w", id, errors.Join(ErrSwitchDeliveryUnconfirmed, err))
@@ -810,7 +810,7 @@ func (m *Manager) recoverActivatedChatAgentSwitch(
 		return false, err
 	}
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.relayChatSwitchAccepted(
+	if err := m.relayChatSwitchAccepted(
 		ctx, store, current); err != nil {
 		recorder.userImpact = domain.AgentSwitchUserImpactDeliveryUnknown
 		_, failErr := m.failAgentSwitchWithRecorder(ctx, store, current, domain.AgentSwitchErrorDeliveryUnconfirmed, recorder)
@@ -931,12 +931,12 @@ func (m *Manager) resolveChatTargetActivationOutcome(
 }
 
 // The launcher must distinguish provider acceptance from local preparation.
-func (m *Manager) relayChatSwitchAccepted(ctx context.Context, store ports.AgentSwitchStore, sw domain.AgentSwitch) (string, error) {
+func (m *Manager) relayChatSwitchAccepted(ctx context.Context, store ports.AgentSwitchStore, sw domain.AgentSwitch) error {
 	launcher, ok := m.chat.(interface {
 		RelayChatTurnAccepted(context.Context, domain.SessionID, string, string, string, func() error) (string, error)
 	})
 	if !ok {
-		return "", domain.ErrConversationSendUncertain
+		return domain.ErrConversationSendUncertain
 	}
 	validateOwner := func() error {
 		if err := ctx.Err(); err != nil {
@@ -975,6 +975,7 @@ func (m *Manager) relayChatSwitchAccepted(ctx context.Context, store ports.Agent
 		}
 		return nil
 	}
-	return launcher.RelayChatTurnAccepted(ctx, sw.SessionID, aoTargetActivationPrompt,
+	_, err := launcher.RelayChatTurnAccepted(ctx, sw.SessionID, aoTargetActivationPrompt,
 		chatSwitchActivationMessageID(sw.ID), string(sw.TargetGenerationID), validateOwner)
+	return err
 }
