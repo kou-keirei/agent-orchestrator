@@ -8,8 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 type reportStoreStub struct {

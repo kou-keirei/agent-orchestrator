@@ -144,6 +144,7 @@ func lazyChatFixtureWithPermission(t *testing.T, permission ports.PermissionMode
 		LookPath: func(string) (string, error) { return "/bin/true", nil }, Logger: slog.New(slog.DiscardHandler),
 	})
 	svc.SetControllerRestorer(manager.EnsureChatController)
+	svc.SetInputAdmission(manager.AcquireChatInput)
 	return manager, svc, st, driver, rec
 }
 

@@ -57,6 +57,7 @@ type Service struct {
 	onCodexCapacityChanged func(domain.SessionID, string, ports.CodexCapacityObservation)
 	stopProviderHost       func(context.Context, domain.SessionID) error
 	restoreController      func(context.Context, domain.SessionID) error
+	admitInput             func(context.Context, domain.SessionID, string) (func(), error)
 
 	mu           sync.RWMutex
 	controllers  map[domain.SessionID]*Controller
@@ -998,7 +999,16 @@ func (s *Service) Send(
 	id domain.SessionID,
 	msg ports.ChatUserMessage,
 ) (domain.ConversationTurn, error) {
-	return s.sendWithAdmission(ctx, id, msg, nil)
+	if s.admitInput == nil {
+		return s.sendWithAdmission(ctx, id, msg, nil)
+	}
+	return s.sendWithAdmission(ctx, id, msg, func() (func(), error) {
+		controller, err := s.Controller(id)
+		if err != nil {
+			return nil, err
+		}
+		return s.admitInput(ctx, id, controller.Generation())
+	})
 }
 
 func (s *Service) sendWithAdmission(
@@ -1018,7 +1028,7 @@ func (s *Service) sendWithAdmission(
 	}
 	defer release()
 	if admit != nil {
-		releaseInput, err := admit()
+		releaseInput, err := s.acquireControllerInput(ctx, id, controller, admit)
 		if err != nil {
 			return domain.ConversationTurn{}, err
 		}
@@ -1680,10 +1690,11 @@ func (s *Service) SetConfigOption(
 	if err != nil {
 		return nil, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	configurer, ok := controller.conv.(ports.ChatConfigOptionController)
 	if !ok {
 		return nil, ErrConfigOptionsUnsupported
@@ -1788,10 +1799,11 @@ func (s *Service) Compact(ctx context.Context, id domain.SessionID) (ports.ChatC
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return ports.ChatCompactionResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return ports.ChatCompactionResult{}, err
 	}
+	defer release()
 	return controller.Compact(ctx)
 }
 
@@ -1813,10 +1825,11 @@ func (s *Service) ReloadMCPServers(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return nil, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return controller.ReloadMCPServers(ctx)
 }
 
@@ -1831,10 +1844,11 @@ func (s *Service) RetryTurn(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return domain.ConversationTurn{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return domain.ConversationTurn{}, err
 	}
+	defer release()
 	result, err := controller.RetryTurn(ctx, turnID)
 	if err != nil {
 		return domain.ConversationTurn{}, err
@@ -1854,10 +1868,11 @@ func (s *Service) SetTurnSettings(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return domain.ConversationSettings{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return domain.ConversationSettings{}, err
 	}
+	defer release()
 	controller.configMu.Lock()
 	defer controller.configMu.Unlock()
 	// The turn-settings endpoint does not own provider session mode choices.
@@ -1885,7 +1900,8 @@ func (s *Service) RelayChatTurn(ctx context.Context, id domain.SessionID, text s
 // RelayChatTurnWithID is RelayChatTurn with a durable caller-supplied
 // idempotency key. Interface-transition outbox retries use it so a crash after
 // provider acceptance but before the outbox acknowledgement cannot create a
-// duplicate Chat turn.
+// duplicate Chat turn. Ordinary relays use the same restore-then-input-admission
+// path as human sends; switch-owned and automation admission have separate APIs.
 func (s *Service) RelayChatTurnWithID(
 	ctx context.Context,
 	id domain.SessionID,

@@ -34,7 +34,7 @@ func newWorkerCommand(ctx *commandContext) *cobra.Command {
 		Use:   "report --file <path|->",
 		Short: "Accept a v1 report and enqueue it durably; does not prove parent ACK",
 		Args:  usageArgs(cobra.NoArgs),
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) (returnErr error) {
 			if file == "" {
 				return usageError{fmt.Errorf("--file is required (use - for stdin)")}
 			}
@@ -44,7 +44,11 @@ func newWorkerCommand(ctx *commandContext) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				defer f.Close()
+				defer func() {
+					if err := f.Close(); err != nil && returnErr == nil {
+						returnErr = err
+					}
+				}()
 				input = f
 			}
 			body, err := io.ReadAll(io.LimitReader(input, (1<<20)+1))
