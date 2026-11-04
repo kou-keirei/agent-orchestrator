@@ -53,7 +53,7 @@ func (s *Store) CreateSession(ctx context.Context, rec domain.SessionRecord) (do
 // UpdateSession writes the full mutable state of an existing session. The
 // id/project/num/created_at are immutable and not touched here. Presentation
 // visibility is intentionally excluded: lifecycle callers may hold a stale
-// SessionRecord, so hidden_at is persisted only through SetSessionHidden.
+// SessionRecord, so hidden_at is persisted only through narrow visibility writes.
 func (s *Store) UpdateSession(ctx context.Context, rec domain.SessionRecord) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -274,6 +274,40 @@ func (s *Store) SetSessionHidden(ctx context.Context, id domain.SessionID, hidde
 		return false, fmt.Errorf("set session hidden %s: %w", id, err)
 	}
 	return rows > 0, nil
+}
+
+// SessionVisibilityStaleWriteError means no row matched the expected revision,
+// including when the session no longer exists. It does not imply a current
+// revision or visibility value; callers must read a fresh snapshot to retry.
+type SessionVisibilityStaleWriteError struct {
+	SessionID        domain.SessionID
+	ExpectedRevision int64
+}
+
+func (e *SessionVisibilityStaleWriteError) Error() string {
+	return fmt.Sprintf("set session hidden %s: stale revision %d", e.SessionID, e.ExpectedRevision)
+}
+
+// SetSessionHiddenIfRevision atomically updates presentation-only visibility
+// when the database row still has expectedRevision. Every matched write,
+// including an unchanged value, consumes that revision via the existing trigger.
+// Repeating a consumed request returns SessionVisibilityStaleWriteError without
+// writing or emitting CDC. No lifecycle, recency, or controller facts are written.
+func (s *Store) SetSessionHiddenIfRevision(ctx context.Context, id domain.SessionID, expectedRevision int64, hiddenAt *time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.SetSessionHiddenIfRevision(ctx, gen.SetSessionHiddenIfRevisionParams{
+		HiddenAt:         timePtrToNullTime(hiddenAt),
+		ID:               id,
+		ExpectedRevision: expectedRevision,
+	})
+	if err != nil {
+		return fmt.Errorf("set session hidden if revision %s: %w", id, err)
+	}
+	if rows == 0 {
+		return &SessionVisibilityStaleWriteError{SessionID: id, ExpectedRevision: expectedRevision}
+	}
+	return nil
 }
 
 // ClearSessionHiddenIfUnchanged clears visibility only when the activation

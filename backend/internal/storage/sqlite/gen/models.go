@@ -764,6 +764,32 @@ type UsageSource struct {
 	UpdatedAt       time.Time
 }
 
+type WorkItem struct {
+	ID                      string
+	AttemptID               string
+	ProjectID               string
+	Repository              string
+	ExecutionBaseSha        string
+	OriginalParentSessionID string
+	OriginalWorkerSessionID string
+	OriginalNativeSessionID string
+	OwnerSessionID          string
+	OwnerGeneration         int64
+	WorktreePath            string
+	Branch                  string
+}
+
+type WorkItemLease struct {
+	WorkItemID      string
+	OwnerGeneration int64
+	Revision        int64
+	LeaseID         string
+	DurationMs      int64
+	ExpiresAtMs     int64
+	AllowedEffects  string
+	State           string
+}
+
 type WorkspaceRepo struct {
 	ProjectID     domain.ProjectID
 	Name          string

@@ -145,6 +145,10 @@ func TestLegacy169Compatibility(t *testing.T) {
 	if err := migrate(db); err != nil {
 		t.Fatal(err)
 	}
+	var journalUpgraded string
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalUpgraded); err != nil {
+		t.Fatal(err)
+	}
 	for table, columns := range map[string][]string{
 		"sessions":                    {"hidden_at", "terminal_revision", "provision_state"},
 		"review_run":                  {"target_binding_json", "reviewer_provenance_json", "launch_id", "provider_native_session_id", "provider_native_first_turn_id", "provider_native_completion_id", "provider_native_observed_at"},
@@ -201,11 +205,14 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	if latest > 169 {
-		if latest != 217 || forwardClaims != "170:1|217:1" {
+		if latest != 219 || forwardClaims != "170:1|217:1|218:1|219:1" {
 			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
 		}
 	} else if forwardClaims != "" {
 		t.Fatalf("unexpected claims beyond frozen historical journal: %s", forwardClaims)
+	}
+	if err := db.QueryRow(`SELECT group_concat(id||':'||version_id||':'||is_applied||':'||tstamp,'|') FROM goose_db_version`).Scan(&journalAfter); err != nil || journalAfter != journalUpgraded {
+		t.Fatalf("restart changed upgraded journal: %v", err)
 	}
 	if rows, err := db.Query(`PRAGMA foreign_key_check`); err != nil {
 		t.Fatal(err)
@@ -990,13 +997,13 @@ func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
 
 func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
 	newLegacy169 := legacy169Fixture(t)
-	for _, claim := range []int{171, 218} {
+	for _, claim := range []int{171, 220} {
 		t.Run(strconv.Itoa(claim), func(t *testing.T) {
 			db := historical169DB(t, newLegacy169(t), true)
 			if err := migrate(db); err != nil {
 				t.Fatal(err)
 			}
-			// Unowned claims remain foreign above and below the owned 217 maximum.
+			// Unowned claims remain foreign above and below the owned 219 maximum.
 			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
 			rejectDesktop169Unchanged(t, db)
 		})
@@ -1165,9 +1172,10 @@ func TestSessionCDCAbsenceRejectsDependenciesBeforeWrites(t *testing.T) {
 	}
 }
 
-func TestDispatchHold170AfterReal217(t *testing.T) {
+func TestDispatchHold170AfterReal217AndWorkItem219(t *testing.T) {
 	// Exact W470 composite migration source, rather than a maximum-version
-	// journal-only stand-in. Its independent table and journal survive 0170.
+	// journal-only stand-in, plus accepted WorkItem/lease migrations. Their
+	// independent schema and journal must survive late application of 0170.
 	for _, rolledBack170 := range []bool{false, true} {
 		t.Run(fmt.Sprintf("rolledBack170=%v", rolledBack170), func(t *testing.T) {
 			db := openTestDB(t)
@@ -1188,17 +1196,27 @@ func TestDispatchHold170AfterReal217(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			provider, err := goose.NewProvider(goose.DialectSQLite3, db, fstest.MapFS{
+			forward := fstest.MapFS{
 				"0217_conversation_ordinary_send.sql": &fstest.MapFile{Data: []byte(w470Migration217)},
-			}, goose.WithDisableGlobalRegistry(true))
+			}
+			for _, name := range []string{"0218_work_item_identity.sql", "0219_work_item_lease.sql"} {
+				source, err := migrationsFS.ReadFile("migrations/" + name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				forward[name] = &fstest.MapFile{Data: source}
+			}
+			provider, err := goose.NewProvider(goose.DialectSQLite3, db, forward, goose.WithDisableGlobalRegistry(true))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if _, err := provider.Up(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			mustExec(t, db, `INSERT INTO work_items VALUES ('future-work','future-attempt','future','__root__','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','parent','future-1','native','future-1',3,'/future-work','future-branch')`)
+			mustExec(t, db, `INSERT INTO work_item_leases VALUES ('future-work',3,7,'future-lease',1000,2000,'[]','active')`)
 			// No 0170 table/application exists at this point, even though the
-			// actual independent 0217 has run through Goose.
+			// actual independent 0217/0218/0219 have run through Goose.
 			var applied, tables int
 			if err := db.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=170 ORDER BY id DESC LIMIT 1),0)`).Scan(&applied); err != nil || applied != 0 {
 				t.Fatalf("fixture already applied 170: %d %v", applied, err)

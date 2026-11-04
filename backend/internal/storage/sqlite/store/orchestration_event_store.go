@@ -29,7 +29,11 @@ func withDispatchAdmission(ctx context.Context, project domain.ProjectID, fn fun
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
 	actual, _ := dispatchAdmission.LoadOrStore(project, gate)
-	gate = actual.(chan struct{})
+	var ok bool
+	gate, ok = actual.(chan struct{})
+	if !ok {
+		return fmt.Errorf("invalid orchestration dispatch admission gate")
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -114,7 +118,7 @@ func (s *Store) InitializeOrchestrationDispatchHold(ctx context.Context, project
 			}
 			var held int
 			err = db.QueryRowContext(ctx, `SELECT held FROM project_dispatch_hold WHERE project_id=?`, project).Scan(&held)
-			if err == sql.ErrNoRows && inserted == 0 {
+			if errors.Is(err, sql.ErrNoRows) && inserted == 0 {
 				var exists bool
 				if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)`, project).Scan(&exists); err != nil {
 					return err
