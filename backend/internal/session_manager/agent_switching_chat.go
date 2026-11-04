@@ -563,9 +563,10 @@ func (m *Manager) executeChatAgentSwitch(
 	}
 	recorder.durable(result)
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.chat.RelayChatTurnWithID(
-		ctx, id, aoTargetActivationPrompt, chatSwitchActivationMessageID(result.ID)); err != nil {
-		return result, fmt.Errorf("switch Chat agent %s: deliver continuation: %w", id, err)
+	if err := m.relayChatSwitchAccepted(
+		ctx, store, result); err != nil {
+		recorder.userImpact = domain.AgentSwitchUserImpactDeliveryUnknown
+		return result, fmt.Errorf("switch Chat agent %s: deliver continuation: %w", id, errors.Join(ErrSwitchDeliveryUnconfirmed, err))
 	}
 	acknowledgedAt := m.clock()
 	recorder.boundary(domain.AgentSwitchFailureChatTargetAckCommit)
@@ -809,8 +810,8 @@ func (m *Manager) recoverActivatedChatAgentSwitch(
 		return false, err
 	}
 	recorder.boundary(domain.AgentSwitchFailureChatContinuationRelay)
-	if _, err := m.chat.RelayChatTurnWithID(
-		ctx, rec.ID, aoTargetActivationPrompt, chatSwitchActivationMessageID(current.ID)); err != nil {
+	if err := m.relayChatSwitchAccepted(
+		ctx, store, current); err != nil {
 		recorder.userImpact = domain.AgentSwitchUserImpactDeliveryUnknown
 		_, failErr := m.failAgentSwitchWithRecorder(ctx, store, current, domain.AgentSwitchErrorDeliveryUnconfirmed, recorder)
 		return failErr == nil, failErr
@@ -927,4 +928,54 @@ func (m *Manager) resolveChatTargetActivationOutcome(
 		session.Metadata.ProviderConversationID == source.Metadata.ProviderConversationID &&
 		session.Metadata.ControllerGeneration == activation.ExpectedSourceControllerGeneration
 	return current, false, sourceStillOwns, nil
+}
+
+// The launcher must distinguish provider acceptance from local preparation.
+func (m *Manager) relayChatSwitchAccepted(ctx context.Context, store ports.AgentSwitchStore, sw domain.AgentSwitch) error {
+	launcher, ok := m.chat.(interface {
+		RelayChatTurnAccepted(context.Context, domain.SessionID, string, string, string, func() error) (string, error)
+	})
+	if !ok {
+		return domain.ErrConversationSendUncertain
+	}
+	validateOwner := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		m.agentOpMu.Lock()
+		ownsGate := m.agentOperations[sw.SessionID] == agentOperationSwitch
+		m.agentOpMu.Unlock()
+		if !ownsGate || sw.State != domain.AgentSwitchDelivering || sw.TargetNativeSessionRef == nil {
+			return ErrSwitchInProgress
+		}
+		current, found, err := store.GetActiveAgentSwitch(ctx, sw.SessionID)
+		if err != nil {
+			return err
+		}
+		if !found || current.ID != sw.ID || current.SessionID != sw.SessionID ||
+			current.State != domain.AgentSwitchDelivering || current.TargetAcknowledgedAt != nil ||
+			current.SourceGenerationID != sw.SourceGenerationID || current.TargetGenerationID != sw.TargetGenerationID ||
+			current.TargetGenerationID == "" || current.TargetHarness != sw.TargetHarness ||
+			current.TargetNativeSessionRef == nil || *current.TargetNativeSessionRef != *sw.TargetNativeSessionRef {
+			return ErrSwitchInProgress
+		}
+		rec, found, err := m.store.GetSession(ctx, sw.SessionID)
+		if err != nil {
+			return err
+		}
+		if !found || rec.ID != sw.SessionID || rec.IsTerminated || domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat {
+			return ErrSwitchInProgress
+		}
+		recoverable, err := m.chatTargetNativeIdentityRecoverable(ctx, store, rec, current)
+		if err != nil {
+			return err
+		}
+		if !recoverable {
+			return ErrSwitchInProgress
+		}
+		return nil
+	}
+	_, err := launcher.RelayChatTurnAccepted(ctx, sw.SessionID, aoTargetActivationPrompt,
+		chatSwitchActivationMessageID(sw.ID), string(sw.TargetGenerationID), validateOwner)
+	return err
 }

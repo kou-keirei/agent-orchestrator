@@ -586,3 +586,7 @@ func (c chatLauncher) AbortChatHandoff(id domain.SessionID) {
 func (c chatLauncher) StopChat(ctx context.Context, id domain.SessionID) error {
 	return c.svc.StopChat(ctx, id)
 }
+
+func (l chatLauncher) RelayChatTurnAccepted(ctx context.Context, id domain.SessionID, text, clientMessageID, generation string, validateOwner func() error) (string, error) {
+	return l.svc.RelayChatTurnAccepted(ctx, id, text, clientMessageID, generation, validateOwner)
+}

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
@@ -26,6 +27,42 @@ const (
 var errAgentOperationInProgress = errors.New("session: another exclusive operation is in progress")
 
 var _ sessionguard.InputLease = (*Manager)(nil)
+
+// AcquireChatInput validates the restored controller under the same lease used
+// by every other writer. Chat never uses the TUI switch-decision input exception.
+func (m *Manager) AcquireChatInput(ctx context.Context, id domain.SessionID, generation string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	release, ok := m.AcquireSessionInput(id)
+	if !ok {
+		return nil, errors.Join(ports.ErrChatInputBlocked, ErrSwitchInProgress)
+	}
+	fail := func(err error) (func(), error) { release(); return nil, err }
+	if m.SessionMutationInProgress(id) {
+		return fail(errors.Join(ports.ErrChatInputBlocked, ErrSwitchInProgress))
+	}
+	rec, found, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return fail(err)
+	}
+	if !found {
+		return fail(ErrNotFound)
+	}
+	if rec.IsTerminated {
+		return fail(ErrTerminated)
+	}
+	if rec.Mode != domain.SessionModeChat || generation == "" || rec.Metadata.ControllerGeneration != generation {
+		return fail(ports.ErrChatControllerRestore)
+	}
+	if rec.Activity.State == domain.ActivityExited {
+		return fail(ErrAgentExited)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	return release, nil
+}
 
 // AcquireSessionInput atomically admits one pane write unless an exclusive
 // operation already owns the AO session. The returned release is idempotent;

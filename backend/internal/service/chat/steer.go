@@ -107,10 +107,11 @@ func (s *Service) Steer(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return SteerResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return SteerResult{}, err
 	}
+	defer release()
 	return controller.Steer(ctx, msg)
 }
 
@@ -161,6 +162,13 @@ func (s *Service) SteerOrSend(
 		return SteerOrSendResult{}, err
 	}
 	defer release()
+	if !recoverOnly {
+		releaseInput, err := s.acquireInput(ctx, id)
+		if err != nil {
+			return SteerOrSendResult{}, err
+		}
+		defer releaseInput()
+	}
 	return controller.SteerOrSend(ctx, msg, recoverOnly)
 }
 
@@ -174,10 +182,11 @@ func (s *Service) PromoteQueuedTurn(
 	if _, err := s.requireChatSession(ctx, id); err != nil {
 		return PromoteQueuedTurnResult{}, err
 	}
-	controller, err := s.Controller(id)
+	controller, release, err := s.inputController(ctx, id)
 	if err != nil {
 		return PromoteQueuedTurnResult{}, err
 	}
+	defer release()
 	if _, ok := controller.conv.(ports.ChatSteerer); !ok {
 		return PromoteQueuedTurnResult{}, ErrSteerUnsupported
 	}

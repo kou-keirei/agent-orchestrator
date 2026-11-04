@@ -2903,7 +2903,11 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 			if stoppedSource != nil {
 				// The runtime handle is now durable. Retain the original recovery
 				// diagnosis and history policy for a later strict handoff retry.
-				_, err := m.store.(interfaceTransitionStore).AdvanceSessionInterfaceTransition(ctx,
+				store, ok := m.store.(interfaceTransitionStore)
+				if !ok {
+					return fmt.Errorf("reconcile %s: restore handoff diagnosis: %w", rec.ID, ErrSpawnRecoveryUncertain)
+				}
+				_, err := store.AdvanceSessionInterfaceTransition(ctx,
 					stoppedSource.ID, domain.SessionInterfaceTransitionRecovery, domain.SessionInterfaceTransitionRecovery,
 					stoppedSource.NativeConversationID, stoppedSource.ErrorCode, stoppedSource.ErrorDetail, m.clock())
 				if err != nil {

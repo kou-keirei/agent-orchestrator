@@ -1594,3 +1594,11 @@ func TestSendRefusedForTerminatedChatSession(t *testing.T) {
 		t.Errorf("a terminated session still received %v", launcher.relayed)
 	}
 }
+
+// This eager test launcher models an acknowledged native SendTurn response.
+func (l *recordingLauncher) RelayChatTurnAccepted(ctx context.Context, id domain.SessionID, text, clientMessageID, _ string, validateOwner func() error) (string, error) {
+	if err := validateOwner(); err != nil {
+		return "", err
+	}
+	return l.RelayChatTurnWithID(ctx, id, text, clientMessageID)
+}

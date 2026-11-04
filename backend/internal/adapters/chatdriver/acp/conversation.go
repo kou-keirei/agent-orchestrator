@@ -92,6 +92,7 @@ type conversation struct {
 	sessionID          string
 	capabilities       ports.ChatCapabilities
 	prepared           *preparedTurn
+	promptAcceptance   *promptAcceptance
 	activeTurn         string
 	settlingTurn       string
 	turnCancel         context.CancelFunc
@@ -393,6 +394,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	}
 	id := uuid.NewString()
 	c.prepared = &preparedTurn{id: id, clientMessageID: msg.ClientMessageID, prompt: prompt}
+	c.promptAcceptance = &promptAcceptance{id: id, done: make(chan struct{})}
 	return ports.ChatTurnRef{ProviderTurnID: id}, nil
 }
 
@@ -400,6 +402,7 @@ func (c *conversation) DiscardDeferredTurn(providerTurnID string) {
 	c.mu.Lock()
 	if c.prepared != nil && c.prepared.id == providerTurnID {
 		c.prepared = nil
+		c.settlePromptAcceptanceLocked(providerTurnID, errors.New("ACP prepared prompt was discarded"))
 	}
 	c.mu.Unlock()
 }
@@ -617,6 +620,11 @@ func (c *conversation) finishPrompt(
 	}
 	c.mu.Lock()
 	c.terminalEventID = eventID
+	acceptanceErr := turnErr
+	if state != domain.TurnStateCompleted && acceptanceErr == nil {
+		acceptanceErr = errors.New("ACP prompt did not complete successfully")
+	}
+	c.settlePromptAcceptanceLocked(turnID, acceptanceErr)
 	c.mu.Unlock()
 	c.emit(ports.ChatEvent{
 		Kind: ports.ChatEventTurnCompleted, ProviderEventID: eventID,
@@ -883,6 +891,9 @@ func (c *conversation) closeProvider(terminate bool) error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
+		if c.promptAcceptance != nil {
+			c.settlePromptAcceptanceLocked(c.promptAcceptance.id, errConversationClosed)
+		}
 		persistent := c.proc.terminate != nil
 		c.detaching = persistent && !terminate
 		cancel := c.turnCancel
