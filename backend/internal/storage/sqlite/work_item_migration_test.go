@@ -8,9 +8,7 @@ func TestWorkItemMigrationUpgradeAndRollback(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO projects(id,path,registered_at) VALUES('workitem-project','/fixture',CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	upTo(t, db, 218)
 	const insert = `INSERT INTO work_items(id,attempt_id,project_id,repository,execution_base_sha,
 original_parent_session_id,original_worker_session_id,owner_session_id,owner_generation,worktree_path,branch)
 VALUES('work','attempt','workitem-project','__root__','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','parent','worker','worker',?,'/worktree','branch')`
@@ -26,9 +24,7 @@ VALUES('work','attempt','workitem-project','__root__','aaaaaaaaaaaaaaaaaaaaaaaaa
 	if _, err := db.Exec(`DELETE FROM projects WHERE id='workitem-project'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	upTo(t, db, 218)
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM work_items WHERE id='work' AND owner_generation=1 AND original_native_session_id=''`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("repeated migration lost identity: count=%d, err=%v", count, err)
