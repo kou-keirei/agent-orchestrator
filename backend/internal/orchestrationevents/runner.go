@@ -2,6 +2,7 @@ package orchestrationevents
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -36,7 +37,7 @@ func Recover(ctx context.Context, store RecoveryStore, dispatcher *Dispatcher) e
 		if err := dispatcher.ReconcileAttention(ctx, domain.ProjectID(p.ID), time.Now().UTC()); err != nil {
 			return err
 		}
-		if err := dispatcher.DispatchProject(ctx, domain.ProjectID(p.ID)); err != nil {
+		if err := dispatcher.DispatchProject(ctx, domain.ProjectID(p.ID)); err != nil && !errors.Is(err, ErrDispatchHeld) {
 			return err
 		}
 	}
@@ -61,7 +62,7 @@ func Run(ctx context.Context, store RecoveryStore, dispatcher *Dispatcher, wake 
 		case <-ctx.Done():
 			return
 		case project := <-wake:
-			if err := dispatcher.DispatchProject(ctx, project); err != nil {
+			if err := dispatcher.DispatchProject(ctx, project); err != nil && !errors.Is(err, ErrDispatchHeld) {
 				log.Warn("orchestration dispatch failed", "projectID", project, "error", err)
 			}
 		case <-timer.C:

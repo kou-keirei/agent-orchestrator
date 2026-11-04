@@ -19,9 +19,45 @@ import (
 // absent effects of the unchanged embedded migrations are eligible for replay.
 // Inspect the entire plan before writing; partial/colliding shapes need review.
 func reconcileDesktop169(ctx context.Context, db *sql.DB) (resultErr error) {
+	// Inspect before any historical replay or Goose migration can write. Adopt
+	// an unshipped candidate table only with the exact declaration and valid
+	// existing operator rows; never replace its hold/release decisions.
+	var holdObjects int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='project_dispatch_hold' COLLATE NOCASE`).Scan(&holdObjects); err != nil {
+		return err
+	}
+	if holdObjects != 0 {
+		var ddl string
+		if holdObjects != 1 {
+			return fmt.Errorf("desktop schema compatibility: conflicting dispatch hold objects")
+		}
+		if err := db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE name='project_dispatch_hold' AND type='table'`).Scan(&ddl); err != nil {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold owner: %w", err)
+		}
+		const want = `CREATE TABLE project_dispatch_hold (project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, held INTEGER NOT NULL CHECK (held IN (0, 1)))`
+		if desktop169SQL(ddl) != desktop169SQL(want) {
+			return fmt.Errorf("desktop schema compatibility: foreign dispatch hold declaration")
+		}
+		var invalid int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_dispatch_hold h WHERE typeof(held)!='integer' OR held NOT IN (0,1) OR project_id IS NULL OR NOT EXISTS (SELECT 1 FROM projects p WHERE p.id=h.project_id)`).Scan(&invalid); err != nil {
+			return err
+		}
+		if invalid != 0 {
+			return fmt.Errorf("desktop schema compatibility: invalid dispatch hold rows")
+		}
+	}
 	var journal int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='goose_db_version' AND type='table'`).Scan(&journal); err != nil || journal == 0 {
 		return err
+	}
+	// A later independent migration (e.g. 0217) says nothing about whether
+	// 0170 ran. Goose owns out-of-order application and rollback semantics.
+	var holdApplied int
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=170 ORDER BY id DESC LIMIT 1),0)`).Scan(&holdApplied); err != nil {
+		return err
+	}
+	if holdApplied == 1 && holdObjects == 0 {
+		return fmt.Errorf("desktop schema compatibility: migration 170 claimed without dispatch hold table")
 	}
 	version, err := goose.GetDBVersionContext(ctx, db)
 	if err != nil || version <= 156 {
@@ -63,7 +99,13 @@ func reconcileDesktop169(ctx context.Context, db *sql.DB) (resultErr error) {
 		return err
 	}
 	if foreignVersion == 0 {
-		return nil // Native forward history retains native schema repair rules.
+		// Native forward history retains native schema repair rules, but an
+		// occupied CDC name must pass the same preflight before any writes.
+		var hidden int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='hidden_at'`).Scan(&hidden); err != nil {
+			return err
+		}
+		return checkDesktop169SessionTriggers(ctx, db, hidden == 0, false, 0)
 	}
 	if foreignVersion != 169 {
 		return fmt.Errorf("desktop schema compatibility: unqualified foreign journal version %d; expected observed lineage 169", foreignVersion)
