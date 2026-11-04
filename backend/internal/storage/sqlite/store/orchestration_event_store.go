@@ -12,11 +12,147 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
+
+// The daemon owns one store. These project-scoped admission locks coordinate
+// operator writes with transport submission; only SQLite owns the hold state.
+// No global writer lock is held across transport I/O.
+var dispatchAdmission sync.Map // domain.ProjectID -> chan struct{}
+
+func withDispatchAdmission(ctx context.Context, project domain.ProjectID, fn func() error) error {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	actual, _ := dispatchAdmission.LoadOrStore(project, gate)
+	var ok bool
+	gate, ok = actual.(chan struct{})
+	if !ok {
+		return fmt.Errorf("invalid orchestration dispatch admission gate")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		defer func() { gate <- struct{}{} }()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fn()
+	}
+}
+
+// OrchestrationDispatchHeld fails closed for missing projects or schema/errors.
+// Absence of an override on an existing project means explicitly unheld by
+// default, rather than an unknown project being admitted.
+func (s *Store) OrchestrationDispatchHeld(ctx context.Context, project domain.ProjectID) (bool, error) {
+	var held int
+	err := s.readDB.QueryRowContext(ctx, `SELECT CASE WHEN h.project_id IS NULL THEN 0 ELSE h.held END FROM projects p LEFT JOIN project_dispatch_hold h ON h.project_id=p.id WHERE p.id=?`, project).Scan(&held)
+	if err != nil {
+		return true, err
+	}
+	if held != 0 && held != 1 {
+		return true, fmt.Errorf("unknown dispatch hold state")
+	}
+	return held == 1, nil
+}
+
+// WithOrchestrationDispatch is the final fence before transport admission.
+func (s *Store) WithOrchestrationDispatch(ctx context.Context, project domain.ProjectID, fn func() error) error {
+	return withDispatchAdmission(ctx, project, func() error {
+		held, err := s.OrchestrationDispatchHeld(ctx, project)
+		if err != nil {
+			return err
+		}
+		if held {
+			return orchestrationevents.ErrDispatchHeld
+		}
+		return fn()
+	})
+}
+
+// SetOrchestrationDispatchHold never modifies events or resumes a session.
+// A successful hold waits for any already-admitted local submission to return.
+func (s *Store) SetOrchestrationDispatchHold(ctx context.Context, project domain.ProjectID, held bool) error {
+	return withDispatchAdmission(ctx, project, func() error {
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return err
+		}
+		defer s.writeMu.Unlock()
+		result, err := s.writeDB.ExecContext(ctx, `INSERT INTO project_dispatch_hold(project_id,held) SELECT id,? FROM projects WHERE id=? ON CONFLICT(project_id) DO UPDATE SET held=excluded.held`, held, project)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return fmt.Errorf("unknown dispatch hold project %q", project)
+		}
+		return nil
+	})
+}
+
+// InitializeOrchestrationDispatchHold runs before startup recovery for an
+// explicitly selected project. It initializes an existing project's missing
+// override once; an operator's prior hold or release always survives restart.
+func (s *Store) InitializeOrchestrationDispatchHold(ctx context.Context, project domain.ProjectID) error {
+	return withDispatchAdmission(ctx, project, func() error {
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return err
+		}
+		defer s.writeMu.Unlock()
+		return s.inTxDB(ctx, "initialize orchestration dispatch hold", func(_ *gen.Queries, db gen.DBTX) error {
+			result, err := db.ExecContext(ctx, `INSERT INTO project_dispatch_hold(project_id,held) SELECT id,1 FROM projects WHERE id=? ON CONFLICT(project_id) DO NOTHING`, project)
+			if err != nil {
+				return err
+			}
+			inserted, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			var held int
+			err = db.QueryRowContext(ctx, `SELECT held FROM project_dispatch_hold WHERE project_id=?`, project).Scan(&held)
+			if errors.Is(err, sql.ErrNoRows) && inserted == 0 {
+				var exists bool
+				if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM projects WHERE id=?)`, project).Scan(&exists); err != nil {
+					return err
+				}
+				if exists {
+					return fmt.Errorf("dispatch hold missing after initialization for existing project %q", project)
+				}
+				// Only a genuinely unregistered project is a safe no-op.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if (held != 0 && held != 1) || (inserted != 0 && held != 1) {
+				return fmt.Errorf("dispatch hold initialization readback failed for %q", project)
+			}
+			return nil
+		})
+	})
+}
+
+// ReadOrchestrationDispatchHold reports outstanding deliveries conservatively:
+// an old submitted/leased batch is not evidence of provider quiescence.
+func (s *Store) ReadOrchestrationDispatchHold(ctx context.Context, project domain.ProjectID) (held bool, outstanding int, err error) {
+	err = withDispatchAdmission(ctx, project, func() error {
+		var readErr error
+		held, readErr = s.OrchestrationDispatchHeld(ctx, project)
+		if readErr != nil {
+			return readErr
+		}
+		return s.readDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM orchestration_events WHERE project_id=? AND state!='acknowledged' AND (state IN ('leased','submitted') OR submitted_at IS NOT NULL OR COALESCE(lease_token,'')!='')`, project).Scan(&outstanding)
+	})
+	return
+}
 
 const orchestrationColumns = `id, project_id, worker_id, kind, source_revision, state,
  attempt_count, enqueued_at, next_attempt_at, lease_token, lease_expires_at,
@@ -202,7 +338,8 @@ func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Ti
 			ELSE attention_required_at
 		END,
 		next_attempt_at=?
-		 WHERE state IN ('leased','submitted') AND lease_expires_at<=?`, now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now, now, now)
+		 WHERE state IN ('leased','submitted') AND lease_expires_at<=?
+		 AND NOT EXISTS (SELECT 1 FROM project_dispatch_hold h WHERE h.project_id=orchestration_events.project_id AND h.held IS NOT 0)`, now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now.Add(-15*time.Minute), now, now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -213,7 +350,7 @@ func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Ti
 func (s *Store) MarkProjectNoDestinationAttention(ctx context.Context, project domain.ProjectID, now time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET attention_required_at=? WHERE project_id=? AND state='pending' AND attention_required_at IS NULL AND enqueued_at<=?`, now, project, now.Add(-15*time.Minute))
+	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET attention_required_at=? WHERE project_id=? AND state='pending' AND attention_required_at IS NULL AND enqueued_at<=? AND NOT EXISTS (SELECT 1 FROM project_dispatch_hold h WHERE h.project_id=orchestration_events.project_id AND h.held IS NOT 0)`, now, project, now.Add(-15*time.Minute))
 	if err != nil {
 		return 0, err
 	}
@@ -224,7 +361,7 @@ func (s *Store) MarkProjectNoDestinationAttention(ctx context.Context, project d
 func (s *Store) MarkOrchestrationRetentionOverflow(ctx context.Context, now time.Time) (int64, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='dead_letter',attention_required_at=COALESCE(attention_required_at,?),last_error='retention limit exceeded' WHERE state='pending' AND (enqueued_at<=? OR id IN (SELECT id FROM orchestration_events AS overflow WHERE overflow.project_id=orchestration_events.project_id AND overflow.state='pending' ORDER BY overflow.enqueued_at DESC,overflow.id DESC LIMIT -1 OFFSET 10000))`, now, now.Add(-30*24*time.Hour))
+	result, err := s.writeDB.ExecContext(ctx, `UPDATE orchestration_events SET state='dead_letter',attention_required_at=COALESCE(attention_required_at,?),last_error='retention limit exceeded' WHERE state='pending' AND NOT EXISTS (SELECT 1 FROM project_dispatch_hold h WHERE h.project_id=orchestration_events.project_id AND h.held IS NOT 0) AND (enqueued_at<=? OR id IN (SELECT id FROM orchestration_events AS overflow WHERE overflow.project_id=orchestration_events.project_id AND overflow.state='pending' ORDER BY overflow.enqueued_at DESC,overflow.id DESC LIMIT -1 OFFSET 10000))`, now, now.Add(-30*24*time.Hour))
 	if err != nil {
 		return 0, err
 	}
@@ -348,6 +485,13 @@ func (s *Store) LeaseOrchestrationEvents(ctx context.Context, ids []string, toke
 		return fmt.Errorf("missing orchestration batch token or destination")
 	}
 	return s.updateOrchestrationBatch(ctx, "lease orchestration events", ids, token, func(db gen.DBTX, id string) (sql.Result, error) {
+		var held int
+		if err := db.QueryRowContext(ctx, `SELECT CASE WHEN h.project_id IS NULL THEN 0 ELSE h.held END FROM orchestration_events e JOIN sessions s ON s.id=? AND s.project_id=e.project_id AND s.kind='orchestrator' LEFT JOIN project_dispatch_hold h ON h.project_id=e.project_id WHERE e.id=?`, destination, id).Scan(&held); err != nil {
+			return nil, err
+		}
+		if held != 0 {
+			return nil, orchestrationevents.ErrDispatchHeld
+		}
 		// The transaction fences stale due reads as well as direct callers. Only
 		// untouched work may acquire a binding; retries may only renew their pair.
 		return db.ExecContext(ctx, `UPDATE orchestration_events SET state='leased',lease_token=?,lease_expires_at=?,destination_session_id=?

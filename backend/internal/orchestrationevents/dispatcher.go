@@ -29,9 +29,14 @@ const (
 	tuiRetryAttempts  = 2
 )
 
+// ErrDispatchHeld means no new automatic submission was admitted.
+var ErrDispatchHeld = errors.New("orchestration dispatch held")
+
 // Store is the durable outbox surface required by Dispatcher.
 type Store interface {
 	GetSession(context.Context, domain.SessionID) (domain.SessionRecord, bool, error)
+	OrchestrationDispatchHeld(context.Context, domain.ProjectID) (bool, error)
+	WithOrchestrationDispatch(context.Context, domain.ProjectID, func() error) error
 	ListSessions(context.Context, domain.ProjectID) ([]domain.SessionRecord, error)
 	ListDueOrchestrationEvents(context.Context, domain.ProjectID, time.Time, int) ([]domain.OrchestrationEvent, error)
 	ListOrchestrationEventsRequiringAttention(context.Context, domain.ProjectID) ([]domain.OrchestrationEvent, error)
@@ -73,6 +78,13 @@ type Dispatcher struct {
 
 // DispatchProject performs at most one bounded delivery attempt.
 func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.ProjectID) error {
+	held, err := d.Store.OrchestrationDispatchHeld(ctx, project)
+	if err != nil {
+		return err
+	}
+	if held {
+		return ErrDispatchHeld
+	}
 	now := time.Now().UTC()
 	if d.Now != nil {
 		now = d.Now()
@@ -85,6 +97,11 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	// original submission. Keep the durable batch membership stable so the
 	// client id never names a different payload on retry.
 	events = stableBatchEvents(events)
+	for _, event := range events {
+		if event.ProjectID != project {
+			return fmt.Errorf("orchestration event project mismatch")
+		}
+	}
 	// A token and destination are assigned together by the first lease. Retry
 	// must consume that exact pair, including after reclaim or explicit rearm.
 	destination := events[0].DestinationSessionID
@@ -146,30 +163,34 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 	if err := d.Store.LeaseOrchestrationEvents(ctx, ids, batchID, target.ID, now.Add(LeaseDuration)); err != nil {
 		return err
 	}
-	attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
-	defer cancel()
-	result, submitErr := d.Transport.Submit(attemptCtx, target, Batch{ID: batchID, Payload: payload, EventIDs: ids})
-	if result.Submitted {
-		if err := d.Store.MarkOrchestrationEventsSubmitted(ctx, ids, batchID, now); err != nil {
+	// The store serializes this final admission with explicit hold activation.
+	// A hold that wins after leasing leaves the original lease untouched.
+	return d.Store.WithOrchestrationDispatch(ctx, project, func() error {
+		attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
+		defer cancel()
+		result, submitErr := d.Transport.Submit(attemptCtx, target, Batch{ID: batchID, Payload: payload, EventIDs: ids})
+		if result.Submitted {
+			if err := d.Store.MarkOrchestrationEventsSubmitted(ctx, ids, batchID, now); err != nil {
+				return err
+			}
+		}
+		if submitErr != nil {
+			if err := d.Store.RetryOrchestrationEvents(ctx, events, batchID, sanitizeError(submitErr), now, target.Mode); err != nil {
+				return err
+			}
+			if events[0].AttemptCount+1 >= retryAttemptLimit(target.Mode) || now.Sub(events[0].EnqueuedAt) >= 15*time.Minute {
+				return d.notifyAttentionForEvents(ctx, events, now)
+			}
+			return nil
+		}
+		if !result.Acknowledged {
+			return nil
+		}
+		if err := d.Store.AcknowledgeOrchestrationEvents(ctx, ids, batchID, now); err != nil {
 			return err
 		}
-	}
-	if submitErr != nil {
-		if err := d.Store.RetryOrchestrationEvents(ctx, events, batchID, sanitizeError(submitErr), now, target.Mode); err != nil {
-			return err
-		}
-		if events[0].AttemptCount+1 >= retryAttemptLimit(target.Mode) || now.Sub(events[0].EnqueuedAt) >= 15*time.Minute {
-			return d.notifyAttentionForEvents(ctx, events, now)
-		}
-		return nil
-	}
-	if !result.Acknowledged {
-		return nil
-	}
-	if err := d.Store.AcknowledgeOrchestrationEvents(ctx, ids, batchID, now); err != nil {
-		return err
-	}
-	return d.resolveAttention(ctx, events, now)
+		return d.resolveAttention(ctx, events, now)
+	})
 }
 
 // ReconcileAttention recreates the human-visible side of every durable
@@ -284,6 +305,9 @@ func (d *Dispatcher) destination(ctx context.Context, project domain.ProjectID, 
 		}
 	}
 	for _, s := range sessions {
+		if s.ProjectID != project {
+			return domain.SessionRecord{}, false, fmt.Errorf("orchestration destination project mismatch")
+		}
 		if s.Kind != domain.KindOrchestrator || s.IsTerminated {
 			continue
 		}

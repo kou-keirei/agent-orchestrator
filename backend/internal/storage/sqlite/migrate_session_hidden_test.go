@@ -121,11 +121,22 @@ WHERE session_id = ? ORDER BY rowid DESC LIMIT 1`, record.ID).Scan(&eventType, &
 	for _, tc := range []struct {
 		name       string
 		createStmt string
+		held       int
 	}{
 		{name: "missing", createStmt: ""},
+		{name: "missing-held", createStmt: "", held: 1},
 		{name: "malformed", createStmt: `CREATE TRIGGER sessions_cdc_update AFTER UPDATE ON sessions BEGIN SELECT 1; END`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			healthy := openTestDB(t)
+			if err := migrate(healthy); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, healthy, `INSERT INTO projects(id,path,registered_at) VALUES ('cdc-hold','/cdc-hold',CURRENT_TIMESTAMP)`)
+			if _, err := healthy.Exec(`INSERT INTO project_dispatch_hold VALUES ('cdc-hold',?)`, tc.held); err != nil {
+				t.Fatal(err)
+			}
+			beforeDrop := desktop169Snapshot(t, healthy)
 			if _, err := healthy.Exec(`DROP TRIGGER IF EXISTS sessions_cdc_update`); err != nil {
 				t.Fatalf("drop stale healthy sessions_cdc_update: %v", err)
 			}
@@ -134,8 +145,28 @@ WHERE session_id = ? ORDER BY rowid DESC LIMIT 1`, record.ID).Scan(&eventType, &
 					t.Fatalf("create malformed sessions_cdc_update: %v", err)
 				}
 			}
+			if tc.name == "malformed" {
+				before := desktop169Snapshot(t, healthy)
+				err := migrate(healthy)
+				if err == nil || !strings.Contains(err.Error(), "foreign session CDC behavior; refusing replacement") {
+					t.Fatalf("expected unknown SQL refusal: %v", err)
+				}
+				if desktop169Snapshot(t, healthy) != before {
+					t.Fatal("foreign trigger refusal changed schema or durable state")
+				}
+				return
+			}
 			if err := migrate(healthy); err != nil {
 				t.Fatalf("repair %s session hidden CDC trigger: %v", tc.name, err)
+			}
+			if desktop169Snapshot(t, healthy) != beforeDrop {
+				t.Fatal("missing CDC repair changed more than restoring the trigger")
+			}
+			if err := migrate(healthy); err != nil {
+				t.Fatalf("restart after missing CDC repair: %v", err)
+			}
+			if desktop169Snapshot(t, healthy) != beforeDrop {
+				t.Fatal("restart changed repaired native state")
 			}
 			var repairedTrigger string
 			if err := healthy.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'sessions_cdc_update'`).Scan(&repairedTrigger); err != nil {

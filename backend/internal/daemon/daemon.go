@@ -215,6 +215,13 @@ func Run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	// The canonical ECP project must be held on its first upgrade before any
+	// controller recovery or background service can acquire/submit old events.
+	// Initialization reads back its write transactionally and preserves an
+	// operator's separately explicit release on subsequent startups.
+	if err := store.InitializeOrchestrationDispatchHold(context.Background(), "execution-control-plane"); err != nil {
+		return fmt.Errorf("initialize orchestration dispatch hold: %w", err)
+	}
 	if err := store.ConfigureAgentSwitchFailureEventEncoder(context.Background(), sentryobs.AgentSwitchEventEncoder{}); err != nil {
 		return fmt.Errorf("configure agent switch failure event encoder: %w", err)
 	}
