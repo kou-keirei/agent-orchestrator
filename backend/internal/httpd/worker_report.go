@@ -14,9 +14,10 @@ import (
 
 // NewWorkerReportHandler is an independent loopback ingress, not yet mounted
 // by the production daemon. Mount only on the primary loopback listener, with
-// its existing request-ID middleware. Store acceptance is not provider delivery
+// its existing request-ID middleware. The daemon must inject guarded submission;
+// request fields never issue caller authority. Acceptance is not provider delivery
 // or an original-parent semantic ACK. Native references remain authored claims.
-func NewWorkerReportHandler(store ports.WorkerReportStore) http.Handler {
+func NewWorkerReportHandler(submission ports.WorkerReportSubmission) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/worker/reports" {
 			http.NotFound(w, r)
@@ -32,8 +33,8 @@ func NewWorkerReportHandler(store ports.WorkerReportStore) http.Handler {
 			envelope.WriteAPIError(w, r, http.StatusMethodNotAllowed, "bad_request", "METHOD_NOT_ALLOWED", "POST required", nil)
 			return
 		}
-		if store == nil {
-			envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "REPORT_STORE_UNAVAILABLE", "Worker report store unavailable", nil)
+		if submission == nil {
+			envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "WORKER_REPORT_ACTOR_BINDING_UNAVAILABLE", "Worker report caller binding unavailable", nil)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -48,10 +49,14 @@ func NewWorkerReportHandler(store ports.WorkerReportStore) http.Handler {
 			envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_JSON", "Expected one report object", nil)
 			return
 		}
-		receipt, err := store.AcceptWorkerReport(r.Context(), report)
+		receipt, err := submission.SubmitWorkerReport(r.Context(), report)
 		switch {
 		case err == nil:
 			envelope.WriteJSON(w, http.StatusOK, receipt)
+		case errors.Is(err, domain.ErrWorkerReportActorBindingUnavailable):
+			envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "WORKER_REPORT_ACTOR_BINDING_UNAVAILABLE", "Worker report caller binding unavailable", nil)
+		case errors.Is(err, domain.ErrWorkerReportActorMismatch):
+			envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "WORKER_REPORT_ACTOR_MISMATCH", "Worker report caller binding mismatch", nil)
 		case errors.Is(err, domain.ErrInvalidWorkerReport), errors.Is(err, domain.ErrInvalidWorkIdentity):
 			envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "INVALID_WORKER_REPORT", "Invalid report or digest", nil)
 		case errors.Is(err, domain.ErrWorkerReportConflict), errors.Is(err, domain.ErrWorkIdentityMismatch), errors.Is(err, domain.ErrStaleWorkOwner), errors.Is(err, domain.ErrWorkLeaseConflict), errors.Is(err, domain.ErrWorkLeaseExpired):
