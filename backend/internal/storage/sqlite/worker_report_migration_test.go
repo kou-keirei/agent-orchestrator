@@ -138,9 +138,8 @@ func TestWorkerReportMigrationCopyFailureRollsBack(t *testing.T) {
 func TestWorkerReportMigrationIsForwardOnly(t *testing.T) {
 	db := openTestDB(t)
 	seedReportMigration(t, db)
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	// Exercise 0220's own guard, independently of later forward-only migrations.
+	upTo(t, db, 220)
 	gooseMu.Lock()
 	defer gooseMu.Unlock()
 	goose.SetBaseFS(migrationsFS)
