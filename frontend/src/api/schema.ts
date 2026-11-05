@@ -2422,6 +2422,40 @@ export interface paths {
         patch: operations["renameShellTerminal"];
         trace?: never;
     };
+    "/api/v1/storage/cleanup-plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read bounded storage retention report; no cleanup execution */
+        get: operations["getStorageCleanupPlan"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/storage/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read bounded storage retention report; no cleanup execution */
+        get: operations["getStorageStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/system/github-auth": {
         parameters: {
             query?: never;
@@ -4511,6 +4545,34 @@ export interface components {
             /** @enum {string} */
             state?: "queued" | "running" | "completed" | "recovered" | "interrupted" | "failed";
             turnId?: string;
+        };
+        StorageStatusResponse: {
+            /** @enum {string} */
+            consistency: "live_keyset_not_snapshot";
+            executableCandidates: number;
+            nextAfter: string;
+            rows: components["schemas"]["StorageStatusRow"][];
+            sourceGaps: string[];
+            /** @enum {string} */
+            state: "SOURCE_GAP";
+            /** @enum {string} */
+            version: "ao.storage.v1";
+        };
+        StorageStatusRow: {
+            category: string;
+            cleanupGeneration: null | number;
+            id: string;
+            /** @description Logical file length; null means UNKNOWN, never zero. */
+            logicalBytes: null | number;
+            ownerSession: string;
+            path: string;
+            /** @description Allocated physical bytes; null means UNKNOWN, never inferred from logical length. */
+            physicalBytes: null | number;
+            protectionReasons: string[];
+            retain: boolean;
+            /** @description Owning session row revision only; worktree/Git/cleanup revision remains unknown. */
+            sourceRevision: null | number;
+            workspaceTier: string;
         };
         SubmitAgentHandoffRequest: {
             /** @description Structured, source-agent-authored handoff enrichment. */
@@ -13733,6 +13795,110 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getStorageCleanupPlan: {
+        parameters: {
+            query?: {
+                /** @description Previous nextAfter; live keyset, not a snapshot. */
+                after?: string;
+                /** @description Maximum rows; defaults to 100. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StorageStatusResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    getStorageStatus: {
+        parameters: {
+            query?: {
+                /** @description Previous nextAfter; live keyset, not a snapshot. */
+                after?: string;
+                /** @description Maximum rows; defaults to 100. */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StorageStatusResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
