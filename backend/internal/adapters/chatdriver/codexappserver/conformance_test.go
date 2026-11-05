@@ -1,6 +1,7 @@
 package codexappserver
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -160,64 +161,35 @@ func TestApprovalKindsAreExhaustive(t *testing.T) {
 	}
 }
 
-// The generated file must describe the provider on this machine. A stale
-// checkout is how a driver starts sending methods that no longer exist.
+// Select the installed version's complete inventory, not the newest generated
+// payload vocabulary. Both missing and additional methods, wrong directions,
+// unsupported versions, and failed exports are failures for an installed binary.
 //
-// Skipped rather than failed when the provider is absent, so the suite still runs
-// on a machine without codex installed; the live e2e covers the other direction.
+// Absence is still an explicit skip. Inventory parity proves no reply payload or
+// authenticated Resume behavior; the response/identity and native tests own that.
 func TestGeneratedProtocolMatchesTheInstalledProvider(t *testing.T) {
 	bin, err := exec.LookPath("codex")
 	if err != nil {
 		t.Skip("codex not installed; nothing to compare the generated protocol against")
 	}
 
-	dir := t.TempDir()
-	out, err := exec.Command(bin, "app-server", "generate-json-schema", "--out", dir).CombinedOutput()
+	contract, err := newLaunchContract(context.Background(), bin, t.TempDir(), nil)
 	if err != nil {
-		t.Skipf("provider declined to emit its schema (%v): %s", err, out)
+		t.Fatal(err)
 	}
-
-	live := methodsFromSchema(t, dir)
-	generated := map[string]bool{}
-	for _, m := range codexproto.Methods {
-		generated[m.Name] = true
+	p, err := probeCodexProtocol(context.Background(), contract)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	var missing, extra []string
-	for name := range live {
-		if !generated[name] {
-			missing = append(missing, name)
+	for _, method := range driverMethods {
+		if err := p.require(method.method); err != nil {
+			t.Error(err)
 		}
 	}
-	for name := range generated {
-		if !live[name] {
-			extra = append(extra, name)
-		}
+	if err := p.require(append([]string{"initialize", "initialized"}, resumeProtocolMethods...)...); err != nil {
+		t.Error(err)
 	}
-
-	// New provider methods are not a failure on their own — AO does not have to use
-	// everything — but they are worth surfacing, because they are where the next
-	// feature comes from.
-	if len(missing) > 0 {
-		t.Logf("installed provider declares %d method(s) the generated file lacks; "+
-			"run `go generate ./internal/adapters/chatdriver/codexappserver/...` to pick them up: %v",
-			len(missing), truncate(missing))
-	}
-	// A method AO's generated file has and the provider does not is the dangerous
-	// direction: any call to it fails at runtime.
-	if len(extra) > 0 {
-		t.Errorf("generated protocol declares %d method(s) the installed provider does not: %v",
-			len(extra), truncate(extra))
-	}
-}
-
-func methodsFromSchema(t *testing.T, dir string) map[string]bool {
-	t.Helper()
-	found := map[string]bool{}
-	for name := range methodDirectionsFromSchema(t, dir) {
-		found[name] = true
-	}
-	return found
+	t.Logf("%s: exact names/directions match (%d methods); native payload semantics unproven", p.version, len(p.methods))
 }
 
 // methodDirectionsFromSchema maps each method the installed provider declares onto
@@ -257,14 +229,6 @@ func methodDirectionsFromSchema(t *testing.T, dir string) map[string]string {
 		t.Fatalf("no methods parsed out of %s", dir)
 	}
 	return found
-}
-
-func truncate(names []string) []string {
-	const limit = 12
-	if len(names) <= limit {
-		return names
-	}
-	return append(names[:limit:limit], "…")
 }
 
 // Voice is deferred, and this is what makes deferring safe rather than forgetful.

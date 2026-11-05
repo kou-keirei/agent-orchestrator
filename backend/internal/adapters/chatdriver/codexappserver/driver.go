@@ -85,12 +85,13 @@ func (fixedCodexPlugin) AuthStatus(context.Context) (ports.AgentAuthStatus, erro
 
 // Driver opens Codex conversations over `codex app-server`.
 type Driver struct {
-	plugin       codexPlugin
-	log          *slog.Logger
-	spawn        spawnFunc
-	versionProbe versionProbeFunc
-	persistent   bool
-	connectHost  persistentConnectFunc
+	plugin        codexPlugin
+	log           *slog.Logger
+	spawn         spawnFunc
+	versionProbe  versionProbeFunc
+	protocolProbe func(context.Context, LaunchContract) (*codexProtocol, error)
+	persistent    bool
+	connectHost   persistentConnectFunc
 }
 
 func (d *Driver) resolveBinary(ctx context.Context, workspacePath string) (string, error) {
@@ -122,6 +123,7 @@ func New(plugin codexPlugin, log *slog.Logger) *Driver {
 	return &Driver{
 		plugin: plugin, log: log, spawn: spawnAppServer,
 		versionProbe: probeCodexVersion, persistent: true, connectHost: persistenthost.ConnectOrStart,
+		protocolProbe: probeCodexProtocol,
 	}
 }
 
@@ -254,7 +256,7 @@ func (d *Driver) probe(ctx context.Context, workspacePath string) (ports.ChatCap
 		return nil, fmt.Errorf("%w: model/list: %w", ports.ErrChatDriverIncompatible, err)
 	}
 
-	return capabilities(), nil
+	return conv.protocol.capabilities(), nil
 }
 
 func effectiveReadOnly(permissions ports.PermissionMode, approvalPolicy, sandbox string) bool {
@@ -358,6 +360,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	conv, reconnected, err := d.connectSession(
 		ctx, cfg.SessionID, cfg.DataDir, cfg.WorkspacePath, cfg.Env, cfg.PrepareEnv, cfg.ProviderScopeID,
 		cfg.RuntimeGeneration, cfg.ControllerGeneration,
+		"thread/start", "turn/start",
 	)
 	if err != nil {
 		return nil, err
@@ -449,8 +452,12 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	conv, reconnected, err := d.connectSession(
 		ctx, cfg.SessionID, cfg.DataDir, cfg.WorkspacePath, cfg.Env, cfg.PrepareEnv, cfg.ProviderScopeID,
 		cfg.RuntimeGeneration, cfg.ControllerGeneration,
+		resumeProtocolMethods...,
 	)
 	if err != nil {
+		if errors.Is(err, ports.ErrChatDriverIncompatible) {
+			return nil, fmt.Errorf("%w: %w", ports.ErrChatResumeFailed, err)
+		}
 		return nil, err
 	}
 	if reconnected {
@@ -556,13 +563,18 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 }
 
 // connect spawns app-server and completes the initialize handshake.
-func (d *Driver) connect(ctx context.Context, contract LaunchContract, providerScopeID string) (*conversation, error) {
+func (d *Driver) connect(ctx context.Context, contract LaunchContract, providerScopeID string, required ...string) (*conversation, error) {
+	protocol, err := d.checkProtocol(ctx, contract, required...)
+	if err != nil {
+		return nil, err
+	}
 	proc, err := d.spawn(ctx, contract.Executable, contract.WorkspacePath, contract.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("%w: launch app-server: %w", ports.ErrChatDriverUnavailable, err)
 	}
 
 	conv := newConversation(proc, d.log, providerScopeID)
+	conv.protocol = protocol
 	if err := d.initialize(ctx, conv); err != nil {
 		_ = conv.Close()
 		return nil, err
@@ -578,6 +590,7 @@ func (d *Driver) connectSession(
 	prepareEnv func(context.Context) (map[string]string, error),
 	providerScopeID string,
 	runtimeGeneration, controllerGeneration string,
+	required ...string,
 ) (*conversation, bool, error) {
 	// Injected driver tests intentionally retain the direct pipe launcher. The
 	// shipped driver uses spawnAppServer and therefore the persistent host.
@@ -593,7 +606,7 @@ func (d *Driver) connectSession(
 		if err != nil {
 			return nil, false, fmt.Errorf("%w: %w", ports.ErrChatDriverUnavailable, err)
 		}
-		conv, err := d.connect(ctx, contract, providerScopeID)
+		conv, err := d.connect(ctx, contract, providerScopeID, required...)
 		return conv, false, err
 	}
 	contract, err := d.resolveLaunchContract(ctx, workdir, env)
@@ -609,15 +622,27 @@ func (d *Driver) connectSession(
 		Env:                  contract.Environment,
 		Argv:                 []string{contract.Executable, "app-server"},
 	}
-	if prepareEnv != nil {
+	var protocol *codexProtocol
+	// The host invokes Prepare only for a fresh provider. Reattachment must not
+	// consult a possibly replaced binary or re-prepare a surviving account.
+	if prepareEnv != nil || d.protocolProbe != nil {
 		hostConfig.Prepare = func(prepareCtx context.Context) (persistenthost.PreparedProvider, error) {
-			preparedEnv, prepareErr := prepareEnv(prepareCtx)
-			if prepareErr != nil {
-				return persistenthost.PreparedProvider{}, prepareErr
+			prepared := contract
+			if prepareEnv != nil {
+				preparedEnv, prepareErr := prepareEnv(prepareCtx)
+				if prepareErr != nil {
+					return persistenthost.PreparedProvider{}, prepareErr
+				}
+				var contractErr error
+				prepared, contractErr = contract.withEnvironment(prepareCtx, preparedEnv)
+				if contractErr != nil {
+					return persistenthost.PreparedProvider{}, contractErr
+				}
 			}
-			prepared, contractErr := contract.withEnvironment(prepareCtx, preparedEnv)
-			if contractErr != nil {
-				return persistenthost.PreparedProvider{}, contractErr
+			var protocolErr error
+			protocol, protocolErr = d.checkProtocol(prepareCtx, prepared, required...)
+			if protocolErr != nil {
+				return persistenthost.PreparedProvider{}, protocolErr
 			}
 			return persistenthost.PreparedProvider{
 				Env: prepared.Environment, Argv: []string{prepared.Executable, "app-server"},
@@ -626,6 +651,9 @@ func (d *Driver) connectSession(
 	}
 	transport, err := d.connectHost(ctx, hostConfig)
 	if err != nil {
+		if errors.Is(err, ports.ErrChatDriverIncompatible) {
+			return nil, false, err
+		}
 		if errors.Is(err, persistenthost.ErrOwnershipInconclusive) ||
 			errors.Is(err, persistenthost.ErrAttached) ||
 			errors.Is(err, persistenthost.ErrIncompatible) ||
@@ -649,6 +677,7 @@ func (d *Driver) connectSession(
 		},
 	}
 	conv := newConversation(proc, d.log, providerScopeID)
+	conv.protocol = protocol
 	if transport.Reconnected {
 		return conv, true, nil
 	}
