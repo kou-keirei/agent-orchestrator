@@ -18,10 +18,12 @@ import (
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	reviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/review"
+	storagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/storage"
 )
 
 // APIDeps bundles every service the API layer's controllers depend on.
 type APIDeps struct {
+	Storage             storagesvc.WorkspaceSource
 	Agents              controllers.AgentCatalog
 	CodexAccounts       controllers.CodexAccountService
 	Projects            projectsvc.Manager
@@ -102,6 +104,7 @@ func normalizeAPIDeps(deps APIDeps, log *slog.Logger) APIDeps {
 // API owns one controller per resource and is the single Register call the
 // router invokes to mount the /api/v1 surface.
 type API struct {
+	storage             *controllers.StorageController
 	cfg                 config.Config
 	deps                APIDeps
 	agents              *controllers.AgentsController
@@ -134,8 +137,9 @@ type API struct {
 // environment.
 func NewAPI(cfg config.Config, deps APIDeps) *API {
 	return &API{
-		cfg:  cfg,
-		deps: deps,
+		storage: &controllers.StorageController{Source: deps.Storage, DataDir: cfg.DataDir},
+		cfg:     cfg,
+		deps:    deps,
 		agents: &controllers.AgentsController{
 			Catalog: deps.Agents,
 		},
@@ -193,6 +197,7 @@ func (a *API) Register(root chi.Router) {
 			a.sessions.Register(r)
 			a.desktop.Register(r)
 			a.usage.Register(r)
+			a.storage.Register(r)
 			a.prs.Register(r)
 			a.reviews.Register(r)
 			a.notifications.Register(r)

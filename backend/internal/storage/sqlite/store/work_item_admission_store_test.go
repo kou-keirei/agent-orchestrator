@@ -14,7 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
-func admissionFixture(t *testing.T, ctx context.Context, s *sqlite.Store, suffix string) (store.WorkItemRecord, domain.WorkItemLease) {
+func admissionFixture(ctx context.Context, t *testing.T, s *sqlite.Store, suffix string) (store.WorkItemRecord, domain.WorkItemLease) {
 	t.Helper()
 	r := workLeaseRecord()
 	r.Identity.ID += domain.WorkItemID(suffix)
@@ -52,8 +52,8 @@ func TestWorkAdmissionRestartRetryAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	a, lease := admissionFixture(t, ctx, s, "-a")
-	b, otherLease := admissionFixture(t, ctx, s, "-b")
+	a, lease := admissionFixture(ctx, t, s, "-a")
+	b, otherLease := admissionFixture(ctx, t, s, "-b")
 	receipt, err := s.ReserveWorkItemAdmission(ctx, a.Identity, lease)
 	if err != nil || receipt.State != domain.WorkAdmissionReserved || receipt.AttemptID != a.Identity.AttemptID {
 		t.Fatalf("reserve: %+v %v", receipt, err)
@@ -109,8 +109,8 @@ func TestWorkAdmissionFencesAndTimeoutHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	a, lease := admissionFixture(t, ctx, s, "-a")
-	b, otherLease := admissionFixture(t, ctx, s, "-b")
+	a, lease := admissionFixture(ctx, t, s, "-a")
+	b, otherLease := admissionFixture(ctx, t, s, "-b")
 	for _, mutate := range []func(*domain.WorkItemIdentity){
 		func(i *domain.WorkItemIdentity) { i.OwnerGeneration++ },
 		func(i *domain.WorkItemIdentity) { i.OwnerSessionID = "foreign" },
@@ -187,8 +187,8 @@ func TestWorkAdmissionOwnerChangeRetainsAmbiguousSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	a, lease := admissionFixture(t, ctx, s, "-a")
-	b, otherLease := admissionFixture(t, ctx, s, "-b")
+	a, lease := admissionFixture(ctx, t, s, "-a")
+	b, otherLease := admissionFixture(ctx, t, s, "-b")
 	receipt, err := s.ReserveWorkItemAdmission(ctx, a.Identity, lease)
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +230,7 @@ func TestWorkAdmissionConcurrentIndependentStores(t *testing.T) {
 		}
 		defer s.Close()
 		stores[i] = s
-		records[i], leases[i] = admissionFixture(t, ctx, s, suffix)
+		records[i], leases[i] = admissionFixture(ctx, t, s, suffix)
 	}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -291,7 +291,7 @@ func TestWorkAdmissionRollbackAndCanceledRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	a, lease := admissionFixture(t, ctx, s, "-a")
+	a, lease := admissionFixture(ctx, t, s, "-a")
 	db := admissionDB(t, dir)
 	if _, err := db.ExecContext(ctx, `CREATE TRIGGER fail_admission AFTER INSERT ON work_item_admissions BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
 		t.Fatal(err)

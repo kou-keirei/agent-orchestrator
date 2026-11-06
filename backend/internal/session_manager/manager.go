@@ -38,6 +38,9 @@ var (
 	ErrAgentNotExited      = errors.New("session: agent has not exited")
 	ErrAgentExitInProgress = errors.New("session: agent exit is already in progress")
 	ErrIncompleteHandle    = errors.New("session: incomplete teardown handle")
+	// ErrSpawnRecoveryUncertain preserves a workspace whose runtime birth was
+	// never acknowledged. A missing handle cannot prove that no provider exists.
+	ErrSpawnRecoveryUncertain = errors.New("session: interrupted spawn runtime ownership is unknown")
 	// ErrProjectNotResolvable means the spawn's project has no usable repo
 	// (unregistered, archived, or missing a path). The API maps it to a 400.
 	ErrProjectNotResolvable = errors.New("session: project repo not resolvable")
@@ -2853,9 +2856,16 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		return nil
 	}
 	isChat := domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat
+	var stoppedSource *domain.SessionInterfaceTransition
 
 	if !isChat {
 		handle := runtimeHandle(rec.Metadata)
+		if handle.ID == "" {
+			stoppedSource, err = m.claimStoppedTUISourceRecovery(ctx, rec)
+			if err != nil {
+				return fmt.Errorf("reconcile %s: %w", rec.ID, err)
+			}
+		}
 		if handle.ID != "" {
 			alive, err := m.runtime.IsAlive(ctx, handle)
 			switch {
@@ -2890,6 +2900,20 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 	if restoreErr == nil {
 		_, relaunchErr := m.relaunchRestoredSession(ctx, rec, project, ws)
 		if relaunchErr == nil {
+			if stoppedSource != nil {
+				// The runtime handle is now durable. Retain the original recovery
+				// diagnosis and history policy for a later strict handoff retry.
+				store, ok := m.store.(interfaceTransitionStore)
+				if !ok {
+					return fmt.Errorf("reconcile %s: restore handoff diagnosis: %w", rec.ID, ErrSpawnRecoveryUncertain)
+				}
+				_, err := store.AdvanceSessionInterfaceTransition(ctx,
+					stoppedSource.ID, domain.SessionInterfaceTransitionRecovery, domain.SessionInterfaceTransitionRecovery,
+					stoppedSource.NativeConversationID, stoppedSource.ErrorCode, stoppedSource.ErrorDetail, m.clock())
+				if err != nil {
+					return fmt.Errorf("reconcile %s: restore handoff diagnosis: %w", rec.ID, err)
+				}
+			}
 			return nil
 		}
 		if errors.Is(relaunchErr, ports.ErrChatRecoveryInconclusive) {
@@ -2912,6 +2936,41 @@ func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) e
 		return nil
 	}
 	return fmt.Errorf("reconcile %s: relaunch controller: %w", rec.ID, restoreErr)
+}
+
+// claimStoppedTUISourceRecovery distinguishes an epoch cleared by handoff
+// rollback from an interrupted spawn whose runtime birth was never acknowledged.
+// The caller holds the session's reconcile/resume operation fence. Use the
+// existing durable handoff checkpoint to consume this one safe attempt before
+// provider I/O: a crash after Create must not authorize a second native writer.
+func (m *Manager) claimStoppedTUISourceRecovery(ctx context.Context, rec domain.SessionRecord) (*domain.SessionInterfaceTransition, error) {
+	metadata := rec.Metadata
+	store, ok := m.store.(interfaceTransitionStore)
+	if !ok || metadata.RuntimeLaunchID != "" || metadata.AgentSessionIDLaunchID != "" ||
+		metadata.ControllerGeneration != "" || metadata.AgentSessionID == "" ||
+		metadata.AgentSessionID != metadata.ProviderConversationID {
+		return nil, ErrSpawnRecoveryUncertain
+	}
+	latest, found, err := store.GetLatestSessionInterfaceTransition(ctx, rec.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || latest.SessionID != rec.ID || latest.SourceMode != domain.SessionModeTUI ||
+		latest.TargetMode != domain.SessionModeChat || latest.Phase != domain.SessionInterfaceTransitionRecovery ||
+		latest.ErrorCode != "DAEMON_RESTARTED" || latest.NativeConversationID != metadata.AgentSessionID {
+		return nil, ErrSpawnRecoveryUncertain
+	}
+	claimed, err := store.AdvanceSessionInterfaceTransition(ctx, latest.ID,
+		domain.SessionInterfaceTransitionRecovery, domain.SessionInterfaceTransitionRecovery,
+		latest.NativeConversationID, "SOURCE_RESTORE_UNCONFIRMED",
+		"AO began restoring the stopped Terminal source; its runtime acknowledgement is not yet durable.", m.clock())
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, ErrSpawnRecoveryUncertain
+	}
+	return &latest, nil
 }
 
 func (m *Manager) relaunchCommitted(before, after domain.SessionRecord) bool {

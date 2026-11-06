@@ -143,6 +143,8 @@ func schemaName(_ reflect.Type, defaultName string) string {
 // by projectOperations(). Add an entry when a new contract type is introduced;
 // the drift test fails until the spec is regenerated, which flags the gap.
 var schemaNames = map[string]string{ //nolint:gosec // Public OpenAPI type names include reset-credit contracts; no credential value is stored here.
+	"ControllersStorageStatusResponse":                     "StorageStatusResponse",
+	"StorageStatusRow":                                     "StorageStatusRow",
 	"ControllersSettingsResponse":                          "SettingsResponse",
 	"ControllersDesktopWorkspaceLocationResponse":          "DesktopWorkspaceLocationResponse",
 	"ControllersUpdateSessionInterfaceRequest":             "UpdateSessionInterfaceRequest",
@@ -575,6 +577,7 @@ func operations() []operation {
 	ops = append(ops, reviewOperations()...)
 	ops = append(ops, notificationOperations()...)
 	ops = append(ops, usageOperations()...)
+	ops = append(ops, storageOperations()...)
 	ops = append(ops, pushOperations()...)
 	ops = append(ops, importOperations()...)
 	ops = append(ops, devOperations()...)
@@ -2592,4 +2595,20 @@ func prOperations() []operation {
 			},
 		},
 	}
+}
+
+func storageOperations() []operation {
+	ops := make([]operation, 0, 2)
+	for _, item := range []struct{ path, id string }{
+		{"/api/v1/storage/status", "getStorageStatus"},
+		{"/api/v1/storage/cleanup-plan", "getStorageCleanupPlan"},
+	} {
+		ops = append(ops, operation{method: http.MethodGet, path: item.path, id: item.id, tag: "system",
+			summary:    "Read bounded storage retention report; no cleanup execution",
+			pathParams: []any{controllers.StorageStatusQuery{}},
+			resps: []respUnit{{http.StatusOK, controllers.StorageStatusResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}}, {http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}}}})
+	}
+	return ops
 }
