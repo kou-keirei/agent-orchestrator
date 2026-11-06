@@ -780,6 +780,16 @@ type WorkItem struct {
 	Branch                  string
 }
 
+type WorkItemAdmission struct {
+	WorkItemID      string
+	AttemptID       string
+	OwnerSessionID  string
+	OwnerGeneration int64
+	LeaseID         string
+	LeaseRevision   int64
+	State           string
+}
+
 type WorkItemLease struct {
 	WorkItemID      string
 	OwnerGeneration int64
@@ -789,6 +799,19 @@ type WorkItemLease struct {
 	ExpiresAtMs     int64
 	AllowedEffects  string
 	State           string
+}
+
+type WorkItemParent struct {
+	WorkItemID                   string
+	AttemptID                    string
+	OriginalParentSessionID      string
+	NativeSessionID              string
+	ControllerGeneration         string
+	ProviderConversationID       string
+	ProviderScopeID              string
+	IssuedBySessionID            string
+	IssuedByControllerGeneration string
+	Provenance                   string
 }
 
 type WorkerReport struct {

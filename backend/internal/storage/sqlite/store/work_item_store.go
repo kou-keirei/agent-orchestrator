@@ -62,28 +62,37 @@ func (s *Store) CreateWorkItem(ctx context.Context, record WorkItemRecord) (Work
 	defer s.writeMu.Unlock()
 	var current WorkItemRecord
 	err := s.inTx(ctx, "create work item", func(q *gen.Queries) error {
-		if err := q.CreateWorkItem(ctx, gen.CreateWorkItemParams{
-			ID: string(i.ID), AttemptID: string(i.AttemptID), ProjectID: string(i.ProjectID),
-			Repository: i.Repository, ExecutionBaseSha: i.ExecutionBaseSHA,
-			OriginalParentSessionID: string(i.OriginalParentSessionID),
-			OriginalWorkerSessionID: string(i.OriginalWorkerSessionID),
-			OriginalNativeSessionID: record.OriginalNativeSessionID,
-			OwnerSessionID:          string(i.OwnerSessionID), OwnerGeneration: i.OwnerGeneration,
-			WorktreePath: i.WorktreePath, Branch: i.Branch,
-		}); err != nil {
-			return err
-		}
-		row, err := q.GetWorkItem(ctx, string(i.ID))
-		if errors.Is(err, sql.ErrNoRows) {
-			return domain.ErrDuplicateWorkIdentity
-		}
-		if err != nil {
-			return err
-		}
-		current = workItemFromGen(row)
-		return record.validateAgainst(current)
+		var err error
+		current, err = createWorkItem(ctx, q, record)
+		return err
 	})
 	return current, err
+}
+
+// createWorkItem is shared by legacy creation and atomic original-parent issuance.
+// The caller owns the writer reservation and transaction.
+func createWorkItem(ctx context.Context, q *gen.Queries, record WorkItemRecord) (WorkItemRecord, error) {
+	i := record.Identity
+	if err := q.CreateWorkItem(ctx, gen.CreateWorkItemParams{
+		ID: string(i.ID), AttemptID: string(i.AttemptID), ProjectID: string(i.ProjectID),
+		Repository: i.Repository, ExecutionBaseSha: i.ExecutionBaseSHA,
+		OriginalParentSessionID: string(i.OriginalParentSessionID),
+		OriginalWorkerSessionID: string(i.OriginalWorkerSessionID),
+		OriginalNativeSessionID: record.OriginalNativeSessionID,
+		OwnerSessionID:          string(i.OwnerSessionID), OwnerGeneration: i.OwnerGeneration,
+		WorktreePath: i.WorktreePath, Branch: i.Branch,
+	}); err != nil {
+		return WorkItemRecord{}, err
+	}
+	row, err := q.GetWorkItem(ctx, string(i.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return WorkItemRecord{}, domain.ErrDuplicateWorkIdentity
+	}
+	if err != nil {
+		return WorkItemRecord{}, err
+	}
+	current := workItemFromGen(row)
+	return current, record.validateAgainst(current)
 }
 
 // GetWorkItem reads the current authoritative record. Missing work is explicit;
