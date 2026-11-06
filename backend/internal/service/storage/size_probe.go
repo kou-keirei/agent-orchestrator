@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
 // ProbeCode is a bounded, path-free diagnostic in ao.storage.size-probe.v1.
@@ -46,6 +48,64 @@ type SizeProbeRequest struct {
 	Root     MetadataRoot
 	OwnerUID *uint32
 	Limits   SizeProbeLimits
+}
+
+// WindowsOwnerSID is a canonical native SID, never a UID, account name or RID.
+type WindowsOwnerSID string
+
+// WindowsSizeOwnerScope names the exact current AO ownership binding. Generation
+// must be positive; an unknown/legacy zero epoch cannot qualify this seam.
+// OwnerID identifies the AO-owned storage record, not an OS account.
+type WindowsSizeOwnerScope struct {
+	SessionID  domain.SessionID
+	ProjectID  domain.ProjectID
+	Generation int64
+	OwnerID    string
+	Root       MetadataRoot
+}
+
+// WindowsSizeOwnerClaim must come from independent AO authority, not the target
+// handle's owner or an API/UI submission. Scope includes the root qualifications.
+type WindowsSizeOwnerClaim struct {
+	Scope    WindowsSizeOwnerScope
+	OwnerSID WindowsOwnerSID
+}
+
+// TrustedWindowsSizeOwnerSource is explicit native caller injection, NOT a wire
+// DTO or an issuer-name assertion. The composition owner must independently read
+// the current AO session/project/generation/storage-owner/root/SID association,
+// return exactly one claim, and hold all Root preconditions for the entire call.
+// Missing or ambiguous authority must return no claim or an error. Each call is
+// a fresh readback; echoing the requested scope or caching an untrusted claim is
+// insufficient. The validator reads twice and compares the complete binding.
+//
+// No existing AO source currently supplies this SID association. Session and
+// workspace records alone, current process tokens, account lookups and target
+// metadata cannot issue it. There is deliberately no production binding. A future
+// issuer must also independently qualify canonical spelling (including Unicode,
+// case and 8.3 aliases), ancestor/link/mount exclusion and whole-call quiescence;
+// this seam does not create an issuer, traverse ancestors or enforce those facts.
+type TrustedWindowsSizeOwnerSource func(context.Context, WindowsSizeOwnerScope) ([]WindowsSizeOwnerClaim, error)
+
+// WindowsSizeOwnerState describes only principal binding, never size acceptance.
+type WindowsSizeOwnerState string
+
+const (
+	// WindowsOwnerSourceGap retains unknown ownership when evidence is incomplete.
+	WindowsOwnerSourceGap WindowsSizeOwnerState = "SOURCE_GAP"
+	// WindowsOwnerBound means the injected binding matched a held native object.
+	// It does not qualify a walker, logical/physical bytes or cleanup authority.
+	WindowsOwnerBound WindowsSizeOwnerState = "OWNER_BOUND"
+)
+
+// WindowsSizeOwnerEvidence is bounded and omits paths, identities and byte counts.
+type WindowsSizeOwnerEvidence struct {
+	State      WindowsSizeOwnerState
+	Diagnostic ProbeCode
+}
+
+func windowsOwnerGap(code ProbeCode) (WindowsSizeOwnerEvidence, error) {
+	return WindowsSizeOwnerEvidence{State: WindowsOwnerSourceGap, Diagnostic: code}, ErrSourceGap
 }
 
 // SizeProbeLimits bounds both passes together. No file contents are read.
