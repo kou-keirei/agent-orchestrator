@@ -803,6 +803,7 @@ func Run() error {
 		SystemChecks:        systemChecks,
 		Installer:           systemInstall,
 		Sessions:            sessionSvc,
+		Storage:             store,
 		DesktopWorkspaces:   sessionSvc,
 		PRs:                 prActions,
 		Reviews:             reviewSvc,

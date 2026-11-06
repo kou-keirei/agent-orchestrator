@@ -190,7 +190,8 @@ type Controller struct {
 	onCodexCapacityChanged func(domain.SessionID, string, ports.CodexCapacityObservation)
 
 	// sendMu serializes command dispatch so only one operation mutates the
-	// provider conversation at a time.
+	// provider conversation at a time. Controller retirement uses the same lock
+	// so guarded report acceptance and original-parent issuance finish first.
 	sendMu sync.Mutex
 	// configMu serializes live provider setting changes. Each response replaces
 	// the complete option catalog and updates durable next-turn settings, so
@@ -2562,7 +2563,10 @@ func (c *Controller) project() {
 		// A lifecycle event and a concurrent Send must agree on whether the root
 		// conversation is busy. Holding the same lock Send/dispatch use closes the
 		// window between the durable projection and the in-memory ownership update.
-		lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted
+		// A stopped event also retires guarded report/parent capabilities. Never
+		// take controllerGate here: Stop holds it while waiting for this loop.
+		lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted ||
+			(event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped)
 		if lifecycle {
 			c.sendMu.Lock()
 		}
@@ -2578,15 +2582,19 @@ func (c *Controller) project() {
 			err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
 		}
 		if err != nil && persistent {
+			// Ordinary projections may proceed during guarded storage, but their
+			// failure must wait for that storage before retiring the controller.
+			// projectEvent has already released its store transaction here.
+			if !lifecycle {
+				c.sendMu.Lock()
+			}
 			c.log.Error("persistent chat projection stopped; provider retained for replay",
 				"session", c.sessionID, "kind", event.Kind, "error", err)
 			c.mu.Lock()
 			c.preserveProviderOnStop = true
 			c.state = ports.ChatControllerStopped
 			c.mu.Unlock()
-			if lifecycle {
-				c.sendMu.Unlock()
-			}
+			c.sendMu.Unlock()
 			c.once.Do(func() { c.closeErr = c.conv.Close() })
 			return
 		}
@@ -2604,6 +2612,10 @@ func (c *Controller) project() {
 		}
 	}
 
+	// Natural stream exhaustion has the same retirement boundary as an explicit
+	// stopped event. Keep dispatch excluded through the final cleanup as well.
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.mu.Lock()
 	c.state = ports.ChatControllerStopped
 	suppressStoppedActivity := c.suppressStoppedActivity

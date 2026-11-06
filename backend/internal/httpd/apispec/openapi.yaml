@@ -7154,6 +7154,100 @@ paths:
       summary: Rename a standalone shell terminal tab
       tags:
       - shellTerminals
+  /api/v1/storage/cleanup-plan:
+    get:
+      operationId: getStorageCleanupPlan
+      parameters:
+      - description: Previous nextAfter; live keyset, not a snapshot.
+        in: query
+        name: after
+        schema:
+          description: Previous nextAfter; live keyset, not a snapshot.
+          maxLength: 4096
+          type: string
+      - description: Maximum rows; defaults to 100.
+        in: query
+        name: limit
+        schema:
+          description: Maximum rows; defaults to 100.
+          maximum: 256
+          minimum: 1
+          type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageStatusResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Read bounded storage retention report; no cleanup execution
+      tags:
+      - system
+  /api/v1/storage/status:
+    get:
+      operationId: getStorageStatus
+      parameters:
+      - description: Previous nextAfter; live keyset, not a snapshot.
+        in: query
+        name: after
+        schema:
+          description: Previous nextAfter; live keyset, not a snapshot.
+          maxLength: 4096
+          type: string
+      - description: Maximum rows; defaults to 100.
+        in: query
+        name: limit
+        schema:
+          description: Maximum rows; defaults to 100.
+          maximum: 256
+          minimum: 1
+          type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageStatusResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Read bounded storage retention report; no cleanup execution
+      tags:
+      - system
   /api/v1/system/github-auth:
     get:
       operationId: getGitHubAuthRequirement
@@ -12724,6 +12818,95 @@ components:
       required:
       - outcome
       - duplicate
+      type: object
+    StorageStatusResponse:
+      properties:
+        consistency:
+          enum:
+          - live_keyset_not_snapshot
+          type: string
+        executableCandidates:
+          maximum: 0
+          minimum: 0
+          type: integer
+        nextAfter:
+          type: string
+        rows:
+          items:
+            $ref: '#/components/schemas/StorageStatusRow'
+          type: array
+        sourceGaps:
+          items:
+            type: string
+          type: array
+        state:
+          enum:
+          - SOURCE_GAP
+          type: string
+        version:
+          enum:
+          - ao.storage.v1
+          type: string
+      required:
+      - version
+      - state
+      - consistency
+      - rows
+      - nextAfter
+      - sourceGaps
+      - executableCandidates
+      type: object
+    StorageStatusRow:
+      properties:
+        category:
+          type: string
+        cleanupGeneration:
+          type:
+          - "null"
+          - integer
+        id:
+          type: string
+        logicalBytes:
+          description: Logical file length; null means UNKNOWN, never zero.
+          type:
+          - "null"
+          - integer
+        ownerSession:
+          type: string
+        path:
+          type: string
+        physicalBytes:
+          description: Allocated physical bytes; null means UNKNOWN, never inferred
+            from logical length.
+          type:
+          - "null"
+          - integer
+        protectionReasons:
+          items:
+            type: string
+          type: array
+        retain:
+          type: boolean
+        sourceRevision:
+          description: Owning session row revision only; worktree/Git/cleanup revision
+            remains unknown.
+          type:
+          - "null"
+          - integer
+        workspaceTier:
+          type: string
+      required:
+      - id
+      - category
+      - path
+      - ownerSession
+      - cleanupGeneration
+      - sourceRevision
+      - workspaceTier
+      - logicalBytes
+      - physicalBytes
+      - retain
+      - protectionReasons
       type: object
     SubmitAgentHandoffRequest:
       properties:

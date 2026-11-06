@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -12,11 +13,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reportactor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
+
+// Missing caller authentication must stop before either writer or receipt lookup.
+// The real store below is used only to inspect and seed disposable fixture state.
+type unauthenticatedReportStore struct{ t *testing.T }
+
+func (s unauthenticatedReportStore) AcceptWorkerReport(context.Context, domain.WorkerReport) (domain.WorkerReportReceipt, error) {
+	s.t.Error("unauthenticated submission reached report writer")
+	return domain.WorkerReportReceipt{}, domain.ErrWorkerReportActorBindingUnavailable
+}
+
+func (s unauthenticatedReportStore) GetWorkerReport(context.Context, string) (domain.WorkerReportReceipt, bool, error) {
+	s.t.Error("unauthenticated submission reached receipt lookup")
+	return domain.WorkerReportReceipt{}, false, domain.ErrWorkerReportActorBindingUnavailable
+}
 
 func reportFixture(t *testing.T) (*sqlite.Store, domain.WorkerReport) {
 	t.Helper()
@@ -48,7 +64,12 @@ func reportFixture(t *testing.T) (*sqlite.Store, domain.WorkerReport) {
 func TestWorkerReportCLIIngress(t *testing.T) {
 	cfg := setConfigEnv(t)
 	s, report := reportFixture(t)
-	srv := httptest.NewServer(httpd.NewWorkerReportHandler(s))
+	// This is a negative ingress fixture, not an authenticated native caller.
+	submission, err := reportactor.NewAcceptance(reportactor.Unavailable{}, unauthenticatedReportStore{t: t})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(httpd.NewWorkerReportHandler(submission))
 	defer srv.Close()
 	writeRunFileFor(t, cfg, srv)
 	submit := func(r domain.WorkerReport, file bool) (string, error) {
@@ -67,6 +88,13 @@ func TestWorkerReportCLIIngress(t *testing.T) {
 		out, _, err := executeCLI(t, Deps{In: strings.NewReader(string(body)), ProcessAlive: func(int) bool { return true }}, "worker", "report", "--file", path)
 		return out, err
 	}
+	requireRefusal := func(r domain.WorkerReport, file bool) {
+		t.Helper()
+		out, err := submit(r, file)
+		if ExitCode(err) != 1 || !strings.Contains(err.Error(), "WORKER_REPORT_ACTOR_BINDING_UNAVAILABLE") || out != "" {
+			t.Fatalf("expected actor-binding refusal without receipt: output=%q err=%v", out, err)
+		}
+	}
 	for _, tc := range []struct {
 		name   string
 		mutate func(*domain.WorkerReport)
@@ -83,35 +111,47 @@ func TestWorkerReportCLIIngress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wrong := report
 			tc.mutate(&wrong)
-			if _, err := submit(wrong, false); ExitCode(err) != 1 {
-				t.Fatalf("expected daemon rejection: %v", err)
+			requireRefusal(wrong, false)
+			if _, err := s.AcceptWorkerReport(context.Background(), wrong); err == nil {
+				t.Fatal("persistence accepted invalid report")
 			}
 			if _, found, err := s.GetWorkerReport(context.Background(), wrong.ID); err != nil || found {
 				t.Fatalf("rejected report persisted: %v %v", found, err)
 			}
 		})
 	}
-	out, err := submit(report, true)
+	requireRefusal(report, true)
+	requireRefusal(report, false)
+	if _, found, err := s.GetWorkerReport(context.Background(), report.ID); err != nil || found {
+		t.Fatalf("unauthenticated report persisted: %v %v", found, err)
+	}
+	if events, err := s.ListOrchestrationEvents(context.Background(), report.Identity.ProjectID, 10); err != nil || len(events) != 0 {
+		t.Fatalf("unauthenticated outbox: %+v %v", events, err)
+	}
+	// Seed persistence directly so an exact retry cannot disclose an old receipt.
+	// This setup does not authenticate a CLI caller or qualify positive ingress.
+	receipt, err := s.AcceptWorkerReport(context.Background(), report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var receipt domain.WorkerReportReceipt
-	if err := json.Unmarshal([]byte(out), &receipt); err != nil {
-		t.Fatal(err)
-	}
 	if receipt.Report != report || receipt.EventID == "" || receipt.AcceptedAtMS <= 0 {
-		t.Fatalf("changed envelope: %+v", receipt)
+		t.Fatalf("changed persistence envelope: %+v", receipt)
 	}
-	retry, err := submit(report, false)
-	if err != nil || retry != out {
-		t.Fatalf("retry: %s %v", retry, err)
+	if retry, err := s.AcceptWorkerReport(context.Background(), report); err != nil || retry != receipt {
+		t.Fatalf("persistence retry: %+v %v", retry, err)
 	}
+	requireRefusal(report, true)
+	requireRefusal(report, false)
 	for _, mutate := range []func(*domain.WorkerReport){func(r *domain.WorkerReport) { r.ID = "second-done" }, func(r *domain.WorkerReport) { r.NativeTurnID = "changed-turn" }} {
 		wrong := report
 		mutate(&wrong)
-		if _, err := submit(wrong, false); err == nil || !strings.Contains(err.Error(), "WORKER_REPORT_CONFLICT") {
-			t.Fatalf("conflict: %v", err)
+		requireRefusal(wrong, false)
+		if _, err := s.AcceptWorkerReport(context.Background(), wrong); !errors.Is(err, domain.ErrWorkerReportConflict) {
+			t.Fatalf("persistence conflict: %v", err)
 		}
+	}
+	if got, found, err := s.GetWorkerReport(context.Background(), report.ID); err != nil || !found || got != receipt {
+		t.Fatalf("refused retry changed persisted receipt: %+v %v %v", got, found, err)
 	}
 	events, err := s.ListOrchestrationEvents(context.Background(), report.Identity.ProjectID, 10)
 	if err != nil || len(events) != 1 {
@@ -131,8 +171,9 @@ func TestWorkerReportCLIIngress(t *testing.T) {
 	stale := report
 	stale.ID = "after-release"
 	stale.Type = "checkpoint"
-	if _, err := submit(stale, false); err == nil {
-		t.Fatal("released lease accepted")
+	requireRefusal(stale, false)
+	if _, err := s.AcceptWorkerReport(context.Background(), stale); err == nil {
+		t.Fatal("persistence accepted released lease")
 	}
 }
 

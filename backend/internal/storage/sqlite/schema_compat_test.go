@@ -205,7 +205,7 @@ func TestLegacy169Compatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	if latest > 169 {
-		if latest != 220 || forwardClaims != "170:1|217:1|218:1|219:1|220:1" {
+		if latest != 222 || forwardClaims != "170:1|217:1|218:1|219:1|220:1|221:1|222:1" {
 			t.Fatalf("unexpected forward journal claims for latest %d: %s", latest, forwardClaims)
 		}
 	} else if forwardClaims != "" {
@@ -997,13 +997,13 @@ func TestLegacy169ForwardMigrationRejectsForeignCDC(t *testing.T) {
 
 func TestLegacy169ForwardMigrationRejectsUnknownJournal(t *testing.T) {
 	newLegacy169 := legacy169Fixture(t)
-	for _, claim := range []int{171, 221} {
+	for _, claim := range []int{171, 223} {
 		t.Run(strconv.Itoa(claim), func(t *testing.T) {
 			db := historical169DB(t, newLegacy169(t), true)
 			if err := migrate(db); err != nil {
 				t.Fatal(err)
 			}
-			// Unowned claims remain foreign above and below the owned 220 maximum.
+			// Unowned claims remain foreign above and below the owned 222 maximum.
 			mustExec(t, db, `INSERT INTO goose_db_version(version_id,is_applied) VALUES (?,1)`, claim)
 			rejectDesktop169Unchanged(t, db)
 		})
@@ -1200,7 +1200,7 @@ func TestDispatchHold170AfterReal217AndWorkItem219(t *testing.T) {
 			forward := fstest.MapFS{
 				"0217_conversation_ordinary_send.sql": &fstest.MapFile{Data: []byte(w470Migration217)},
 			}
-			for _, name := range []string{"0218_work_item_identity.sql", "0219_work_item_lease.sql", "0220_worker_reports.sql"} {
+			for _, name := range []string{"0218_work_item_identity.sql", "0219_work_item_lease.sql", "0220_worker_reports.sql", "0221_work_item_admission.sql", "0222_work_item_parent.sql"} {
 				source, err := migrationsFS.ReadFile("migrations/" + name)
 				if err != nil {
 					t.Fatal(err)
@@ -1217,7 +1217,7 @@ func TestDispatchHold170AfterReal217AndWorkItem219(t *testing.T) {
 			mustExec(t, db, `INSERT INTO work_items VALUES ('future-work','future-attempt','future','__root__','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','parent','future-1','native','future-1',3,'/future-work','future-branch')`)
 			mustExec(t, db, `INSERT INTO work_item_leases VALUES ('future-work',3,7,'future-lease',1000,2000,'[]','active')`)
 			// No 0170 table/application exists at this point, even though the
-			// actual independent 0217/0218/0219/0220 have run through Goose.
+			// actual independent 0217/0218/0219/0220/0221/0222 have run through Goose.
 			var applied, tables int
 			if err := db.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=170 ORDER BY id DESC LIMIT 1),0)`).Scan(&applied); err != nil || applied != 0 {
 				t.Fatalf("fixture already applied 170: %d %v", applied, err)
