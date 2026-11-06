@@ -219,8 +219,8 @@ func (c *RetentionCensus) Page(ctx context.Context, cursor *RetentionCensusCurso
 	return p, nil
 }
 
-func (c *RetentionCensus) pageLocked(ctx context.Context) (RetentionCensusPage, error) {
-	p := RetentionCensusPage{
+func (c *RetentionCensus) pageLocked(ctx context.Context) (p RetentionCensusPage, err error) {
+	p = RetentionCensusPage{
 		Version: "ao16.retention-census.v1", SnapshotID: c.id, Revision: c.id,
 		CallerSnapshotID: c.options.CallerSnapshotID, SnapshotBinding: "SQLITE_READ_TRANSACTION",
 		SourceMaxID: c.sourceMax, HighWaterID: c.highWater, Page: c.pages + 1,
@@ -248,7 +248,11 @@ func (c *RetentionCensus) pageLocked(ctx context.Context) (RetentionCensusPage, 
 	if err != nil {
 		return p, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	counts := make(map[sql.NullString]*RetentionCensusCount)
 	var unknownBytes bool
 	for rows.Next() {
