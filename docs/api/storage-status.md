@@ -37,3 +37,20 @@ reported in `sourceGaps`; arbitrary backup/cache directories are not enumerated
 or inferred from names or age. The report is not a complete physical census.
 It never copies SQLite files, runs Git, creates snapshots, or invokes lifecycle
 cleanup. A qualified measurement/catalog adapter requires separate scope.
+
+The opt-in service-only `ProbeSize` seam is not bound to these HTTP routes.
+On Windows it returns `ErrSourceGap` with diagnostic `platform_source_gap`
+before filesystem access, even for an explicitly trusted root. The current
+request supplies a numeric `OwnerUID` without a trusted mapping to a Windows
+owner SID/ACL. Reading the target's owner, using the current process token, or
+equating a SID's final RID with a UID cannot supply that missing authority.
+Logical bytes and device identity remain null, entries remain zero, physical
+bytes remain null, retention stays true, and executable candidates stay zero.
+Invalid requests and cancellation still use their existing diagnostics.
+
+Windows native support remains blocked on that ownership contract and qualified
+handle-relative no-reparse traversal, including ancestor and parent/name binding,
+stable volume/file identity, hardlink and namespace-alias rejection, bounded
+enumeration, and mutation/budget checks. Windows temp-fixture canaries establish
+the fail-closed contract only; they do not qualify traversal or measurement.
+Linux keeps its existing native source; Darwin remains unsupported.
