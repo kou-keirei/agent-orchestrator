@@ -44,9 +44,10 @@ var approvalMethods = map[string]domain.ActivityKind{
 
 // conversation is one live Codex thread. It is the only writer to that thread.
 type conversation struct {
-	conn *conn
-	proc *process
-	log  *slog.Logger
+	conn     *conn
+	proc     *process
+	log      *slog.Logger
+	protocol *codexProtocol
 
 	threadID        string
 	historyParentID string
@@ -271,7 +272,7 @@ func (c *conversation) ReconnectedLive() bool { return c.proc.reconnected }
 func (c *conversation) Capabilities() ports.ChatCapabilities {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	caps := capabilities()
+	caps := c.protocol.capabilities()
 	if c.preventiveReadOnly {
 		caps[ports.ChatCapabilityPreventiveReadOnly] = true
 	}
