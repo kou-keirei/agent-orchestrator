@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/agentauth"
 	projectsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/project"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
+	storagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/storage"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systemcheck"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systeminstall"
 
@@ -2748,4 +2749,13 @@ type MuteDeviceRequest struct {
 // routes.
 type InstallIDParam struct {
 	InstallID string `path:"installId" description:"The device's stable install id."`
+}
+
+// StorageStatusResponse is the versioned read-only storage report.
+type StorageStatusResponse storagesvc.Status
+
+// StorageStatusQuery bounds each live keyset page.
+type StorageStatusQuery struct {
+	After string `query:"after,omitempty" maxLength:"4096" description:"Previous nextAfter; live keyset, not a snapshot."`
+	Limit int    `query:"limit,omitempty" minimum:"1" maximum:"256" description:"Maximum rows; defaults to 100."`
 }
