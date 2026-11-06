@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,9 +13,12 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
+	storepkg "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 var _ FinalizeSource = (*sqlite.Store)(nil)
+var _ FinalizeBoundedSource = (*sqlite.Store)(nil)
 
 // Only reads are exposed; hooks simulate concurrent native writes without any
 // runtime, filesystem, network, or live user database capability.
@@ -434,18 +439,166 @@ func (*finalizeLegacySource) ListSessionWorktrees(context.Context, domain.Sessio
 	panic("unbounded worktrees")
 }
 
-func TestFinalizeSourceNativeStoreUnavailable(t *testing.T) {
-	// Even a nil native store is rejected before accessing the DB or any reads.
-	// No live database, fixture writes, runtime or filesystem effects are needed.
+func TestFinalizeSourceLegacySourceUnavailable(t *testing.T) {
 	f := newFinalizeReadFixture()
-	for _, source := range []FinalizeSource{(*sqlite.Store)(nil), &finalizeLegacySource{f}} {
-		p, err := NewFinalizePreview(context.Background(), source, nil)
-		if p != nil || !errors.Is(err, ErrFinalizeSourceUnavailable) || err.Error() != "SOURCE_UNAVAILABLE" {
-			t.Fatalf("unsupported native source: %v %v", p, err)
-		}
+	p, err := NewFinalizePreview(context.Background(), &finalizeLegacySource{f}, nil)
+	if p != nil || !errors.Is(err, ErrFinalizeSourceUnavailable) || err.Error() != "SOURCE_UNAVAILABLE" {
+		t.Fatalf("unsupported legacy source: %v %v", p, err)
 	}
 	if len(f.calls) != 0 {
 		t.Fatalf("unsupported source performed reads: %v", f.calls)
+	}
+}
+
+func TestFinalizeSourceNativeStoreUnavailable(t *testing.T) {
+	for _, source := range []*sqlite.Store{nil, new(sqlite.Store)} {
+		p, err := NewFinalizePreview(context.Background(), source, nil)
+		var gap *storepkg.FinalizeSourceUnavailableError
+		if p != nil || !errors.Is(err, storepkg.ErrFinalizeSourceUnavailable) ||
+			!errors.As(err, &gap) || gap.Source != "sessions" {
+			t.Fatalf("missing native store must fail with inventory source gap: %v %v", p, err)
+		}
+	}
+}
+
+// All writes below seed disposable synthetic databases, never live AO state.
+func newFinalizeSQLiteFixture(t *testing.T, count int) (*sqlite.Store, *sql.DB) {
+	t.Helper()
+	dir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dir)
+	db, err := sql.Open("sqlite", filepath.Join(dir, "ao.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UTC()
+	if _, err := tx.Exec(`INSERT INTO projects (id, path, registered_at) VALUES ('finalize', '/synthetic', ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	// Reverse insertion distinguishes exact ID ordering from creation order.
+	for i := count; i > 0; i-- {
+		if _, err := tx.Exec(`INSERT INTO sessions
+			(id, project_id, num, activity_last_at, created_at, updated_at)
+			VALUES (?, 'finalize', ?, ?, ?, ?)`, fmt.Sprintf("native-%05d", i), count-i+1, now, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return s, db
+}
+
+func TestFinalizeSourceSQLiteEmptyAndMissingSchema(t *testing.T) {
+	s, db := newFinalizeSQLiteFixture(t, 0)
+	p, err := NewFinalizePreview(context.Background(), s, nil)
+	if err != nil || p == nil {
+		t.Fatalf("supported empty inventory: %v %v", p, err)
+	}
+	page, err := p.Page(context.Background(), 0)
+	if err != nil || page.Mode != FinalizePlanOnly || page.Total != 0 || len(page.Rows) != 0 || page.NextOffset != -1 {
+		t.Fatalf("empty page: %+v %v", page, err)
+	}
+	if _, err := db.Exec(`DROP TABLE sessions`); err != nil {
+		t.Fatal(err)
+	}
+	p, err = NewFinalizePreview(context.Background(), s, nil)
+	var gap *storepkg.FinalizeSourceUnavailableError
+	if p != nil || !errors.Is(err, storepkg.ErrFinalizeSourceUnavailable) ||
+		!errors.As(err, &gap) || gap.Source != "sessions" {
+		t.Fatalf("missing schema treated as empty: %v %v", p, err)
+	}
+}
+
+func TestFinalizeSourceSQLiteEvidenceAndGaps(t *testing.T) {
+	s, db := newFinalizeSQLiteFixture(t, 1)
+	row := finalizeReadRow(t, s, nil)
+	if row.Evidence.Session.ID != "native-00001" || row.Evidence.CleanupPresent ||
+		row.Evidence.SessionRevisionReadback != row.Evidence.Session.Revision ||
+		row.Evidence.PRsComplete != FinalizeYes || row.Evidence.WorktreesComplete != FinalizeYes ||
+		len(row.Evidence.PRs) != 0 || len(row.Evidence.Worktrees) != 0 {
+		t.Fatalf("lost native identity or supported empty facts: %+v", row.Evidence)
+	}
+	for _, tc := range []struct{ table, field string }{{"pr", "prs"}, {"session_worktrees", "worktrees"}} {
+		if _, err := db.Exec(`DROP TABLE ` + tc.table); err != nil {
+			t.Fatal(err)
+		}
+		row = finalizeReadRow(t, s, nil)
+		assertFinalizeSourceHold(t, row, "source."+tc.field, FinalizeMissing)
+		assertFinalizeSourceHold(t, row, "source."+tc.field+".readback", FinalizeMissing)
+		if (tc.field == "prs" && row.Evidence.PRsComplete != FinalizeUnknown) ||
+			(tc.field == "worktrees" && row.Evidence.WorktreesComplete != FinalizeUnknown) {
+			t.Fatalf("unavailable native facts treated as empty: %+v", row.Evidence)
+		}
+	}
+}
+
+func TestFinalizeSourceSQLiteInventoryBound(t *testing.T) {
+	s, db := newFinalizeSQLiteFixture(t, FinalizeSourceMaxSessions+1)
+	p, err := NewFinalizePreview(context.Background(), s, nil)
+	if p != nil || !errors.Is(err, storepkg.ErrFinalizeSourceUnavailable) || !errors.Is(err, storepkg.ErrFinalizeSourceOverflow) {
+		t.Fatalf("overflow inventory accepted or cause lost: %v %v", p, err)
+	}
+	if _, err := db.Exec(`DELETE FROM sessions WHERE id = ?`, fmt.Sprintf("native-%05d", FinalizeSourceMaxSessions+1)); err != nil {
+		t.Fatal(err)
+	}
+	p, err = NewFinalizePreview(context.Background(), s, nil)
+	if err != nil || p == nil {
+		t.Fatalf("inclusive inventory bound rejected: %v", err)
+	}
+	seen := 0
+	for offset := 0; offset >= 0; {
+		page, err := p.Page(context.Background(), offset)
+		if err != nil || page.Total != FinalizeSourceMaxSessions || len(page.Rows) > FinalizePlanPageSize {
+			t.Fatalf("bounded native page: %+v %v", page, err)
+		}
+		for _, row := range page.Rows {
+			seen++
+			if row.Evidence.Session.ID != domain.SessionID(fmt.Sprintf("native-%05d", seen)) ||
+				row.Plan.State != FinalizeHeld || row.Plan.PhysicalRemovalEligible ||
+				!slices.Contains(row.Plan.Holds, FinalizeHold{"owner.release_qualification", FinalizeReleaseUnqualified}) {
+				t.Fatalf("native ordering or release hold lost: %+v", row)
+			}
+		}
+		offset = page.NextOffset
+	}
+	if seen != FinalizeSourceMaxSessions {
+		t.Fatalf("native inventory truncated: %d", seen)
+	}
+}
+
+func TestFinalizeSourceSQLiteFactBounds(t *testing.T) {
+	s, db := newFinalizeSQLiteFixture(t, 1)
+	for i := 1; i <= FinalizeSourceMaxFacts+1; i++ {
+		if _, err := db.Exec(`INSERT INTO pr (url, session_id, number, updated_at)
+			VALUES (?, 'native-00001', ?, ?)`, fmt.Sprintf("pr/%03d", i), i, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, worktree_path)
+			VALUES ('native-00001', ?, 'branch', '', ?)`, fmt.Sprintf("repo-%03d", i), fmt.Sprintf("/synthetic/%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+		if i == FinalizeSourceMaxFacts {
+			row := finalizeReadRow(t, s, nil)
+			if row.Evidence.PRsComplete != FinalizeYes || row.Evidence.WorktreesComplete != FinalizeYes ||
+				len(row.Evidence.PRs) != i || len(row.Evidence.Worktrees) != i {
+				t.Fatalf("inclusive fact bound rejected: %+v", row.Evidence)
+			}
+		}
+	}
+	row := finalizeReadRow(t, s, nil)
+	for _, field := range []string{"prs", "worktrees"} {
+		assertFinalizeSourceHold(t, row, "source."+field, FinalizeMissing)
+		assertFinalizeSourceHold(t, row, "source."+field+".readback", FinalizeMissing)
+	}
+	if row.Evidence.PRsComplete != FinalizeUnknown || row.Evidence.WorktreesComplete != FinalizeUnknown ||
+		len(row.Evidence.PRs) != 0 || len(row.Evidence.Worktrees) != 0 {
+		t.Fatalf("overflow accepted as partial facts: %+v", row.Evidence)
 	}
 }
 

@@ -25,8 +25,8 @@ var ErrFinalizeSourceUnavailable = errors.New("SOURCE_UNAVAILABLE")
 // materializing results, for initial reads AND readbacks. Each method returns
 // the complete set or an error on overflow, never a silently truncated set.
 // Wrapping an unbounded ListAll/List method does not satisfy this contract.
-// The current SQLite store does not implement this seam and is rejected before
-// any reads. Adding native support is a separately scoped store prerequisite.
+// The SQLite store supplies this seam with bounded native reads. Legacy sources
+// without it are rejected before any reads; unavailable native reads fail closed.
 type FinalizeBoundedSource interface {
 	FinalizeSource
 	ListFinalizeSessions(context.Context, int) ([]domain.SessionRecord, error)
