@@ -268,6 +268,58 @@ class RangeTests(unittest.TestCase):
                 self.assertTrue(all(selection[key] for key in ci.SUITES))
 
 
+class BackendPartitionTests(unittest.TestCase):
+    def setUp(self):
+        self.general = [ci.BACKEND_MODULE + suffix for suffix in (
+            "", "/cmd/ao", "/internal/service/chat/nested",
+            "/internal/storage/sqlite/store/nested", "/internal/storage/sqlite/sqlitetest",
+        )]
+        self.inventory = [*ci.ISOLATED_PACKAGES.values(), *self.general]
+
+    def test_complete_disjoint_partition_keeps_new_and_nested_packages(self):
+        for packages in (self.inventory, list(reversed(self.inventory))):
+            groups = ci.backend_partition(packages)
+            self.assertEqual(set(groups), {"general", "chat", "store", "sqlite"})
+            self.assertEqual(set(groups["general"]), set(self.general))
+            for group, package in ci.ISOLATED_PACKAGES.items():
+                self.assertEqual(groups[group], [package])
+            assigned = list(itertools.chain.from_iterable(groups.values()))
+            self.assertEqual(sorted(assigned), sorted(packages))
+            self.assertEqual(len(assigned), len(set(assigned)))
+
+    def test_empty_duplicate_malformed_or_missing_inventory_fails_closed(self):
+        bad = [[], list(ci.ISOLATED_PACKAGES.values()),
+               [*self.inventory, self.inventory[0]]]
+        bad += [[*self.inventory, value] for value in (
+            "", " ", "other/module/package", ci.BACKEND_MODULE + "-foreign/package",
+            ci.BACKEND_MODULE + "/package with whitespace",
+        )]
+        bad += [[package for package in self.inventory if package != missing]
+                for missing in ci.ISOLATED_PACKAGES.values()]
+        for packages in bad:
+            with self.subTest(packages=packages), self.assertRaises(ValueError):
+                ci.backend_partition(packages)
+
+    def test_actual_partition_cli_stdout_and_failure_diagnostics(self):
+        script = str(ROOT / ".github/scripts/ci_select.py")
+        for group in ("general", "chat", "store"):
+            result = subprocess.run(
+                [sys.executable, "-B", script, "--backend-packages", group],
+                input="\n".join(self.inventory) + "\n", text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ci.backend_partition(self.inventory)[group])
+            self.assertIn("chat=1, store=1, sqlite=1, general=5", result.stderr)
+            for inventory in ([], self.inventory[1:], [*self.inventory, ""]):
+                result = subprocess.run(
+                    [sys.executable, "-B", script, "--backend-packages", group],
+                    input="\n".join(inventory) + "\n", text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Backend race partition failed:", result.stderr)
+
+
 class WorkflowContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -310,6 +362,34 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", cli_jobs["native"])
         self.assertIn("go test -tags e2e -v ./internal/cli/...", cli_jobs["native"])
         self.assertIn("docker run --rm --init ao-cli-smoke", cli_jobs["container"])
+
+    def test_backend_race_groups_and_selector_mapping(self):
+        jobs = self.jobs(self.go)
+        groups = {"backend-checks": "general", "backend-chat-race": "chat",
+                  "backend-store-race": "store"}
+        for job, group in groups.items():
+            body = jobs[job]
+            self.assertEqual(ci.GO_JOBS[job], "backend")
+            self.assertIn("runs-on: ubuntu-latest", body)
+            self.assertIn("go-version-file: backend/go.mod", body)
+            self.assertIn("cache: false", body)
+            self.assertIn("set -euo pipefail", body)
+            self.assertIn("package_list=$(go list ./...)", body)
+            self.assertIn(f'--backend-packages {group})', body)
+            self.assertIn('mapfile -t packages <<< "$selected"', body)
+            commands = re.findall(r'^\s+go test .+$', body, flags=re.MULTILINE)
+            self.assertEqual(len(commands), 1)
+            command = commands[0]
+            self.assertIn('-race ', command)
+            self.assertIn('-count=1 ', command)
+            self.assertIn('-timeout=30m "${packages[@]}"', command)
+            self.assertNotIn('-run', command)
+            self.assertNotIn('-skip', command)
+            if group != "general":
+                self.assertIn('-p=1 -parallel=1 ', command)
+                self.assertIn('timeout-minutes: 35', body)
+        self.assertIn("go build ./...", jobs["backend-checks"])
+        self.assertIn("go vet ./...", jobs["backend-checks"])
 
     def test_cli_output_validation_and_dependency_failure_truth_table(self):
         jobs = self.jobs(self.cli)

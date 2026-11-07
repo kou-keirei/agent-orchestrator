@@ -39,7 +39,7 @@ jobs:
 
   # Keep the existing check name; require every applicable Go suite, not skips.
   build-test:
-    needs: [select, backend-checks, sqlite-race, windows-workspace, windows-journal, cloud-build-test, lint, sqlc-drift, api-drift]
+    needs: [select, backend-checks, backend-chat-race, backend-store-race, sqlite-race, windows-workspace, windows-journal, cloud-build-test, lint, sqlc-drift, api-drift]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -81,27 +81,62 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test backend packages outside the SQLite race matrix
+      - name: Partition and race-test general backend packages
         shell: bash
         run: |
           set -euo pipefail
-          sqlite_package=$(go list ./internal/storage/sqlite)
           package_list=$(go list ./...)
-          mapfile -t packages <<< "$package_list"
-          other_packages=()
-          sqlite_count=0
-          for package in "${packages[@]}"; do
-            if [[ "$package" == "$sqlite_package" ]]; then
-              sqlite_count=$((sqlite_count + 1))
-            else
-              other_packages+=("$package")
-            fi
-          done
-          test "$sqlite_count" -eq 1
-          test "${#other_packages[@]}" -gt 0
-          # Allow the complete SQLite-heavy Chat race suite to finish without
-          # dropping packages or test cases.
-          go test -race -timeout=30m "${other_packages[@]}"
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages general)
+          mapfile -t packages <<< "$selected"
+          go test -race -count=1 -timeout=30m "${packages[@]}"
+
+  # Separate hosted runners remove cross-package race/stress contention. Each
+  # job runs its entire package once, with the existing test timeout unchanged.
+  backend-chat-race:
+    needs: select
+    if: needs.select.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+      - name: Partition and race-test the complete chat package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages chat)
+          mapfile -t packages <<< "$selected"
+          go test -race -p=1 -parallel=1 -count=1 -timeout=30m "${packages[@]}"
+
+  backend-store-race:
+    needs: select
+    if: needs.select.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+      - name: Partition and race-test the complete sqlite/store package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages store)
+          mapfile -t packages <<< "$selected"
+          go test -race -p=1 -parallel=1 -count=1 -timeout=30m "${packages[@]}"
 
   sqlite-race:
     needs: select

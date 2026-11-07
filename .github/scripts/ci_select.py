@@ -2,8 +2,8 @@
 """Conservative CI selection; standard library only. Run tests with unittest.
 
 Only the named test fixtures have a backend-only proof: backend-checks still
-builds/vets everything and race-tests all non-SQLite packages (including these
-fixtures and storage/store), and lint still checks the backend. They change no
+builds/vets everything; the general, chat and store jobs race-test every package
+outside the SQLite matrix, and lint still checks the backend. They change no
 production storage, generated contracts, cloud, CLI or native Windows suites.
 Every other backend change, including lease/parent/Chat writer tests, is full.
 This is path selection, not permission to reuse a skipped suite as a PASS.
@@ -20,10 +20,17 @@ import sys
 
 SUITES = ("backend", "sqlite", "windows", "cloud", "lint", "sqlc", "api", "cli")
 GO_JOBS = {
-    "backend-checks": "backend", "sqlite-race": "sqlite",
+    "backend-checks": "backend", "backend-chat-race": "backend",
+    "backend-store-race": "backend", "sqlite-race": "sqlite",
     "windows-workspace": "windows", "windows-journal": "windows",
     "cloud-build-test": "cloud", "lint": "lint", "sqlc-drift": "sqlc",
     "api-drift": "api",
+}
+BACKEND_MODULE = "github.com/aoagents/agent-orchestrator/backend"
+ISOLATED_PACKAGES = {
+    "chat": BACKEND_MODULE + "/internal/service/chat",
+    "store": BACKEND_MODULE + "/internal/storage/sqlite/store",
+    "sqlite": BACKEND_MODULE + "/internal/storage/sqlite",
 }
 FIXTURES = frozenset({
     "backend/internal/service/chat/provider_event_restore_fixture_test.go",
@@ -118,10 +125,48 @@ def check_go(needs):
         print(f"{job}: {'PASS' if selection[suite] else 'NOT APPLICABLE (not run)'}")
 
 
+def backend_partition(packages):
+    """Partition the complete go list inventory, failing before any tests run.
+
+    The SQLite package stays in its existing four test shards. New packages
+    belong to general automatically; exact matches alone isolate chat/store.
+    """
+    if not packages or any(not package or any(char.isspace() for char in package)
+                           or not (package == BACKEND_MODULE or
+                                   package.startswith(BACKEND_MODULE + "/"))
+                           for package in packages):
+        raise ValueError("invalid or empty backend go list inventory")
+    if len(packages) != len(set(packages)):
+        raise ValueError("duplicate packages in backend go list inventory")
+    missing = sorted(set(ISOLATED_PACKAGES.values()) - set(packages))
+    if missing:
+        raise ValueError(f"missing isolated backend packages: {missing}")
+    groups = {name: [package] for name, package in ISOLATED_PACKAGES.items()}
+    groups["general"] = [package for package in packages
+                         if package not in ISOLATED_PACKAGES.values()]
+    if not all(groups.values()):
+        raise ValueError("empty backend race group")
+    assigned = [package for group in groups.values() for package in group]
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(packages):
+        raise ValueError("backend race partition is not exhaustive and disjoint")
+    return groups
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check-go", action="store_true")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--check-go", action="store_true")
+    actions.add_argument("--backend-packages", choices=("general", "chat", "store"))
     args = parser.parse_args()
+    if args.backend_packages:
+        try:
+            groups = backend_partition(sys.stdin.read().splitlines())
+        except ValueError as err:
+            parser.exit(1, f"Backend race partition failed: {err}\n")
+        print("Backend race partition: " + ", ".join(
+            f"{name}={len(group)}" for name, group in groups.items()), file=sys.stderr)
+        print("\n".join(groups[args.backend_packages]))
+        return
     if args.check_go:
         check_go(json.loads(os.environ["NEEDS_JSON"]))
         return
