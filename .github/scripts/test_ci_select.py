@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,8 +18,9 @@ import ci_select as ci
 
 ROOT = Path(__file__).resolve().parents[2]
 FULL = set(ci.SUITES)
-FIXTURE = "backend/internal/adapters/reportactor/acceptance_sqlite_test.go"
+FIXTURE = "backend/internal/service/chat/provider_event_restore_equivalence_test.go"
 CHAT_FIXTURE = "backend/internal/service/chat/provider_event_restore_fixture_test.go"
+REMOVED_REPORTACTOR = "backend/internal/adapters/reportactor/acceptance_sqlite_test.go"
 
 
 def selected(paths=None, event="pull_request"):
@@ -35,7 +37,7 @@ def needs_for(selection):
 class SelectionTests(unittest.TestCase):
     def test_table(self):
         cases = [
-            ("reportactor fixture", [FIXTURE], {"backend", "lint"}),
+            ("unreviewed reportactor fixture", [REMOVED_REPORTACTOR], FULL),
             ("chat fixture", [CHAT_FIXTURE], {"backend", "lint"}),
             ("chat equivalence", ["backend/internal/service/chat/provider_event_restore_equivalence_test.go"], {"backend", "lint"}),
             ("fixtures and docs", [FIXTURE, CHAT_FIXTURE, "docs/README.md"], {"backend", "lint"}),
@@ -80,6 +82,11 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(selected(paths), expected)
 
     def test_every_allowlisted_fixture(self):
+        # Bind exceptions to committed Git source, not merely strings or
+        # untracked working files. Future exceptions need actual reviewed source.
+        tracked = ci.git("-C", str(ROOT), "ls-tree", "-r", "--name-only", "HEAD",
+                         "--", *sorted(ci.FIXTURES)).decode().splitlines()
+        self.assertEqual(set(tracked), ci.FIXTURES)
         for path in ci.FIXTURES:
             with self.subTest(path=path):
                 self.assertEqual(selected([path]), {"backend", "lint"})
@@ -107,7 +114,7 @@ class SelectionTests(unittest.TestCase):
         # Representative paths from live PR58 head 23768b2e; the fixture must
         # never narrow the broad parent/lease/writer/source qualification.
         self.assertEqual(selected([
-            FIXTURE,
+            REMOVED_REPORTACTOR,
             "backend/internal/adapters/reportactor/acceptance.go",
             "backend/internal/service/chat/worker_report_actor.go",
             "backend/internal/domain/work_item_parent.go",
@@ -299,10 +306,47 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(set(cli_jobs), {"select", "native", "container"})
         for job in ("native", "container"):
             self.assertIn("needs: select", cli_jobs[job])
-            self.assertIn("if: needs.select.outputs.cli == 'true'", cli_jobs[job])
+            self.assertIn("if: ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.cli != 'false') }}", cli_jobs[job])
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", cli_jobs["native"])
         self.assertIn("go test -tags e2e -v ./internal/cli/...", cli_jobs["native"])
         self.assertIn("docker run --rm --init ao-cli-smoke", cli_jobs["container"])
+
+    def test_cli_output_validation_and_dependency_failure_truth_table(self):
+        jobs = self.jobs(self.cli)
+        validation = jobs["select"].split("- name: Validate CLI selection output", 1)[1]
+        self.assertIn("CLI_SELECTION: ${{ steps.select.outputs.cli }}", validation)
+        code = re.search(r'run: python3 -c "([^"\n]+)"', validation).group(1)
+        # Test the actual inline validator, including Actions' case-insensitive
+        # string comparison edge. Missing outputs are empty strings in needs.
+        outputs = ("", "true", "false", "TRUE", "FALSE", "False", " false",
+                   "false ", "false\n", '"false"', "0", "null", "{}", "garbage")
+        for output in outputs:
+            validated = subprocess.run(
+                [sys.executable, "-c", code],
+                env=dict(os.environ, CLI_SELECTION=output), capture_output=True,
+            ).returncode
+            self.assertEqual(validated, 0 if output in ("true", "false") else 1)
+            for result, cancelled, job in itertools.product(
+                ("success", "failure", "cancelled", "skipped", "", "unknown"),
+                (False, True), ("native", "container"),
+            ):
+                # Invalid output turns an otherwise successful select into a
+                # failed job through the validator's nonzero process exit.
+                effective_result = "failure" if result == "success" and validated else result
+                expected = not cancelled and not (result == "success" and output == "false")
+                with self.subTest(output=output, result=result, cancelled=cancelled, job=job):
+                    predicate = re.search(r"if: \$\{\{ (.+) \}\}", jobs[job]).group(1)
+                    # Evaluate only these source predicate terms, not a general
+                    # Actions engine. Native scheduling remains a hosted check.
+                    predicate = predicate.replace("!cancelled()", str(not cancelled))
+                    predicate = predicate.replace("needs.select.result != 'success'",
+                                                  str(effective_result.casefold() != "success"))
+                    predicate = predicate.replace("needs.select.outputs.cli != 'false'",
+                                                  str(output.casefold() != "false"))
+                    self.assertRegex(predicate, r"^[TrueFals ()&|]+$")
+                    actual = eval(predicate.replace("&&", " and ").replace("||", " or "),
+                                  {"__builtins__": {}}, {})
+                    self.assertEqual(actual, expected)
 
     def test_trigger_permissions_no_masks_and_security_unconditional(self):
         for workflow in (self.go, self.cli):

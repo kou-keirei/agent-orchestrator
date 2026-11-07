@@ -26,7 +26,6 @@ GO_JOBS = {
     "api-drift": "api",
 }
 FIXTURES = frozenset({
-    "backend/internal/adapters/reportactor/acceptance_sqlite_test.go",
     "backend/internal/service/chat/provider_event_restore_fixture_test.go",
     "backend/internal/service/chat/provider_event_restore_equivalence_test.go",
 })
