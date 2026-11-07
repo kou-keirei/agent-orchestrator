@@ -4,21 +4,43 @@ on:
   push:
     branches: [main]
   pull_request:
-    paths:
-      - "backend/**"
-      - "test/cli/**"
-      - ".github/workflows/cli-e2e.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: cli-e2e-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      cli: ${{ steps.select.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Select CLI coverage (unknown ranges run everything)
+        id: select
+        run: python3 .github/scripts/ci_select.py
+      # Actions string comparisons ignore case. A successful selector must
+      # emit canonical output before literal false may suppress CLI coverage.
+      - name: Validate CLI selection output
+        env:
+          CLI_SELECTION: ${{ steps.select.outputs.cli }}
+        run: python3 -c "import os, sys; sys.exit(os.environ['CLI_SELECTION'] not in ('true', 'false'))"
+
   # Primary tier: the cross-platform Go E2E suite (build tag `e2e`) runs the real
   # `ao` binary against isolated state on every OS GitHub hosts. These runners
   # are the "VMs" — the only place that exercises the OS-specific process-detach
   # paths (unix Setsid vs Windows CREATE_NEW_PROCESS_GROUP) and os.UserConfigDir
   # resolution. The suite builds its own binary and self-allocates a free port.
   native:
+    needs: select
+    # Unknown selection runs the full suite; superseded workflow cancellation
+    # still stops work. The status function avoids implicit success() gating.
+    if: ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.cli != 'false') }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +66,8 @@ jobs:
   # --init gives a real PID-1 reaper so the daemon the check starts is reaped
   # after `stop` instead of lingering as a zombie.
   container:
+    needs: select
+    if: ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.cli != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
