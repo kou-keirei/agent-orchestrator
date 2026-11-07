@@ -14,6 +14,8 @@ import (
 )
 
 type fakeStore struct {
+	semanticReports                   map[string]bool
+	semanticReadErr                   error
 	reportsHeld                       bool
 	reportHoldErr                     error
 	reportHoldCalls                   int
@@ -25,6 +27,8 @@ type fakeStore struct {
 	attentionEvents                   []domain.OrchestrationEvent
 	leased, submitted, acked, retried []string
 	cleared                           []string
+	clearedReports                    []string
+	clearReportErr                    error
 	destination                       domain.SessionID
 	leaseErr, submitErr, ackErr       error
 	getErr                            error
@@ -35,6 +39,22 @@ type fakeStore struct {
 func (f *fakeStore) HoldWorkerReportDeliveries(context.Context, domain.ProjectID, time.Time) (bool, error) {
 	f.reportHoldCalls++
 	return f.reportsHeld, f.reportHoldErr
+}
+
+func (f *fakeStore) WorkerReportSemanticallyResolved(_ context.Context, e domain.OrchestrationEvent) (bool, error) {
+	return f.semanticReports[e.ID], f.semanticReadErr
+}
+
+func (f *fakeStore) ClearResolvedWorkerReportAttention(_ context.Context, events []domain.OrchestrationEvent) error {
+	if f.clearReportErr != nil {
+		return f.clearReportErr
+	}
+	for _, event := range events {
+		if event.Kind == domain.OrchestrationWorkerReport && f.semanticReports[event.ID] {
+			f.clearedReports = append(f.clearedReports, event.ID)
+		}
+	}
+	return nil
 }
 
 func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.SessionRecord, bool, error) {
@@ -617,6 +637,104 @@ func TestDispatchHoldBoundaries(t *testing.T) {
 			}
 			if phase != "after-lease" && len(s.leased) != 0 {
 				t.Fatal("unexpected lease")
+			}
+		})
+	}
+}
+
+func TestReportAttentionUsesSemanticReadbackAndPreservesUnresolvedPeers(t *testing.T) {
+	for _, name := range []string{"semantic", "generic_ack", "unresolved_peer", "read_error", "no_marker_generic"} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC()
+			report := domain.OrchestrationEvent{ID: "report", ProjectID: "p", WorkerID: "worker",
+				Kind: domain.OrchestrationWorkerReport, State: domain.OrchestrationAcknowledged, AttentionRequiredAt: now}
+			s := &fakeStore{attentionEvents: []domain.OrchestrationEvent{report}, semanticReports: map[string]bool{report.ID: name != "generic_ack" && name != "no_marker_generic"}}
+			if name == "unresolved_peer" {
+				s.attentionEvents = append(s.attentionEvents, domain.OrchestrationEvent{ID: "peer", ProjectID: "p", WorkerID: report.WorkerID,
+					Kind: domain.OrchestrationWorkerReport, State: domain.OrchestrationSubmitted, AttentionRequiredAt: now})
+			}
+			failure := errors.New("semantic read unavailable")
+			if name == "read_error" {
+				s.semanticReadErr = failure
+			}
+			n := &fakeNotifier{}
+			d := &Dispatcher{Store: s, Notifier: n}
+			if name == "no_marker_generic" {
+				s.attentionEvents = nil
+				if err := d.resolveAttention(t.Context(), []domain.OrchestrationEvent{report}, now); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := d.ReconcileAttention(t.Context(), "p", now); name == "read_error" {
+				if !errors.Is(err, failure) {
+					t.Fatalf("read error: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if name == "semantic" {
+				if !slices.Equal(n.resolved, []domain.SessionID{report.WorkerID}) || len(n.created) != 0 || !slices.Equal(s.cleared, []string{report.ID}) {
+					t.Fatalf("resolved=%v created=%v cleared=%v", n.resolved, n.created, s.cleared)
+				}
+			} else {
+				wantNotify := 1
+				if name == "read_error" || name == "no_marker_generic" {
+					wantNotify = 0
+				}
+				if len(n.resolved) != 0 || len(s.cleared) != 0 || len(n.created) != wantNotify {
+					t.Fatalf("unresolved: resolved=%v created=%v cleared=%v", n.resolved, n.created, s.cleared)
+				}
+			}
+		})
+	}
+}
+
+func TestDispatchFirstResolvedReportAttentionRetriesWithoutHeldOrDueWork(t *testing.T) {
+	for _, name := range []string{"success", "resolve_failure", "clear_failure", "read_failure", "unresolved_peer"} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC()
+			report := domain.OrchestrationEvent{ID: "report", ProjectID: "p", WorkerID: "worker",
+				Kind: domain.OrchestrationWorkerReport, State: domain.OrchestrationAcknowledged, AttentionRequiredAt: now}
+			s := &fakeStore{attentionEvents: []domain.OrchestrationEvent{report}, semanticReports: map[string]bool{report.ID: true}}
+			n := &fakeNotifier{}
+			failure := errors.New("attention boundary unavailable")
+			switch name {
+			case "resolve_failure":
+				n.resolveErr = failure
+			case "clear_failure":
+				s.clearReportErr = failure
+			case "read_failure":
+				s.semanticReadErr = failure
+			case "unresolved_peer":
+				s.reportsHeld = true
+				s.attentionEvents = append(s.attentionEvents, domain.OrchestrationEvent{ID: "peer", ProjectID: "p", WorkerID: report.WorkerID,
+					Kind: domain.OrchestrationWorkerReport, State: domain.OrchestrationSubmitted, AttentionRequiredAt: now})
+			}
+			tr := &fakeTransport{}
+			d := &Dispatcher{Store: s, Notifier: n, Transport: tr, Now: func() time.Time { return now }}
+			err := d.DispatchProject(t.Context(), "p")
+			switch name {
+			case "success":
+				if err != nil || !slices.Equal(n.resolved, []domain.SessionID{report.WorkerID}) || !slices.Equal(s.clearedReports, []string{report.ID}) {
+					t.Fatalf("dispatch skipped resolved report: err=%v resolved=%v cleared=%v", err, n.resolved, s.clearedReports)
+				}
+			case "unresolved_peer":
+				if !errors.Is(err, ErrReportDeliveryHeld) || len(n.resolved) != 0 || len(s.clearedReports) != 0 || len(n.created) != 1 {
+					t.Fatalf("peer lost attention: err=%v notifier=%+v cleared=%v", err, n, s.clearedReports)
+				}
+			default:
+				if !errors.Is(err, failure) || len(s.clearedReports) != 0 {
+					t.Fatalf("retry evidence lost: err=%v cleared=%v", err, s.clearedReports)
+				}
+				if name != "clear_failure" && (len(n.resolved) != 0 || len(s.cleared) != 0) {
+					t.Fatalf("failed resolution cleared attention: notifier=%+v cleared=%v", n, s.cleared)
+				}
+				n.resolveErr, s.clearReportErr, s.semanticReadErr = nil, nil, nil
+				if err := d.DispatchProject(t.Context(), "p"); err != nil || !slices.Equal(s.clearedReports, []string{report.ID}) {
+					t.Fatalf("dispatch retry: err=%v cleared=%v", err, s.clearedReports)
+				}
+			}
+			if tr.calls != 0 || len(s.leased) != 0 || len(s.submitted) != 0 || len(s.acked) != 0 || s.sessionLists != 0 {
+				t.Fatalf("attention recovery entered transport: calls=%d store=%+v", tr.calls, s)
 			}
 		})
 	}
