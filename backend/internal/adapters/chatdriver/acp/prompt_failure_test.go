@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"testing/synctest"
 
 	acpsdk "github.com/coder/acp-go-sdk"
 
@@ -14,6 +15,37 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestACPReadyAllowsImmediateFollowup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conv := &conversation{
+			sessionID: "session", activeTurn: "turn-1",
+			events: make(chan ports.ChatEvent), log: slog.New(slog.DiscardHandler),
+		}
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			conv.finishPrompt("turn-1", acpsdk.PromptResponse{StopReason: acpsdk.StopReasonEndTurn}, nil)
+		}()
+		completed := <-conv.events
+		if completed.Kind != ports.ChatEventTurnCompleted || completed.ProviderTurnID != "turn-1" {
+			t.Fatalf("completion = %#v", completed)
+		}
+		// The unbuffered Ready publication must be blocked until we receive it.
+		// Its consumers must already be able to prepare a turn at this boundary.
+		synctest.Wait()
+		ref, err := conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "follow-up"})
+		if err != nil || ref.ProviderTurnID == "" {
+			t.Fatalf("Ready retained the prior turn: ref=%#v err=%v", ref, err)
+		}
+		ready := <-conv.events
+		if ready.Kind != ports.ChatEventControllerState || ready.ControllerState != ports.ChatControllerReady {
+			t.Fatalf("ready = %#v", ready)
+		}
+		<-finished
+		conv.DiscardDeferredTurn(ref.ProviderTurnID)
+	})
+}
 
 func TestACPDriverPromptResponseFailure(t *testing.T) {
 	for _, tc := range []struct {

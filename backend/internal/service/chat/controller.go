@@ -211,7 +211,10 @@ type Controller struct {
 	// turn-started notification arriving. Interrupt needs the distinction: a
 	// provider refuses to cancel a turn it has not acknowledged yet.
 	ackedTurnID string
-	state       ports.ChatControllerState
+	// reportTurn is captured only from a committed primary native turn event.
+	// Its pointer identity retires report callers when a turn is replaced.
+	reportTurn *workerReportNativeTurn
+	state      ports.ChatControllerState
 	// settings are the provider choices applied to the next dispatch. Held here as
 	// well as on disk so a dispatch does not need a read, and updated together with
 	// the row so the two cannot drift.
@@ -2733,6 +2736,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 		}
 		c.pendingTurnID = event.ProviderTurnID
 		c.ackedTurnID = event.ProviderTurnID
+		c.observeWorkerReportTurnLocked(event)
 		c.state = ports.ChatControllerBusy
 		return true
 	case ports.ChatEventTurnCompleted:
@@ -2740,6 +2744,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 			return false
 		}
 		c.pendingTurnID = ""
+		c.reportTurn = nil
 		if c.ackedTurnID == event.ProviderTurnID {
 			c.ackedTurnID = ""
 		}

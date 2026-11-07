@@ -83,7 +83,9 @@ jobs:
           done
           test "$sqlite_count" -eq 1
           test "${#other_packages[@]}" -gt 0
-          go test -race -timeout=20m "${other_packages[@]}"
+          # Allow the complete SQLite-heavy Chat race suite to finish without
+          # dropping packages or test cases.
+          go test -race -timeout=30m "${other_packages[@]}"
 
   sqlite-race:
     runs-on: ubuntu-latest
