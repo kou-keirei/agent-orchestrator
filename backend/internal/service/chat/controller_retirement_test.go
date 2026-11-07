@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -246,6 +247,7 @@ func retirementParentIdentity(t *testing.T, f *reportActorFixture) domain.WorkIt
 	}
 	i := f.r.Identity
 	i.ID, i.AttemptID = "issued-child", "issued-child-attempt"
+	i.WorktreePath = filepath.Join(f.dir, "issued-child")
 	i.OriginalParentSessionID = f.c.sessionID
 	i.OriginalWorkerSessionID, i.OwnerSessionID = worker.ID, worker.ID
 	for _, id := range []domain.SessionID{f.c.sessionID, worker.ID} {
