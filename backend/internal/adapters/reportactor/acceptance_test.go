@@ -55,7 +55,8 @@ func TestAcceptanceHoldsWithoutIssuer(t *testing.T) {
 }
 
 func TestAcceptanceVerifiesEveryInvocationBeforeWriter(t *testing.T) {
-	ctx := context.WithValue(context.Background(), struct{}{}, "untrusted-context-is-not-proof")
+	type reportContextKey struct{}
+	ctx := context.WithValue(context.Background(), reportContextKey{}, "untrusted-context-is-not-proof")
 	report := reportClaim()
 	want := domain.WorkerReportReceipt{Report: report, EventID: "event", AcceptedAtMS: 1}
 	denied := fmt.Errorf("runtime binding: %w", domain.ErrWorkerReportActorBindingUnavailable)
@@ -88,7 +89,7 @@ func TestAcceptanceVerifiesEveryInvocationBeforeWriter(t *testing.T) {
 		t.Fatalf("writer error lost or exposed receipt: %+v %v", got, err)
 	}
 	verificationErr = denied
-	if got, err := acceptance.SubmitWorkerReport(ctx, report); err != denied || got != (domain.WorkerReportReceipt{}) {
+	if got, err := acceptance.SubmitWorkerReport(ctx, report); !errors.Is(err, denied) || got != (domain.WorkerReportReceipt{}) {
 		t.Fatalf("denied retry exposed receipt or lost error: %+v %v", got, err)
 	}
 	if verified != 4 || written != 3 {

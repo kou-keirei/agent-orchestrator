@@ -42,11 +42,11 @@ type reportLeaseReads struct {
 
 func (s *reportLeaseReads) ReadWorkerReportBinding(ctx context.Context, id domain.WorkItemID) (domain.WorkerReportActorBinding, bool, error) {
 	s.reads++
-	item, found, err := s.Store.GetWorkItem(ctx, id)
+	item, found, err := s.GetWorkItem(ctx, id)
 	if err != nil || !found {
 		return domain.WorkerReportActorBinding{}, false, err
 	}
-	lease, found, err := s.Store.GetWorkItemLease(ctx, id)
+	lease, found, err := s.GetWorkItemLease(ctx, id)
 	return domain.WorkerReportActorBinding{Identity: item.Identity, OriginalNativeSessionID: item.OriginalNativeSessionID, Lease: lease}, found, err
 }
 
