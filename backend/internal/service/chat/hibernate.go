@@ -90,6 +90,11 @@ func (s *Service) workingController(ctx context.Context, id domain.SessionID) (*
 			return nil, nil, fmt.Errorf("%w: %w", ports.ErrChatControllerRestore, ErrNoController)
 		}
 		if err := s.restoreController(ctx, id); err != nil {
+			// A native continuity refusal requires a recovery choice. Do not turn
+			// it into the retryable controller-restore response.
+			if errors.Is(err, ports.ErrChatResumeFailed) {
+				return nil, nil, err
+			}
 			return nil, nil, fmt.Errorf("%w: %w", ports.ErrChatControllerRestore, err)
 		}
 	}
