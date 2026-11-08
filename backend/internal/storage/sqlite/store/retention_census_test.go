@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -302,13 +304,66 @@ func TestRetentionCensusEmptyReadOnlyAndCancellation(t *testing.T) {
 	if _, err := c.Page(context.Background(), nil); !errors.Is(err, store.ErrRetentionCensusClosed) {
 		t.Fatalf("canceled page snapshot reused: %v", err)
 	}
-	opts := censusOptions()
-	opts.MaxDuration = 50 * time.Millisecond
-	c = beginCensus(t, f.s, opts)
-	time.Sleep(75 * time.Millisecond)
-	if _, err := c.Page(context.Background(), nil); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("snapshot deadline ignored: %v", err)
-	}
+}
+
+func TestRetentionCensusDeadline(t *testing.T) {
+	// MaxDuration includes opening and pinning the snapshot. A 50ms wall-clock
+	// budget can expire during that setup under -race, before Page is tested.
+	// Keep a real SQLite transaction, but advance its clock only at test barriers.
+	synctest.Test(t, func(t *testing.T) {
+		db, err := sql.Open("sqlite", filepath.ToSlash(filepath.Join(t.TempDir(), "census.db")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		db.SetMaxOpenConns(1)
+		archiveExec(t, db, `CREATE TABLE conversation_provider_events (id INTEGER PRIMARY KEY, method TEXT, provider_event_id TEXT, payload_json TEXT)`)
+		archiveExec(t, db, `INSERT INTO conversation_provider_events VALUES (1, 'message.delta', '', 'a'), (2, 'message.delta', '', 'b')`)
+		s := store.NewStore(db, db)
+		opts := censusOptions()
+		opts.MaxDuration, opts.PageRows = 50*time.Millisecond, 1
+
+		// A held reader deterministically consumes the setup budget. This must
+		// fail at Begin rather than masquerading as a Page cancellation failure.
+		held, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = held.Close() }()
+		started := time.Now()
+		if c, err := s.BeginRetentionCensus(context.Background(), opts); !errors.Is(err, context.DeadlineExceeded) || c != nil {
+			t.Fatalf("reader wait ignored setup deadline: census=%v err=%v", c, err)
+		}
+		if time.Since(started) != opts.MaxDuration || db.Stats().WaitCount != 1 {
+			t.Fatalf("setup did not exhaust the reader wait budget: elapsed=%v stats=%+v", time.Since(started), db.Stats())
+		}
+		if err := held.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		c := beginCensus(t, s, opts)
+		time.Sleep(opts.MaxDuration - time.Nanosecond)
+		first := censusPage(t, c, nil)
+		if first.ScannedRows != 1 || first.Next == nil {
+			t.Fatalf("snapshot expired before deadline: %+v", first)
+		}
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if db.Stats().InUse != 0 {
+			t.Fatal("deadline did not release snapshot reader")
+		}
+		if p, err := c.Page(context.Background(), first.Next); !errors.Is(err, context.DeadlineExceeded) || !reflect.DeepEqual(p, store.RetentionCensusPage{}) {
+			t.Fatalf("snapshot deadline returned data or wrong error: page=%+v err=%v", p, err)
+		}
+		if _, err := c.Page(context.Background(), first.Next); !errors.Is(err, store.ErrRetentionCensusClosed) {
+			t.Fatalf("expired snapshot reused: %v", err)
+		}
+		opts.PageRows = 3
+		fresh := censusPage(t, beginCensus(t, s, opts), nil)
+		if fresh.ScannedRows != 2 || !fresh.WindowComplete {
+			t.Fatalf("deadline changed source rows or prevented a fresh snapshot: %+v", fresh)
+		}
+	})
 }
 
 func TestRetentionCensusRejectsBoundsAndOversizeReport(t *testing.T) {

@@ -4,13 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    paths:
-      - "backend/**"
-      - "cloud/**"
-      - "pricing/**"
-      - "frontend/src/api/schema.ts"
-      - "package.json"
-      - ".github/workflows/go.yml"
 
 permissions:
   contents: read
@@ -20,22 +13,45 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Preserve the existing required check as the gate for every backend test.
+  # No workflow path filter: the source-bound gate must exist on every PR.
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      plan: ${{ steps.select.outputs.plan }}
+      backend: ${{ steps.select.outputs.backend }}
+      sqlite: ${{ steps.select.outputs.sqlite }}
+      windows: ${{ steps.select.outputs.windows }}
+      cloud: ${{ steps.select.outputs.cloud }}
+      lint: ${{ steps.select.outputs.lint }}
+      sqlc: ${{ steps.select.outputs.sqlc }}
+      api: ${{ steps.select.outputs.api }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR merge and its two parent trees suffice; no full history scan.
+          fetch-depth: 2
+      # Run selector regression tests once, not once per selected suite/host.
+      - name: Test CI selection and summary contracts
+        run: python3 -B -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Select affected suites (unknown ranges run everything)
+        id: select
+        run: python3 .github/scripts/ci_select.py
+
+  # Keep the existing check name; require every applicable Go suite, not skips.
   build-test:
-    needs: [backend-checks, sqlite-race]
+    needs: [select, backend-checks, backend-chat-race, backend-store-race, sqlite-race, windows-workspace, windows-journal, cloud-build-test, lint, sqlc-drift, api-drift]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require backend checks and every SQLite race shard
+      - uses: actions/checkout@v4
+      - name: Require successful selection and all selected Go checks
         env:
-          BACKEND_RESULT: ${{ needs.backend-checks.result }}
-          SQLITE_RESULT: ${{ needs.sqlite-race.result }}
-        run: |
-          set -euo pipefail
-          test "$BACKEND_RESULT" = success
-          test "$SQLITE_RESULT" = success
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/ci_select.py --check-go
 
   backend-checks:
+    needs: select
+    if: needs.select.outputs.backend == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -65,29 +81,66 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test backend packages outside the SQLite race matrix
+      - name: Partition and race-test general backend packages
         shell: bash
         run: |
           set -euo pipefail
-          sqlite_package=$(go list ./internal/storage/sqlite)
           package_list=$(go list ./...)
-          mapfile -t packages <<< "$package_list"
-          other_packages=()
-          sqlite_count=0
-          for package in "${packages[@]}"; do
-            if [[ "$package" == "$sqlite_package" ]]; then
-              sqlite_count=$((sqlite_count + 1))
-            else
-              other_packages+=("$package")
-            fi
-          done
-          test "$sqlite_count" -eq 1
-          test "${#other_packages[@]}" -gt 0
-          # Allow the complete SQLite-heavy Chat race suite to finish without
-          # dropping packages or test cases.
-          go test -race -timeout=30m "${other_packages[@]}"
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages general)
+          mapfile -t packages <<< "$selected"
+          go test -race -count=1 -timeout=30m "${packages[@]}"
+
+  # Separate hosted runners remove cross-package race/stress contention. Each
+  # job runs its entire package once, with the existing test timeout unchanged.
+  backend-chat-race:
+    needs: select
+    if: needs.select.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+      - name: Partition and race-test the complete chat package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages chat)
+          mapfile -t packages <<< "$selected"
+          go test -race -p=1 -parallel=1 -count=1 -timeout=30m "${packages[@]}"
+
+  backend-store-race:
+    needs: select
+    if: needs.select.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+      - name: Partition and race-test the complete sqlite/store package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list=$(go list ./...)
+          selected=$(printf '%s\n' "$package_list" | python3 ../.github/scripts/ci_select.py --backend-packages store)
+          mapfile -t packages <<< "$selected"
+          go test -race -p=1 -parallel=1 -count=1 -timeout=30m "${packages[@]}"
 
   sqlite-race:
+    needs: select
+    if: needs.select.outputs.sqlite == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -174,6 +227,8 @@ jobs:
   # an open handle makes both fail. Scoped to those packages rather than the
   # whole suite to keep the matrix cheap.
   windows-workspace:
+    needs: select
+    if: needs.select.outputs.windows == 'true'
     runs-on: windows-latest
     defaults:
       run:
@@ -215,6 +270,8 @@ jobs:
         run: go test -race -count=1 -timeout=10m -run '^Test(FindInstalledBinary|WarmReadinessAndFindInstalled|PresslyGoose|Refresh|Probe|ReadinessCoordinator)' ./internal/service/agent
 
   windows-journal:
+    needs: select
+    if: needs.select.outputs.windows == 'true'
     runs-on: windows-latest
     # Time/concurrency bounds do not enforce child-process or memory quotas.
     timeout-minutes: 15
@@ -236,6 +293,8 @@ jobs:
           ./internal/adapters/chatdriver/persistenthost
 
   cloud-build-test:
+    needs: select
+    if: needs.select.outputs.cloud == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -267,6 +326,8 @@ jobs:
         run: go test -race ./...
 
   lint:
+    needs: select
+    if: needs.select.outputs.lint == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -291,6 +352,8 @@ jobs:
           # any new issue fails CI rather than being grandfathered.
 
   sqlc-drift:
+    needs: select
+    if: needs.select.outputs.sqlc == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -313,6 +376,8 @@ jobs:
           test -z "$(git ls-files --others --exclude-standard -- backend/internal/storage/sqlite/gen)"
 
   api-drift:
+    needs: select
+    if: needs.select.outputs.api == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
