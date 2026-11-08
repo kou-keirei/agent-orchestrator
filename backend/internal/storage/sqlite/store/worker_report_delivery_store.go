@@ -25,13 +25,19 @@ func (s *Store) HoldWorkerReportDeliveries(ctx context.Context, project domain.P
 		}
 		defer s.writeMu.Unlock()
 		return s.inTxDB(ctx, "hold worker reports", func(_ *gen.Queries, db gen.DBTX) error {
-			rows, err := db.QueryContext(ctx, `SELECT `+orchestrationColumns+`
-			 FROM orchestration_events WHERE project_id=? AND kind='worker_report'`, project)
-			if err != nil {
+			if err := reserveReportWriter(ctx, db); err != nil {
 				return err
 			}
-			reports, scanErr := scanOrchestrationEvents(rows)
-			if err := errors.Join(scanErr, rows.Close()); err != nil {
+			reports, err := func() (_ []domain.OrchestrationEvent, err error) {
+				rows, err := db.QueryContext(ctx, `SELECT `+orchestrationColumns+`
+				 FROM orchestration_events WHERE project_id=? AND kind='worker_report'`, project)
+				if err != nil {
+					return nil, err
+				}
+				defer func() { err = errors.Join(err, rows.Close()) }()
+				return scanOrchestrationEvents(rows)
+			}()
+			if err != nil {
 				return err
 			}
 			for _, event := range reports {
@@ -85,6 +91,9 @@ func (s *Store) ClearResolvedWorkerReportAttention(ctx context.Context, events [
 	}
 	defer s.writeMu.Unlock()
 	return s.inTxDB(ctx, "clear resolved worker report attention", func(_ *gen.Queries, db gen.DBTX) error {
+		if err := reserveReportWriter(ctx, db); err != nil {
+			return err
+		}
 		for _, event := range events {
 			resolved, err := reportSemanticallyResolved(ctx, db, event)
 			if err != nil {
@@ -108,8 +117,11 @@ func reportSemanticallyResolved(ctx context.Context, db gen.DBTX, event domain.O
 		return false, nil
 	}
 	m, err := ports.ParseExactReportMessage(event.LeaseToken)
-	if err != nil {
+	if errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
 		return false, nil
+	}
+	if err != nil {
+		return false, err
 	}
 	w := &exactReportWriter{project: event.ProjectID, reportID: m.ReportID}
 	r, current, err := w.read(ctx, db)
@@ -183,7 +195,21 @@ func (w *exactReportWriter) write(ctx context.Context, fn func(gen.DBTX) error) 
 		return err
 	}
 	defer w.s.writeMu.Unlock()
-	return w.s.inTxDB(ctx, "exact parent report", func(_ *gen.Queries, db gen.DBTX) error { return fn(db) })
+	return w.s.inTxDB(ctx, "exact parent report", func(_ *gen.Queries, db gen.DBTX) error {
+		if err := reserveReportWriter(ctx, db); err != nil {
+			return err
+		}
+		return fn(db)
+	})
+}
+
+// Reserve SQLite's writer before taking a read snapshot. Independent Store
+// opens have separate writeMu gates; a deferred read-to-write upgrade can fail
+// with SQLITE_BUSY_SNAPSHOT even with busy_timeout. The empty update acquires
+// the database writer without changing rows or firing CDC/source triggers.
+func reserveReportWriter(ctx context.Context, db gen.DBTX) error {
+	_, err := db.ExecContext(ctx, `UPDATE orchestration_events SET id=id WHERE 0`)
+	return err
 }
 
 func (w *exactReportWriter) Prepare(ctx context.Context, m ports.ExactReportMessage, expected domain.OrchestrationEvent, now func() time.Time) error {
@@ -279,7 +305,7 @@ func (w *exactReportWriter) advance(ctx context.Context, m ports.ExactReportMess
 		}
 		if e.LeaseToken != m.Token() || e.DestinationSessionID != m.Parent.SessionID || e.AttemptCount == 0 ||
 			(e.State != domain.OrchestrationPending && e.State != domain.OrchestrationLeased && e.State != domain.OrchestrationSubmitted &&
-				!(semantic && e.State == domain.OrchestrationDeadLetter)) {
+				(!semantic || e.State != domain.OrchestrationDeadLetter)) {
 			return &ports.ReportDeliveryHold{Reason: "report_singleton_cas"}
 		}
 		at := now()

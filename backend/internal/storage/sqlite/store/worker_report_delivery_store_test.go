@@ -355,6 +355,67 @@ func exactReportEvent(t *testing.T, s *sqlite.Store, r domain.WorkerReportReceip
 	return domain.OrchestrationEvent{}
 }
 
+// Exercise the real transaction boundary deterministically: now is sampled
+// after the source reads, while an independent connection tries to write.
+// A deferred reader would allow that write and then fail its own upgrade.
+func TestExactParentReportReservesSQLiteWriterBeforeSourceReads(t *testing.T) {
+	for _, operation := range []string{"prepare", "admit", "resolve"} {
+		t.Run(operation, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			r, chat := seedExactParentDelivery(t, s)
+			e := exactReportEvent(t, s, r)
+			message := ports.ExactReportMessage{ReportID: r.Report.ID, EventID: r.EventID,
+				SourceRevision: e.SourceRevision, LeaseID: r.Report.LeaseID, LeaseRevision: r.Report.LeaseRevision,
+				Parent: chat.parent, Payload: "fixture exact binding"}
+			conn, err := reportDB(t, dir).Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.ExecContext(t.Context(), `PRAGMA busy_timeout=0`); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			checked := false
+			checkWriter := func() time.Time {
+				checked = true
+				_, err := conn.ExecContext(t.Context(), `UPDATE orchestration_events SET last_error='competing writer' WHERE id=?`, e.ID)
+				var coded interface{ Code() int }
+				if !errors.As(err, &coded) || coded.Code()&255 != 5 { // SQLITE_BUSY
+					t.Fatalf("independent write entered source-read transaction: %v", err)
+				}
+				return now
+			}
+			err = s.WithExactParentReport(t.Context(), e.ProjectID, r.Report.ID, func(w ports.ExactReportWriter) error {
+				if operation == "prepare" {
+					return w.Prepare(t.Context(), message, e, checkWriter)
+				}
+				if err := w.Prepare(t.Context(), message, e, func() time.Time { return now }); err != nil {
+					return err
+				}
+				if operation == "admit" {
+					return w.Admit(t.Context(), message, checkWriter)
+				}
+				return w.Resolve(t.Context(), message, checkWriter)
+			})
+			if err != nil || !checked {
+				t.Fatalf("writer reservation: checked=%v err=%v", checked, err)
+			}
+			if _, err := conn.ExecContext(t.Context(), `UPDATE orchestration_events SET last_error=last_error WHERE id=?`, e.ID); err != nil {
+				t.Fatalf("committed report retained SQLite writer: %v", err)
+			}
+			if got, found, err := s.GetWorkerReport(t.Context(), r.Report.ID); err != nil || !found || got != r {
+				t.Fatalf("writer reservation changed immutable receipt: %+v %v", got, err)
+			}
+		})
+	}
+}
+
 func TestExactParentReportStoreColdReplayAndSemanticResolution(t *testing.T) {
 	dir := t.TempDir()
 	s, err := sqlite.Open(dir)
@@ -938,7 +999,21 @@ func TestReportLegacyAckDoesNotAcquireSemanticResolution(t *testing.T) {
 			case "malformed":
 				_, err = db.Exec(`UPDATE orchestration_events SET lease_token='ao-exact-report-v1:{}' WHERE id=?`, e.ID)
 			case "foreign_source":
-				_, err = db.Exec(`UPDATE orchestration_events SET source_revision='foreign' WHERE id=?`, e.ID)
+				// SQLite owns immutable event sources. Prove the trigger rejects
+				// substitution, then corrupt only the mutable delivery binding.
+				sourceBefore := exactReportEvent(t, s, r)
+				if _, err := db.Exec(`UPDATE orchestration_events SET source_revision='foreign' WHERE id=?`, e.ID); err == nil || !strings.Contains(err.Error(), "immutable worker report event source") {
+					t.Fatalf("immutable source substitution: %v", err)
+				}
+				if got := exactReportEvent(t, s, r); !reflect.DeepEqual(got, sourceBefore) {
+					t.Fatalf("rejected source update changed durable event: %+v", got)
+				}
+				binding, parseErr := ports.ParseExactReportMessage(e.LeaseToken)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				binding.SourceRevision = "foreign"
+				_, err = db.Exec(`UPDATE orchestration_events SET lease_token=? WHERE id=?`, binding.Token(), e.ID)
 			case "foreign_destination":
 				_, err = db.Exec(`UPDATE orchestration_events SET destination_session_id=? WHERE id=?`, r.Report.WorkerSessionID, e.ID)
 			case "mixed":

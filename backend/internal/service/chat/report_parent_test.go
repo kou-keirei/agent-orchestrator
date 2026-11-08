@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -74,7 +75,7 @@ type reportParentFixture struct {
 func newReportParentFixture(t *testing.T, wrap ...func(*sqlite.Store) chatsvc.Store) *reportParentFixture {
 	t.Helper()
 	f := &reportParentFixture{dir: t.TempDir(), provider: &reportParentProvider{fakeConversation: newFakeConversation()}}
-	st, err := sqlite.Open(f.dir)
+	st, err := sqlitetest.Open(f.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,7 +591,7 @@ func (c *reportAppendWaitContext) Err() error {
 	return c.Context.Err()
 }
 
-var reportAppendWriterRollback = errors.New("roll back disposable contention writer")
+var errReportAppendWriterRollback = errors.New("roll back disposable contention writer")
 
 type reportAppendContentionStore struct {
 	*sqlite.Store
@@ -606,12 +607,12 @@ func (s *reportAppendContentionStore) AppendReservedUserMessage(ctx context.Cont
 	// Start it only at the append boundary, AFTER the engine's Prepare COMMIT.
 	// Its transaction is rolled back, leaving no synthetic provider event.
 	go func() {
-		_, err := s.Store.ProjectProviderEvent(context.WithoutCancel(ctx), owner.ConversationID, owner.SessionID,
+		_, err := s.ProjectProviderEvent(context.WithoutCancel(ctx), owner.ConversationID, owner.SessionID,
 			owner.ControllerGeneration, "w616-contention-writer", "fixture.writer", `{}`, now,
 			func(context.Context) error {
 				close(locked)
 				<-s.release
-				return reportAppendWriterRollback
+				return errReportAppendWriterRollback
 			})
 		s.writerResult <- err
 	}()
@@ -725,7 +726,7 @@ func TestReportParentAppendWriterWaitReturnsBeforeRelease(t *testing.T) {
 			select {
 			case err := <-probe.writerResult:
 				writerConsumed = true
-				if !errors.Is(err, reportAppendWriterRollback) {
+				if !errors.Is(err, errReportAppendWriterRollback) {
 					t.Fatalf("fixture writer did not reach its rollback boundary: %v", err)
 				}
 			case <-time.After(time.Second):
