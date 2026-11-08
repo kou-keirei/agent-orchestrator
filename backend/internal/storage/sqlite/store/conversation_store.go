@@ -842,7 +842,22 @@ func (s *Store) AppendUserMessage(
 	turnID string,
 	now time.Time,
 ) (created bool, err error) {
-	return s.appendUserMessage(ctx, conversationID, session, generation, msg, turnID, "", now)
+	return s.appendUserMessage(ctx, conversationID, session, generation, msg, turnID, "", now, nil)
+}
+
+// AppendReservedUserMessage commits admission and the existing native-send
+// reservation together. A newly created row authorizes one immediate dispatch;
+// errors and duplicates never do. Process loss cannot leave pending queue work.
+func (s *Store) AppendReservedUserMessage(ctx context.Context, owner domain.ConversationSendOwner, msg domain.ConversationMessage, now time.Time) (bool, error) {
+	// Like ReserveOrdinarySend, this authorization must own its COMMIT.
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return false, domain.ErrConversationSendConflict
+	}
+	if now.IsZero() || owner.ClientMessageID == "" || owner.ClientMessageID != msg.ClientMessageID {
+		return false, domain.ErrConversationSendConflict
+	}
+	return s.appendUserMessage(ctx, owner.ConversationID, owner.SessionID, owner.ControllerGeneration,
+		msg, owner.TurnID, "", now, &owner)
 }
 
 // AppendRetryUserMessage records a retry and its source as one transaction.
@@ -858,7 +873,7 @@ func (s *Store) AppendRetryUserMessage(
 	retryOfTurnID string,
 	now time.Time,
 ) (created bool, err error) {
-	return s.appendUserMessage(ctx, conversationID, session, generation, msg, turnID, retryOfTurnID, now)
+	return s.appendUserMessage(ctx, conversationID, session, generation, msg, turnID, retryOfTurnID, now, nil)
 }
 
 func (s *Store) appendUserMessage(
@@ -870,8 +885,15 @@ func (s *Store) appendUserMessage(
 	turnID string,
 	retryOfTurnID string,
 	now time.Time,
+	reservation *domain.ConversationSendOwner,
 ) (created bool, err error) {
-	s.writeMu.Lock()
+	if reservation != nil {
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return false, err
+		}
+	} else {
+		s.writeMu.Lock()
+	}
 	defer s.writeMu.Unlock()
 
 	if retryOfTurnID != "" {
@@ -947,9 +969,16 @@ func (s *Store) appendUserMessage(
 				return fmt.Errorf("record latest human message: %w", err)
 			}
 		}
-		return q.InsertConversationSendPending(ctx, gen.InsertConversationSendPendingParams{
+		if err := q.InsertConversationSendPending(ctx, gen.InsertConversationSendPendingParams{
 			TurnID: turnID, ConversationID: conversationID,
-		})
+		}); err != nil {
+			return err
+		}
+		if reservation != nil {
+			_, err := reserveConversationSend(ctx, q, *reservation, now)
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return false, err
@@ -998,39 +1027,46 @@ func (s *Store) ReserveOrdinarySend(ctx context.Context, owner domain.Conversati
 		return message, domain.ErrConversationSendConflict
 	}
 	err := s.inTx(ctx, "reserve ordinary send", func(q *gen.Queries) error {
-		held, err := q.HasUnresolvedConversationSend(ctx, owner.ConversationID)
-		if err != nil {
-			return err
-		}
-		if held {
-			return domain.ErrConversationSendUncertain
-		}
-		rows, err := q.ReserveConversationOrdinarySend(ctx, gen.ReserveConversationOrdinarySendParams{
-			TurnID: owner.TurnID, ConversationID: owner.ConversationID,
-			BranchID: owner.BranchID, SessionID: owner.SessionID,
-			ClientMessageID: owner.ClientMessageID, Generation: owner.ControllerGeneration,
-			ReservedAt: sql.NullTime{Time: now, Valid: true},
-		})
-		if err != nil {
-			return err
-		}
-		if rows != 1 {
-			return domain.ErrConversationSendConflict
-		}
-		row, err := q.SelectOrdinarySendMessage(ctx, owner.TurnID)
-		if err != nil {
-			return err
-		}
-		message = domain.QueuedTurn{
-			TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
-			Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
-		}
-		return nil
+		var err error
+		message, err = reserveConversationSend(ctx, q, owner, now)
+		return err
 	})
 	if err != nil {
 		return domain.QueuedTurn{}, err
 	}
 	return message, nil
+}
+
+// reserveConversationSend uses the same owner fence for standalone queue
+// reservations and append-with-reservation. The caller owns the transaction.
+func reserveConversationSend(ctx context.Context, q *gen.Queries, owner domain.ConversationSendOwner, now time.Time) (domain.QueuedTurn, error) {
+	held, err := q.HasUnresolvedConversationSend(ctx, owner.ConversationID)
+	if err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	if held {
+		return domain.QueuedTurn{}, domain.ErrConversationSendUncertain
+	}
+	rows, err := q.ReserveConversationOrdinarySend(ctx, gen.ReserveConversationOrdinarySendParams{
+		TurnID: owner.TurnID, ConversationID: owner.ConversationID,
+		BranchID: owner.BranchID, SessionID: owner.SessionID,
+		ClientMessageID: owner.ClientMessageID, Generation: owner.ControllerGeneration,
+		ReservedAt: sql.NullTime{Time: now, Valid: true},
+	})
+	if err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	if rows != 1 {
+		return domain.QueuedTurn{}, domain.ErrConversationSendConflict
+	}
+	row, err := q.SelectOrdinarySendMessage(ctx, owner.TurnID)
+	if err != nil {
+		return domain.QueuedTurn{}, err
+	}
+	return domain.QueuedTurn{
+		TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
+		Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
+	}, nil
 }
 
 // BindReservedOrdinarySend records an actually correlated native provider turn,

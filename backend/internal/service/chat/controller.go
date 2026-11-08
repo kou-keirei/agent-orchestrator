@@ -1386,8 +1386,26 @@ func (c *Controller) sendLocked(
 		DeliveryContentJSON: deliveryContent,
 	}
 
-	created, err := c.store.AppendUserMessage(
-		ctx, c.conversation.ID, c.sessionID, c.generation, record, turnID, now)
+	var created bool
+	var err error
+	var reservation *domain.ConversationSendOwner
+	if queueWhenBusy {
+		created, err = c.store.AppendUserMessage(
+			ctx, c.conversation.ID, c.sessionID, c.generation, record, turnID, now)
+	} else {
+		// Reports cannot leave pending work for ordinary drain, even if the
+		// process dies immediately after append. Reuse Chat's reservation in
+		// the append transaction and retain its grant only for this invocation.
+		admission, ok := c.store.(reportAdmissionStore)
+		if !ok {
+			return domain.ConversationTurn{}, &ports.ReportDeliveryHold{Reason: "report_atomic_admission_unavailable"}
+		}
+		reservation = &domain.ConversationSendOwner{
+			ConversationID: c.conversation.ID, TurnID: turnID, ClientMessageID: msg.ClientMessageID,
+			BranchID: c.conversation.ActiveBranchID, SessionID: c.sessionID, ControllerGeneration: c.generation,
+		}
+		created, err = admission.AppendReservedUserMessage(ctx, *reservation, record, now)
+	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("record user message: %w", err)
 	}
@@ -1421,7 +1439,7 @@ func (c *Controller) sendLocked(
 		return queued, nil
 	}
 
-	return c.dispatch(ctx, turnID, msg, now)
+	return c.dispatchWithReservation(ctx, turnID, msg, now, reservation)
 }
 
 // RetryTurn re-dispatches a failed turn's durable prompt as a new turn.
@@ -1688,6 +1706,18 @@ func (c *Controller) dispatch(
 	turnID string,
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
+) (domain.ConversationTurn, error) {
+	return c.dispatchWithReservation(ctx, turnID, msg, requestedAt, nil)
+}
+
+// reservation is an invocation-local successful append-and-reserve grant, never
+// a grant reconstructed from durable readback. Ordinary drain passes nil.
+func (c *Controller) dispatchWithReservation(
+	ctx context.Context,
+	turnID string,
+	msg ports.ChatUserMessage,
+	requestedAt time.Time,
+	reservation *domain.ConversationSendOwner,
 ) (result domain.ConversationTurn, resultErr error) {
 	// Admission survives dispatch errors. Return its actual row so edit/history
 	// callers cannot confuse uncertain delivery with an undispatched message.
@@ -1742,9 +1772,25 @@ func (c *Controller) dispatch(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	owner, msg, err := c.reserveOrdinarySend(ctx, turnID, msg)
+	var owner domain.ConversationSendOwner
+	var err error
+	if reservation == nil {
+		owner, msg, err = c.reserveOrdinarySend(ctx, turnID, msg)
+	} else {
+		owner = *reservation
+		// A read failure after admission leaves the reservation unresolved.
+		// Readback only checks the live grant; it cannot recreate one on retry.
+		var attempt domain.ConversationSendAttempt
+		attempt, err = c.store.OrdinarySendAttempt(ctx, turnID)
+		if err == nil && (attempt.State != domain.ConversationSendReserved || attempt.ConversationSendOwner != owner) {
+			err = domain.ErrConversationSendConflict
+		}
+	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("reserve turn: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.ConversationTurn{}, ordinarySendUncertain(err)
 	}
 	ref, err := c.conv.SendTurn(ctx, msg)
 	if ref.ProviderTurnID == "" {

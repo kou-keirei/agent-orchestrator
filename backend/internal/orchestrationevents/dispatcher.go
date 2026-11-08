@@ -105,10 +105,10 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 			err = ErrReportDeliveryHeld
 		}
 	}()
-	if reportsHeld {
-		if err := d.ReconcileAttention(ctx, project, now); err != nil {
-			return err
-		}
+	// A semantically resolved report can still carry a notification retry marker,
+	// even when no report remains held and there is no due transport work.
+	if err := d.ReconcileAttention(ctx, project, now); err != nil {
+		return err
 	}
 	events, err := d.Store.ListDueOrchestrationEvents(ctx, project, now, MaxBatchEvents)
 	if err != nil || len(events) == 0 {
@@ -246,7 +246,11 @@ func (d *Dispatcher) reconcileAttentionForEvents(ctx context.Context, events []d
 			ordered = append(ordered, group)
 		}
 		group.events = append(group.events, event)
-		if event.Kind == domain.OrchestrationWorkerReport || event.State != domain.OrchestrationAcknowledged {
+		resolved, err := d.eventSemanticallyResolved(ctx, event)
+		if err != nil {
+			return err
+		}
+		if !resolved {
 			group.acknowledged = false
 		}
 	}
@@ -296,19 +300,36 @@ func (d *Dispatcher) resolveAttention(ctx context.Context, events []domain.Orche
 			return err
 		}
 		for _, event := range attention {
-			if event.Kind == domain.OrchestrationWorkerReport || event.State != domain.OrchestrationAcknowledged {
+			resolved, err := d.eventSemanticallyResolved(ctx, event)
+			if err != nil {
+				return err
+			}
+			if !resolved {
+				unresolved[event.WorkerID] = true
+			}
+		}
+	}
+	// A caller may supply a report without an attention marker. It still needs
+	// semantic readback before its worker's notification can be resolved.
+	for _, event := range events {
+		if event.Kind == domain.OrchestrationWorkerReport {
+			resolved, err := d.eventSemanticallyResolved(ctx, event)
+			if err != nil {
+				return err
+			}
+			if !resolved {
 				unresolved[event.WorkerID] = true
 			}
 		}
 	}
 	seen := map[domain.SessionID]bool{}
-	idsByWorker := map[domain.SessionID][]string{}
+	eventsByWorker := map[domain.SessionID][]domain.OrchestrationEvent{}
 	var workers []domain.SessionID
 	for _, event := range events {
 		if unresolved[event.WorkerID] {
 			continue
 		}
-		idsByWorker[event.WorkerID] = append(idsByWorker[event.WorkerID], event.ID)
+		eventsByWorker[event.WorkerID] = append(eventsByWorker[event.WorkerID], event)
 		if seen[event.WorkerID] {
 			continue
 		}
@@ -319,11 +340,31 @@ func (d *Dispatcher) resolveAttention(ctx context.Context, events []domain.Orche
 		}
 	}
 	for _, worker := range workers {
-		if err := d.Store.ClearOrchestrationAttention(ctx, idsByWorker[worker]); err != nil {
+		if err := d.Store.ClearOrchestrationAttention(ctx, eventIDs(eventsByWorker[worker])); err != nil {
 			return err
+		}
+		var reports []domain.OrchestrationEvent
+		for _, event := range eventsByWorker[worker] {
+			if event.Kind == domain.OrchestrationWorkerReport {
+				reports = append(reports, event)
+			}
+		}
+		if len(reports) > 0 {
+			if err := d.Store.ClearResolvedWorkerReportAttention(ctx, reports); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// Report resolution is read from the existing exact singleton/receipt boundary.
+// An acknowledged transport row alone cannot resolve report attention.
+func (d *Dispatcher) eventSemanticallyResolved(ctx context.Context, event domain.OrchestrationEvent) (bool, error) {
+	if event.Kind == domain.OrchestrationWorkerReport {
+		return d.Store.WorkerReportSemanticallyResolved(ctx, event)
+	}
+	return event.State == domain.OrchestrationAcknowledged, nil
 }
 
 func (d *Dispatcher) destination(ctx context.Context, project domain.ProjectID, recorded domain.SessionID) (domain.SessionRecord, bool, error) {

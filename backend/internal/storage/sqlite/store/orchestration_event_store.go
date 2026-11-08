@@ -330,7 +330,7 @@ func (s *Store) ReclaimOrchestrationEventLeases(ctx context.Context, now time.Ti
 				THEN CASE WHEN attempt_count+1>=2 OR enqueued_at<=? THEN 'dead_letter' ELSE 'pending' END
 			ELSE 'dead_letter'
 		END,
-		attempt_count=attempt_count+1,lease_expires_at=NULL,
+		attempt_count=MIN(attempt_count+1,8),lease_expires_at=NULL,
 		attention_required_at=CASE
 			WHEN COALESCE((SELECT session_mode FROM sessions WHERE id=destination_session_id),'') NOT IN ('chat','tui')
 				OR ((SELECT session_mode FROM sessions WHERE id=destination_session_id)='chat' AND (attempt_count+1>=8 OR enqueued_at<=?))

@@ -14,6 +14,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 type ordinarySendFixture struct {
@@ -255,6 +256,91 @@ func TestOrdinarySendSQLConstraintsAndAtomicAdmission(t *testing.T) {
 	}
 	if _, found, err := f.s.ConversationMessageByClientID(t.Context(), f.owner.ConversationID, "client-b"); err != nil || found {
 		t.Fatalf("message escaped rollback: %v %v", found, err)
+	}
+}
+
+func TestReservedAppendFailureRollsBackSuccessfulMessageInsert(t *testing.T) {
+	for _, failure := range []string{"reservation", "commit", "foreign-generation"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			owner := f.owner
+			owner.TurnID, owner.ClientMessageID = "report", "report-client"
+			switch failure {
+			case "reservation":
+				// The trigger checks the message already exists inside the append
+				// transaction, then fails the pending -> reserved transition.
+				if _, err := f.db.Exec(`CREATE TRIGGER reject_report_reservation BEFORE UPDATE ON conversation_send_attempts
+					WHEN NEW.state = 'reserved' AND EXISTS (SELECT 1 FROM conversation_messages WHERE turn_id = NEW.turn_id)
+					BEGIN SELECT RAISE(ABORT, 'injected reservation after append'); END`); err != nil {
+					t.Fatal(err)
+				}
+			case "commit":
+				if _, err := f.db.Exec(`CREATE TABLE report_commit_parent(id INTEGER PRIMARY KEY);
+					CREATE TABLE report_commit_child(id INTEGER REFERENCES report_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+					CREATE TRIGGER reject_report_commit AFTER UPDATE ON conversation_send_attempts
+					WHEN NEW.state = 'reserved' BEGIN INSERT INTO report_commit_child VALUES (1); END`); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-generation":
+				owner.ControllerGeneration = "foreign"
+			}
+			created, err := f.s.AppendReservedUserMessage(t.Context(), owner, domain.ConversationMessage{
+				ID: "report-message", ClientMessageID: owner.ClientMessageID, Origin: domain.MessageOriginAutomation, Text: "report payload",
+			}, testNow)
+			if err == nil || created {
+				t.Fatalf("failed append authorized provider dispatch: %v %v", created, err)
+			}
+			if failure == "reservation" && !strings.Contains(err.Error(), "injected reservation after append") {
+				t.Fatalf("did not reach successful-append/pre-reservation boundary: %v", err)
+			}
+			if failure == "commit" && !strings.Contains(err.Error(), "FOREIGN KEY") {
+				t.Fatalf("did not reach COMMIT failure: %v", err)
+			}
+			if _, err := f.s.TurnByID(t.Context(), owner.TurnID); !errors.Is(err, domain.ErrNoConversationTurn) {
+				t.Fatalf("turn escaped rollback: %v", err)
+			}
+			if _, found, err := f.s.ConversationMessageByClientID(t.Context(), owner.ConversationID, owner.ClientMessageID); err != nil || found {
+				t.Fatalf("message escaped rollback: %v %v", found, err)
+			}
+			if _, err := f.s.NextQueuedTurn(t.Context(), owner.ConversationID); !errors.Is(err, domain.ErrNoQueuedTurn) {
+				t.Fatalf("failed reservation left drainable work: %v", err)
+			}
+		})
+	}
+}
+
+func TestReservedAppendCrashBeforeProviderRetainsReservation(t *testing.T) {
+	f := newOrdinarySendFixture(t)
+	owner := f.owner
+	owner.TurnID, owner.ClientMessageID = "report", "report-client"
+	message := domain.ConversationMessage{ID: "report-message", ClientMessageID: owner.ClientMessageID,
+		Origin: domain.MessageOriginAutomation, Text: "report payload"}
+	created, err := f.s.AppendReservedUserMessage(t.Context(), owner, message, testNow)
+	if err != nil || !created {
+		t.Fatalf("atomic admission: %v %v", created, err)
+	}
+	// No provider call, controller shutdown or error cleanup occurs. Close only
+	// the DB pools, discarding all volatile permission from the successful call.
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.s, err = sqlite.Open(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.ClaimChatControllerGeneration(t.Context(), owner.SessionID, "g2"); err != nil {
+		t.Fatal(err)
+	}
+	assertOrdinarySendQueued(t, f, owner, domain.ConversationSendReserved)
+	if created, err := f.s.AppendReservedUserMessage(t.Context(), owner, message, testNow); err != nil || created {
+		t.Fatalf("duplicate recreated dispatch permission: %v %v", created, err)
+	}
+	owner.ControllerGeneration = "g2"
+	if _, err := f.s.ReserveOrdinarySend(t.Context(), owner, testNow); !errors.Is(err, domain.ErrConversationSendUncertain) {
+		t.Fatalf("replacement reclaimed report: %v", err)
+	}
+	if _, err := f.s.NextQueuedTurn(t.Context(), owner.ConversationID); !errors.Is(err, domain.ErrConversationSendUncertain) {
+		t.Fatalf("reopened report became drainable: %v", err)
 	}
 }
 
@@ -525,6 +611,91 @@ func TestOrdinarySendProjectionResolutionRejectsBeforeMutex(t *testing.T) {
 			}
 			if err := f.s.BindReservedOrdinarySend(t.Context(), a, "native-a", testNow); err != nil {
 				t.Fatalf("ordinary resolution lost resources: %v", err)
+			}
+		})
+	}
+}
+
+func TestReservedAppendWriterWaitHonorsCancellationAndDeadline(t *testing.T) {
+	for _, mode := range []string{"cancel", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			owner := f.owner
+			owner.TurnID, owner.ClientMessageID = "contended-report", "contended-report-client"
+			ctx, cancel := context.WithCancel(t.Context())
+			wantErr := context.Canceled
+			if mode == "deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+				wantErr = context.DeadlineExceeded
+			}
+			waiting := make(chan struct{})
+			waitCtx := &reportWriterWaitContext{Context: ctx, waiting: waiting}
+			release := store.LockReportWriterForTest(f.s)
+			var once sync.Once
+			unlock := func() { once.Do(release) }
+			type appendResult struct {
+				created bool
+				err     error
+			}
+			result := make(chan appendResult, 1)
+			consumed := false
+			defer func() {
+				cancel()
+				unlock()
+				// Release a regressed bare Lock before joining the caller, including
+				// when the entry barrier or prompt-return assertion fails.
+				if !consumed {
+					select {
+					case <-result:
+					case <-time.After(time.Second):
+						t.Error("reserved append caller did not exit after writer release")
+					}
+				}
+			}()
+			go func() {
+				created, err := f.s.AppendReservedUserMessage(waitCtx, owner, domain.ConversationMessage{
+					ID: "contended-report-message", ClientMessageID: owner.ClientMessageID,
+					Origin: domain.MessageOriginAutomation, Text: "must never enter the queue",
+				}, testNow)
+				result <- appendResult{created: created, err: err}
+			}()
+			select {
+			case <-waiting: // actual LockContext entry with writer still held
+			case <-time.After(time.Second):
+				t.Fatal("reserved append did not enter cancellation-aware writer acquisition")
+			}
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("context expired before contention was established: %v", err)
+			}
+			if mode == "cancel" {
+				cancel()
+			}
+			<-ctx.Done()
+			select {
+			case got := <-result:
+				consumed = true
+				if got.created || !errors.Is(got.err, wantErr) {
+					t.Fatalf("contended append: created=%v err=%v", got.created, got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("reserved append retained writer wait after context ended")
+			}
+			// Successful return was observed BEFORE releasing the held writer.
+			unlock()
+			var turns, messages, attempts int
+			if err := f.db.QueryRowContext(t.Context(), `SELECT
+				(SELECT COUNT(*) FROM conversation_turns WHERE id = ?),
+				(SELECT COUNT(*) FROM conversation_messages WHERE client_message_id = ?),
+				(SELECT COUNT(*) FROM conversation_send_attempts WHERE turn_id = ?)`,
+				owner.TurnID, owner.ClientMessageID, owner.TurnID).Scan(&turns, &messages, &attempts); err != nil {
+				t.Fatal(err)
+			}
+			if turns != 0 || messages != 0 || attempts != 0 {
+				t.Fatalf("canceled writer admitted rows: turns=%d messages=%d attempts=%d", turns, messages, attempts)
+			}
+			if _, err := f.s.NextQueuedTurn(t.Context(), owner.ConversationID); !errors.Is(err, domain.ErrNoQueuedTurn) {
+				t.Fatalf("canceled writer left drainable work: %v", err)
 			}
 		})
 	}
