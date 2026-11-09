@@ -2404,6 +2404,12 @@ func (m *Manager) resumeAgentWithMode(ctx context.Context, id domain.SessionID, 
 		if m.chat.HasLiveChatController(id) {
 			return RestoreResult{Session: rec, Mode: RestoreModeNative}, nil
 		}
+		// Spawn opens the provider even without a prompt. Missing identity is
+		// therefore not proof that a fresh first conversation is safe to create.
+		if strings.TrimSpace(rec.Metadata.ProviderConversationID) == "" {
+			return RestoreResult{}, fmt.Errorf("resume agent %s: missing provider conversation identity: %w", id,
+				errors.Join(ports.ErrChatResumeFailed, ErrIncompleteHandle))
+		}
 		if recovery, ok := m.chat.(interface {
 			ChatNeedsController(context.Context, domain.SessionID) (bool, error)
 		}); ok {
@@ -2525,7 +2531,8 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 		if forceFresh {
 			rec.Metadata.ProviderConversationID = ""
 		} else if strings.TrimSpace(rec.Metadata.ProviderConversationID) == "" {
-			return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, ErrIncompleteHandle)
+			return RestoreResult{}, fmt.Errorf("%s %s: missing provider conversation identity: %w", operation, rec.ID,
+				errors.Join(ports.ErrChatResumeFailed, ErrIncompleteHandle))
 		}
 		return m.resumeChatController(
 			ctx, operation, rec, project, ws, requireNativeHistory, reservedGeneration, historyPolicy,
