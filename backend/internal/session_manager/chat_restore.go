@@ -19,7 +19,7 @@ type chatRestore struct {
 // remains outside the attempt, so retries retain their own durable message ID.
 func (m *Manager) EnsureChatController(ctx context.Context, id domain.SessionID) error {
 	_, err := m.ensureChatController(ctx, id, false)
-	if err != nil && !errors.Is(err, ports.ErrChatControllerRestore) {
+	if err != nil && !errors.Is(err, ports.ErrChatControllerRestore) && !errors.Is(err, ports.ErrChatResumeFailed) {
 		return fmt.Errorf("%w: %w", ports.ErrChatControllerRestore, err)
 	}
 	return err
@@ -48,7 +48,7 @@ func (m *Manager) ensureChatController(ctx context.Context, id domain.SessionID,
 	restoreCtx, cancel := context.WithTimeout(ctx, m.statusVerificationLimit)
 	defer cancel()
 	attempt.result, attempt.err = m.resumeAgentWithMode(restoreCtx, id, explicit)
-	if attempt.err != nil && !explicit {
+	if attempt.err != nil && !explicit && !errors.Is(attempt.err, ports.ErrChatResumeFailed) {
 		attempt.err = fmt.Errorf("%w: %w", ports.ErrChatControllerRestore, attempt.err)
 	}
 	return attempt.result, attempt.err
