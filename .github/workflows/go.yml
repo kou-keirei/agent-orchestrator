@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+# setup-go's native key includes OS, architecture, Linux image and actual Go
+# version. Hash both workspace modules and the workspace sum explicitly below.
+# PR cache writes stay in refs/pull/*/merge; main cannot restore those entries.
+# Cache hits never gate checks: every selected build, vet and test still runs.
 concurrency:
   group: go-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -64,7 +68,11 @@ jobs:
           # Read the version from go.mod so CI can't drift from the module
           # (it previously pinned 1.22 while go.mod declared 1.25).
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - name: Check formatting
         run: |
@@ -105,7 +113,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
       - name: Partition and race-test the complete chat package
         shell: bash
         run: |
@@ -128,7 +140,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
       - name: Partition and race-test the complete sqlite/store package
         shell: bash
         run: |
@@ -156,7 +172,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - name: Partition every discovered SQLite test exactly once
         env:
@@ -239,7 +259,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       # Scoped to teardown and kill by name rather than running these packages
       # whole: running them on Windows for the first time surfaced ten
@@ -284,7 +308,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - name: Test native Windows ACP prompt journals
         run: >-
@@ -305,7 +333,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: cloud/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - name: Check formatting
         run: |
@@ -335,7 +367,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - name: golangci-lint
         # v8 of the action drives golangci-lint v2 (the schema this config uses);
@@ -361,7 +397,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - uses: actions/setup-node@v4
         with:
@@ -385,7 +425,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: |
+            backend/go.sum
+            cloud/go.sum
+            go.work.sum
 
       - uses: actions/setup-node@v4
         with:

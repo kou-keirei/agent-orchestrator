@@ -372,7 +372,7 @@ class WorkflowContracts(unittest.TestCase):
             self.assertEqual(ci.GO_JOBS[job], "backend")
             self.assertIn("runs-on: ubuntu-latest", body)
             self.assertIn("go-version-file: backend/go.mod", body)
-            self.assertIn("cache: false", body)
+            self.assertIn("cache: true", body)
             self.assertIn("set -euo pipefail", body)
             self.assertIn("package_list=$(go list ./...)", body)
             self.assertIn(f'--backend-packages {group})', body)
@@ -390,6 +390,24 @@ class WorkflowContracts(unittest.TestCase):
                 self.assertIn('timeout-minutes: 35', body)
         self.assertIn("go build ./...", jobs["backend-checks"])
         self.assertIn("go vet ./...", jobs["backend-checks"])
+
+    def test_native_go_cache_covers_exact_workspace_sums_without_gating_checks(self):
+        jobs = self.jobs(self.go)
+        setups = 0
+        for job in ci.GO_JOBS:
+            body = jobs[job]
+            with self.subTest(job=job):
+                self.assertEqual(body.count('uses: actions/setup-go@v5'), 1)
+                self.assertIn(
+                    '          cache: true\n'
+                    '          cache-dependency-path: |\n'
+                    '            backend/go.sum\n'
+                    '            cloud/go.sum\n'
+                    '            go.work.sum\n', body)
+                self.assertNotIn('cache-hit', body)
+                self.assertNotIn('actions/cache', body)
+                setups += 1
+        self.assertEqual(setups, 10)
 
     def test_cli_output_validation_and_dependency_failure_truth_table(self):
         jobs = self.jobs(self.cli)
