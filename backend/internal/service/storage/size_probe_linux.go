@@ -112,24 +112,43 @@ func (n *linuxSizeNode) openChild(name string, rejectMount bool) (*linuxSizeNode
 }
 
 func (n *linuxSizeNode) check() error {
+	if err := n.checkMetadata(false); err != nil {
+		return err
+	}
+	for _, ancestor := range n.ancestors {
+		if err := ancestor.checkMetadata(true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *linuxSizeNode) matchesMetadata(stat unix.Stat_t, ancestor bool) bool {
+	m := linuxSizeMetadata(stat)
+	if ancestor {
+		// Above the trusted root, sibling activity may change directory size,
+		// link count and timestamps. Preserve identity, owner and type instead;
+		// both the held handle and its no-follow parent/name binding must match.
+		return m.Device == n.initial.Device && m.Inode == n.initial.Inode &&
+			m.Owner == n.initial.Owner && m.Directory == n.initial.Directory && m.Regular == n.initial.Regular
+	}
+	return m == n.initial
+}
+
+func (n *linuxSizeNode) checkMetadata(ancestor bool) error {
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(n.file.Fd()), &stat); err != nil {
 		return err
 	}
-	if linuxSizeMetadata(stat) != n.initial {
+	if !n.matchesMetadata(stat, ancestor) {
 		return probeFailure{ProbeChanged}
 	}
 	if n.parent >= 0 {
 		if err := unix.Fstatat(n.parent, n.name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return err
 		}
-		if linuxSizeMetadata(stat) != n.initial {
+		if !n.matchesMetadata(stat, ancestor) {
 			return probeFailure{ProbeChanged}
-		}
-	}
-	for _, ancestor := range n.ancestors {
-		if err := ancestor.check(); err != nil {
-			return err
 		}
 	}
 	return nil
