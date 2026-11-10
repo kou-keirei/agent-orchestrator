@@ -10,7 +10,6 @@ on:
   pull_request:
     paths:
       - "frontend/**"
-      - ".github/workflows/**"
       - "contracts/cloud/**"
       - "packages/cloud-client/**"
       - "packages/product-ui/**"
