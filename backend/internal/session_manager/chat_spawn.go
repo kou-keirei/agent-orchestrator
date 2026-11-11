@@ -90,6 +90,7 @@ type chatSpawn struct {
 	workspaceProject *ports.WorkspaceProjectInfo
 	prompt           string
 	systemPrompt     string
+	workItem         *workItemSpawnAuthorization
 }
 
 // launchChatController starts the provider controller for a chat session and
@@ -132,6 +133,9 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		controllerCommitted bool
 		completionErr       error
 	)
+	if err := m.admitWorkItemSpawn(ctx, in.workItem, in.record, in.workspace); err != nil {
+		return domain.SessionRecord{}, workItemSpawnHeld(id, err)
+	}
 	_, err = m.chat.StartChat(ctx, ChatStart{
 		SessionID:               id,
 		ProjectID:               in.cfg.ProjectID,
@@ -196,6 +200,9 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		},
 	})
 	if err != nil {
+		if in.workItem != nil {
+			return domain.SessionRecord{}, workItemSpawnHeld(id, errors.Join(err, completionErr))
+		}
 		if completionErr != nil || controllerCommitted {
 			m.stopChatBestEffort(ctx, id)
 			m.rollbackPreparedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, true)
@@ -216,6 +223,9 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	// provider either accepts the turn or reports why.
 	if in.prompt != "" {
 		if _, err := m.chat.StartChatTurn(ctx, id, in.prompt); err != nil {
+			if in.workItem != nil {
+				return domain.SessionRecord{}, workItemSpawnHeld(id, err)
+			}
 			m.stopChatBestEffort(ctx, id)
 			m.rollbackPreparedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, true)
 			m.markSpawnFailedTerminated(ctx, id)
@@ -223,7 +233,11 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		}
 	}
 
-	return m.getRecord(ctx, id)
+	rec, err := m.getRecord(ctx, id)
+	if err != nil && in.workItem != nil {
+		return domain.SessionRecord{}, workItemSpawnHeld(id, err)
+	}
+	return rec, err
 }
 
 // stopChatBestEffort closes a controller during rollback. A failure here is

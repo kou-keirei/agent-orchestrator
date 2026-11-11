@@ -852,12 +852,19 @@ func New(d Deps) *Manager {
 // materialization fails the still-seed row is deleted outright; a later failure
 // parks the row as terminated and rolls back what was built.
 func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error) {
+	return m.spawn(ctx, cfg, nil)
+}
+
+func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, workItem *workItemSpawnAuthorization) (domain.SessionRecord, int, int, error) {
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
 	}
 	standalone := cfg.ProjectID == ""
 	projectKind := project.Kind.WithDefault()
+	if workItem != nil && projectKind != domain.ProjectKindSingleRepo {
+		return domain.SessionRecord{}, 0, 0, ports.ErrWorkspaceExecutionBaseUnsupported
+	}
 	if standalone {
 		projectKind = domain.ProjectKindScratch
 	}
@@ -1053,6 +1060,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			workspaceProject: workspaceProject,
 			prompt:           prompt,
 			systemPrompt:     systemPrompt,
+			workItem:         workItem,
 		})
 		if err != nil {
 			return domain.SessionRecord{}, 0, 0, err
@@ -1131,6 +1139,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn %s: %w", id, err)
 	}
 	defer releaseCodexAdmission()
+	if err := m.admitWorkItemSpawn(ctx, workItem, rec, ws); err != nil {
+		return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     id,
 		WorkspacePath: ws.Path,
@@ -1138,6 +1149,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		Env:           env,
 	})
 	if err != nil {
+		if workItem != nil {
+			return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+		}
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, true)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrRuntimeCreate, err)
 	}
@@ -1166,6 +1180,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		metadata.DiffBaseSHA, metadata.DiffBaseRef = resolveSpawnDiffBase(ctx, ws.Path, ws.BaseRef)
 	}
 	if err := m.lcm.MarkSpawned(ctx, id, metadata); err != nil {
+		if workItem != nil {
+			return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+		}
 		runtimeDestroyed := m.runtime.Destroy(ctx, handle) == nil
 		m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject, runtimeDestroyed)
 		m.markSpawnFailedTerminated(ctx, id)
@@ -1173,6 +1190,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 	if delivery == ports.PromptDeliveryAfterStart && prompt != "" {
 		if err := m.deliverAfterStartPrompt(ctx, agent, launchCfg, handle, id, prompt); err != nil {
+			if workItem != nil {
+				return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+			}
 			runtimeDestroyed := m.runtime.Destroy(ctx, handle) == nil
 			workspaceDestroyed := m.rollbackPreparedSpawnWorkspace(ctx, rec, ws, workspaceProject, runtimeDestroyed)
 			if runtimeDestroyed && workspaceDestroyed {
@@ -1185,6 +1205,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	}
 	rec, err = m.getRecord(ctx, id)
 	if err != nil {
+		if workItem != nil {
+			return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+		}
 		return domain.SessionRecord{}, 0, 0, err
 	}
 	return rec, promptBytes, systemPromptBytes, nil

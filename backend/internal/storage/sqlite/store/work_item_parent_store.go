@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -14,6 +16,7 @@ var (
 	_ ports.WorkItemParentIssuer      = (*Store)(nil)
 	_ ports.WorkItemParentReader      = (*Store)(nil)
 	_ ports.WorkItemParentPersistence = (*Store)(nil)
+	_ ports.WorkItemSpawnPersistence  = (*Store)(nil)
 )
 
 // IssueWorkItemFromOriginalParent refuses to use caller assertions as origin.
@@ -70,6 +73,10 @@ func readWorkItemParent(ctx context.Context, db gen.DBTX, id domain.WorkItemID) 
 // the writer reservation fences durable ownership across independent Store opens.
 // This is not a public ingress and must never be wired to a DTO/report handler.
 func (s *Store) PersistWorkItemOriginalParent(ctx context.Context, i domain.WorkItemIdentity, workerNativeID string, target domain.WorkItemParentTarget) (domain.WorkItemParentTarget, error) {
+	return s.persistWorkItemOriginalParent(ctx, i, workerNativeID, target, nil)
+}
+
+func (s *Store) persistWorkItemOriginalParent(ctx context.Context, i domain.WorkItemIdentity, workerNativeID string, target domain.WorkItemParentTarget, finalize func(*gen.Queries, gen.DBTX, bool) error) (domain.WorkItemParentTarget, error) {
 	r := WorkItemRecord{Identity: i, OriginalNativeSessionID: workerNativeID}
 	if err := ctx.Err(); err != nil {
 		return domain.WorkItemParentTarget{}, err
@@ -115,6 +122,9 @@ func (s *Store) PersistWorkItemOriginalParent(ctx context.Context, i domain.Work
 			return err
 		}
 		if current != (domain.WorkItemParentTarget{}) {
+			if finalize != nil {
+				return finalize(q, db, false)
+			}
 			return nil
 		}
 		if i.OwnerGeneration != 1 || i.OwnerSessionID != i.OriginalWorkerSessionID {
@@ -134,12 +144,76 @@ func (s *Store) PersistWorkItemOriginalParent(ctx context.Context, i domain.Work
 		if err == nil && current != target {
 			return domain.ErrInvalidWorkItemParent
 		}
+		if err == nil && finalize != nil {
+			return finalize(q, db, true)
+		}
 		return err
 	})
 	if err != nil {
 		return domain.WorkItemParentTarget{}, err
 	}
 	return current, nil
+}
+
+// PersistWorkItemSpawn opts into atomic initial issuance and capacity. A lost
+// commit acknowledgement cannot expose a durable WorkItem without its slot.
+func (s *Store) PersistWorkItemSpawn(ctx context.Context, i domain.WorkItemIdentity, native string, target domain.WorkItemParentTarget, grant domain.WorkLeaseGrant) (ports.WorkItemSpawnReceipt, error) {
+	if err := grant.Validate(); err != nil {
+		return ports.WorkItemSpawnReceipt{}, err
+	}
+	var receipt ports.WorkItemSpawnReceipt
+	parent, err := s.persistWorkItemOriginalParent(ctx, i, native, target, func(q *gen.Queries, db gen.DBTX, created bool) error {
+		if i.OwnerGeneration != 1 || i.OwnerSessionID != i.OriginalWorkerSessionID {
+			return domain.ErrWorkAdmissionHeld
+		}
+		if created {
+			effects, err := json.Marshal(grant.AllowedEffects)
+			if err != nil {
+				return err
+			}
+			if err := q.CreateWorkItemLease(ctx, gen.CreateWorkItemLeaseParams{
+				WorkItemID: string(i.ID), OwnerGeneration: i.OwnerGeneration, Revision: 1,
+				LeaseID: grant.ID, DurationMs: grant.Duration.Milliseconds(),
+				ExpiresAtMs: time.Now().Add(grant.Duration).UnixMilli(), AllowedEffects: string(effects), State: domain.WorkLeaseActive,
+			}); err != nil {
+				return err
+			}
+		}
+		lease, err := readWorkLease(ctx, q, i.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.ErrWorkAdmissionHeld
+		}
+		if err != nil {
+			return err
+		}
+		if lease.OwnerGeneration != i.OwnerGeneration || lease.Revision != 1 || !sameGrant(lease.Grant, grant) {
+			return domain.ErrWorkLeaseConflict
+		}
+		if !created {
+			// Readback cannot promote legacy/incomplete issuance or a released attempt.
+			a, err := readWorkAdmission(ctx, db, i.ID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return domain.ErrWorkAdmissionHeld
+			}
+			if err != nil {
+				return err
+			}
+			if a != workAdmissionFor(i, lease) {
+				return domain.ErrWorkAdmissionHeld
+			}
+		}
+		admission, err := reserveWorkItemAdmission(ctx, q, db, i, lease)
+		if err != nil {
+			return err
+		}
+		receipt.Lease, receipt.Admission = lease, admission
+		return nil
+	})
+	if err != nil {
+		return ports.WorkItemSpawnReceipt{}, err
+	}
+	receipt.Parent = parent
+	return receipt, nil
 }
 
 func checkWorkItemParentFence(ctx context.Context, q *gen.Queries, i domain.WorkItemIdentity, t domain.WorkItemParentTarget) error {

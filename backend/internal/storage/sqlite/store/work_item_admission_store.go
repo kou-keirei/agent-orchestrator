@@ -55,52 +55,64 @@ func (s *Store) withWorkAdmission(ctx context.Context, identity domain.WorkItemI
 // ReserveWorkItemAdmission persists one slot without performing any external
 // effect. Exact readback is idempotency, never a second dispatch authorization.
 func (s *Store) ReserveWorkItemAdmission(ctx context.Context, identity domain.WorkItemIdentity, expected domain.WorkItemLease) (domain.WorkItemAdmission, error) {
-	wanted := domain.WorkItemAdmission{WorkItemID: identity.ID, AttemptID: identity.AttemptID,
-		OwnerSessionID: identity.OwnerSessionID, OwnerGeneration: identity.OwnerGeneration,
-		LeaseID: expected.Grant.ID, LeaseRevision: expected.Revision, State: domain.WorkAdmissionReserved}
 	var current domain.WorkItemAdmission
 	err := s.withWorkAdmission(ctx, identity, func(q *gen.Queries, db gen.DBTX) error {
-		lease, err := readWorkLease(ctx, q, identity.ID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return domain.ErrWorkLeaseConflict
-		}
-		if err != nil {
-			return err
-		}
-		if lease.OwnerGeneration != identity.OwnerGeneration || !sameWorkLease(lease, expected) {
-			return domain.ErrWorkLeaseConflict
-		}
-		if err := liveWorkLease(lease); err != nil {
-			return err
-		}
-		current, err = readWorkAdmission(ctx, db, identity.ID)
-		if err == nil {
-			if current != wanted {
-				return domain.ErrWorkAdmissionHeld
-			}
-			return nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		var occupied int
-		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM work_item_admissions WHERE state='reserved'`).Scan(&occupied); err != nil {
-			return err
-		}
-		if occupied != 0 {
-			return domain.ErrWorkAdmissionHeld
-		}
-		if _, err := db.ExecContext(ctx, `INSERT INTO work_item_admissions
-			(work_item_id, attempt_id, owner_session_id, owner_generation, lease_id, lease_revision, state) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			wanted.WorkItemID, wanted.AttemptID, wanted.OwnerSessionID, wanted.OwnerGeneration, wanted.LeaseID, wanted.LeaseRevision, wanted.State); err != nil {
-			return err
-		}
-		current, err = readWorkAdmission(ctx, db, identity.ID)
-		if err == nil && current != wanted {
-			return domain.ErrWorkAdmissionHeld
-		}
+		var err error
+		current, err = reserveWorkItemAdmission(ctx, q, db, identity, expected)
 		return err
 	})
+	return current, err
+}
+
+func workAdmissionFor(identity domain.WorkItemIdentity, expected domain.WorkItemLease) domain.WorkItemAdmission {
+	return domain.WorkItemAdmission{WorkItemID: identity.ID, AttemptID: identity.AttemptID,
+		OwnerSessionID: identity.OwnerSessionID, OwnerGeneration: identity.OwnerGeneration,
+		LeaseID: expected.Grant.ID, LeaseRevision: expected.Revision, State: domain.WorkAdmissionReserved}
+}
+
+// Caller owns the Store writer lock and SQLite writer-fenced transaction.
+func reserveWorkItemAdmission(ctx context.Context, q *gen.Queries, db gen.DBTX, identity domain.WorkItemIdentity, expected domain.WorkItemLease) (domain.WorkItemAdmission, error) {
+	wanted := workAdmissionFor(identity, expected)
+
+	lease, err := readWorkLease(ctx, q, identity.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkItemAdmission{}, domain.ErrWorkLeaseConflict
+	}
+	if err != nil {
+		return domain.WorkItemAdmission{}, err
+	}
+	if lease.OwnerGeneration != identity.OwnerGeneration || !sameWorkLease(lease, expected) {
+		return domain.WorkItemAdmission{}, domain.ErrWorkLeaseConflict
+	}
+	if err := liveWorkLease(lease); err != nil {
+		return domain.WorkItemAdmission{}, err
+	}
+	current, err := readWorkAdmission(ctx, db, identity.ID)
+	if err == nil {
+		if current != wanted {
+			return domain.WorkItemAdmission{}, domain.ErrWorkAdmissionHeld
+		}
+		return current, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkItemAdmission{}, err
+	}
+	var occupied int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM work_item_admissions WHERE state='reserved'`).Scan(&occupied); err != nil {
+		return domain.WorkItemAdmission{}, err
+	}
+	if occupied != 0 {
+		return domain.WorkItemAdmission{}, domain.ErrWorkAdmissionHeld
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO work_item_admissions
+			(work_item_id, attempt_id, owner_session_id, owner_generation, lease_id, lease_revision, state) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		wanted.WorkItemID, wanted.AttemptID, wanted.OwnerSessionID, wanted.OwnerGeneration, wanted.LeaseID, wanted.LeaseRevision, wanted.State); err != nil {
+		return domain.WorkItemAdmission{}, err
+	}
+	current, err = readWorkAdmission(ctx, db, identity.ID)
+	if err == nil && current != wanted {
+		return domain.WorkItemAdmission{}, domain.ErrWorkAdmissionHeld
+	}
 	return current, err
 }
 

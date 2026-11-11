@@ -26,59 +26,72 @@ type originalParentIssuer struct {
 }
 
 var _ ports.WorkItemParentIssuer = originalParentIssuer{}
+var _ ports.WorkItemSpawnIssuer = originalParentIssuer{}
 
 func (issuer originalParentIssuer) IssueWorkItemFromOriginalParent(ctx context.Context, i domain.WorkItemIdentity, workerNativeID string) (domain.WorkItemParentTarget, error) {
+	receipt, err := issuer.issue(ctx, i, workerNativeID, nil)
+	return receipt.Parent, err
+}
+
+func (issuer originalParentIssuer) IssueWorkItemSpawn(ctx context.Context, i domain.WorkItemIdentity, workerNativeID string, grant domain.WorkLeaseGrant) (ports.WorkItemSpawnReceipt, error) {
+	if err := grant.Validate(); err != nil {
+		return ports.WorkItemSpawnReceipt{}, err
+	}
+	return issuer.issue(ctx, i, workerNativeID, &grant)
+}
+
+func (issuer originalParentIssuer) issue(ctx context.Context, i domain.WorkItemIdentity, workerNativeID string, grant *domain.WorkLeaseGrant) (ports.WorkItemSpawnReceipt, error) {
 	if err := ctx.Err(); err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	if err := i.Validate(); err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	s, c := issuer.service, issuer.controller
 	held := &domain.WorkItemParentHold{Reason: domain.WorkItemParentControllerMismatch}
 	if i.OriginalParentSessionID != c.sessionID {
-		return domain.WorkItemParentTarget{}, held
+		return ports.WorkItemSpawnReceipt{}, held
 	}
 	gate := s.controllerGate(c.sessionID)
 	if err := gate.lock(ctx); err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	defer gate.unlock()
 	current, err := s.Controller(c.sessionID)
 	if err != nil || current != c {
-		return domain.WorkItemParentTarget{}, held
+		return ports.WorkItemSpawnReceipt{}, held
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	c.mu.Lock()
 	available := (c.state == ports.ChatControllerReady || c.state == ports.ChatControllerBusy) &&
 		c.handoff == controllerHandoffNone && !c.preserveProviderOnStop
 	c.mu.Unlock()
 	if !available {
-		return domain.WorkItemParentTarget{}, held
+		return ports.WorkItemSpawnReceipt{}, held
 	}
 	select {
 	case <-c.stopped:
-		return domain.WorkItemParentTarget{}, held
+		return ports.WorkItemSpawnReceipt{}, held
 	default:
 	}
 	persistence, ok := s.store.(ports.WorkItemParentPersistence)
 	if !ok {
-		return domain.WorkItemParentTarget{}, &domain.WorkItemParentHold{Reason: domain.WorkItemParentIssuanceUnbound}
+		return ports.WorkItemSpawnReceipt{}, &domain.WorkItemParentHold{Reason: domain.WorkItemParentIssuanceUnbound}
 	}
 	conversation, err := s.store.ConversationForSession(ctx, c.sessionID)
 	if err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	if conversation.ID != c.conversation.ID {
-		return domain.WorkItemParentTarget{}, held
+		return ports.WorkItemSpawnReceipt{}, held
 	}
 	branch, err := s.store.ConversationBranch(ctx, conversation.ID, conversation.ActiveBranchID)
 	if err != nil {
-		return domain.WorkItemParentTarget{}, err
+		return ports.WorkItemSpawnReceipt{}, err
 	}
 	// ChatConversation's native protocol handle is authoritative here. This does
 	// not equate the separate terminal AgentSessionID for an arbitrary provider.
@@ -90,5 +103,13 @@ func (issuer originalParentIssuer) IssueWorkItemFromOriginalParent(ctx context.C
 		IssuedBySessionID: c.sessionID, IssuedByControllerGeneration: c.generation,
 		Provenance: domain.WorkItemParentLiveProvenance,
 	}
-	return persistence.PersistWorkItemOriginalParent(ctx, i, workerNativeID, target)
+	if grant != nil {
+		atomic, ok := s.store.(ports.WorkItemSpawnPersistence)
+		if !ok {
+			return ports.WorkItemSpawnReceipt{}, &domain.WorkItemParentHold{Reason: domain.WorkItemParentIssuanceUnbound}
+		}
+		return atomic.PersistWorkItemSpawn(ctx, i, workerNativeID, target, *grant)
+	}
+	parent, err := persistence.PersistWorkItemOriginalParent(ctx, i, workerNativeID, target)
+	return ports.WorkItemSpawnReceipt{Parent: parent}, err
 }
