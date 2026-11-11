@@ -419,3 +419,140 @@ func TestWorkItemParentMissingForeignAndCanceled(t *testing.T) {
 		t.Fatalf("invalid issuance: %v", err)
 	}
 }
+
+func TestWorkItemSpawnAtomicRetryCapacityAndReconciliation(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	st, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r, target := seedParentPersistence(t, st)
+	grant := domain.WorkLeaseGrant{ID: "atomic-lease", Duration: time.Minute}
+	first, err := st.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	got, err := other.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, grant)
+	if err != nil || got.Parent != first.Parent || got.Admission != first.Admission || got.Lease.Revision != first.Lease.Revision || !got.Lease.ExpiresAt.Equal(first.Lease.ExpiresAt) {
+		t.Fatalf("exact readback: %+v %v", got, err)
+	}
+	changed := grant
+	changed.ID = "replacement-lease"
+	if _, err := other.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, changed); !errors.Is(err, domain.ErrWorkLeaseConflict) {
+		t.Fatalf("reused issuance with different lease: %v", err)
+	}
+	competitor, destination := r, target
+	worker, err := st.CreateSession(ctx, sampleRecord("parent-issuance"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	competitor.Identity.OriginalWorkerSessionID, competitor.Identity.OwnerSessionID = worker.ID, worker.ID
+	competitor.Identity.WorktreePath, competitor.Identity.Branch = t.TempDir(), "ao/competitor/root"
+	if err := st.UpsertSessionWorktree(ctx, domain.SessionWorktreeRecord{SessionID: worker.ID, RepoName: competitor.Identity.Repository,
+		WorktreePath: competitor.Identity.WorktreePath, Branch: competitor.Identity.Branch, BaseSHA: competitor.Identity.ExecutionBaseSHA}); err != nil {
+		t.Fatal(err)
+	}
+	competitor.Identity.ID, competitor.Identity.AttemptID = "atomic-competitor", "atomic-competitor-attempt"
+	destination.WorkItemID, destination.AttemptID = competitor.Identity.ID, competitor.Identity.AttemptID
+	db := admissionDB(t, dir)
+	// Expiry is not reconciliation and must retain capacity. No timer dependence.
+	if _, err := db.ExecContext(ctx, `UPDATE work_item_leases SET expires_at_ms=1 WHERE work_item_id=?`, r.Identity.ID); err != nil {
+		t.Fatal(err)
+	}
+	expired, found, err := other.GetWorkItemLease(ctx, r.Identity.ID)
+	if err != nil || !found {
+		t.Fatalf("expired lease readback: %v %v", found, err)
+	}
+	if _, err := other.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, grant); !errors.Is(err, domain.ErrWorkLeaseExpired) {
+		t.Fatalf("expired retry: %v", err)
+	}
+	if _, err := other.PersistWorkItemSpawn(ctx, competitor.Identity, competitor.OriginalNativeSessionID, destination, grant); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+		t.Fatalf("competitor after expiry: %v", err)
+	}
+	if _, found, err := other.GetWorkItem(ctx, competitor.Identity.ID); err != nil || found {
+		t.Fatalf("capacity failure left partial work: %v %v", found, err)
+	}
+	if _, found, err := other.GetWorkItemLease(ctx, competitor.Identity.ID); err != nil || found {
+		t.Fatalf("capacity failure left partial lease: %v %v", found, err)
+	}
+	if _, err := other.ReleaseWorkItemLease(ctx, r.Identity, expired); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.PersistWorkItemSpawn(ctx, competitor.Identity, competitor.OriginalNativeSessionID, destination, grant); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+		t.Fatalf("lease release freed capacity: %v", err)
+	}
+	// Only a separately confirmed reconciliation may release the exact admission.
+	if _, err := other.ReleaseWorkItemAdmission(ctx, r.Identity, first.Admission); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, grant); err == nil {
+		t.Fatal("released attempt reopened")
+	}
+	if _, err := other.PersistWorkItemSpawn(ctx, competitor.Identity, competitor.OriginalNativeSessionID, destination, grant); err != nil {
+		t.Fatalf("reconciled slot not available: %v", err)
+	}
+}
+
+func TestWorkItemSpawnAtomicRefusesIncompleteIssuanceAndRollsBack(t *testing.T) {
+	for _, fault := range []string{"parent-only", "parent-and-lease", "admission-write-failure", "stale-parent", "foreign-parent", "stale-owner"} {
+		t.Run(fault, func(t *testing.T) {
+			ctx := t.Context()
+			dir := t.TempDir()
+			st, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			r, target := seedParentPersistence(t, st)
+			grant := domain.WorkLeaseGrant{ID: "atomic-lease", Duration: time.Minute}
+			db := admissionDB(t, dir)
+			switch fault {
+			case "parent-only", "parent-and-lease":
+				if _, err := st.PersistWorkItemOriginalParent(ctx, r.Identity, r.OriginalNativeSessionID, target); err != nil {
+					t.Fatal(err)
+				}
+				if fault == "parent-and-lease" {
+					if _, err := st.AcquireWorkItemLease(ctx, r.Identity, grant); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "admission-write-failure":
+				if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_atomic_admission BEFORE INSERT ON work_item_admissions BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END`); err != nil {
+					t.Fatal(err)
+				}
+			case "stale-parent":
+				if err := st.ClaimChatControllerGeneration(ctx, r.Identity.OriginalParentSessionID, "replacement"); err != nil {
+					t.Fatal(err)
+				}
+			case "foreign-parent":
+				r.Identity.OriginalParentSessionID = "foreign-parent"
+			case "stale-owner":
+				r.Identity.OwnerGeneration++
+			}
+			receipt, err := st.PersistWorkItemSpawn(ctx, r.Identity, r.OriginalNativeSessionID, target, grant)
+			if err == nil || receipt.Parent != (domain.WorkItemParentTarget{}) || receipt.Admission != (domain.WorkItemAdmission{}) || receipt.Lease.Revision != 0 {
+				t.Fatalf("fault accepted: %+v err=%v", receipt, err)
+			}
+			for _, table := range []string{"work_items", "work_item_parents", "work_item_leases", "work_item_admissions"} {
+				want := 0
+				if (fault == "parent-only" || fault == "parent-and-lease") && (table == "work_items" || table == "work_item_parents") {
+					want = 1
+				}
+				if fault == "parent-and-lease" && table == "work_item_leases" {
+					want = 1
+				}
+				var count int
+				if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != want {
+					t.Fatalf("%s count=%d want=%d err=%v", table, count, want, err)
+				}
+			}
+		})
+	}
+}
