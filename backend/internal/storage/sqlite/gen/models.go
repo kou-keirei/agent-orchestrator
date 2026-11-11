@@ -311,6 +311,18 @@ type ConversationSendAttempt struct {
 	NonDeliveryEvidence  string
 }
 
+type ConversationSendDispatchBoundary struct {
+	TurnID              string
+	ConversationID      string
+	BranchID            string
+	SessionID           string
+	ClientMessageID     string
+	AdmissionGeneration string
+	AdmittedAt          sql.NullTime
+	CallGeneration      string
+	CallCommittedAt     sql.NullTime
+}
+
 type ConversationSteerDelivery struct {
 	ConversationID   string
 	ClientMessageID  string

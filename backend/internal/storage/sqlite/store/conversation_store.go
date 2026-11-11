@@ -923,7 +923,7 @@ func (s *Store) appendUserMessage(
 		}
 	}
 
-	err = s.inTx(ctx, "append user message", func(q *gen.Queries) error {
+	err = s.inTxDB(ctx, "append user message", func(q *gen.Queries, db gen.DBTX) error {
 		sequence, err := q.NextConversationSequence(ctx, gen.NextConversationSequenceParams{
 			UpdatedAt: now,
 			ID:        conversationID,
@@ -974,8 +974,11 @@ func (s *Store) appendUserMessage(
 		}); err != nil {
 			return err
 		}
+		if err := admitOrdinarySendBoundary(ctx, db, turnID, now); err != nil {
+			return err
+		}
 		if reservation != nil {
-			_, err := reserveConversationSend(ctx, q, *reservation, now)
+			_, err := reserveConversationSend(ctx, q, db, *reservation, now)
 			return err
 		}
 		return nil
@@ -1026,9 +1029,9 @@ func (s *Store) ReserveOrdinarySend(ctx context.Context, owner domain.Conversati
 	if now.IsZero() {
 		return message, domain.ErrConversationSendConflict
 	}
-	err := s.inTx(ctx, "reserve ordinary send", func(q *gen.Queries) error {
+	err := s.inTxDB(ctx, "reserve ordinary send", func(q *gen.Queries, db gen.DBTX) error {
 		var err error
-		message, err = reserveConversationSend(ctx, q, owner, now)
+		message, err = reserveConversationSend(ctx, q, db, owner, now)
 		return err
 	})
 	if err != nil {
@@ -1039,7 +1042,7 @@ func (s *Store) ReserveOrdinarySend(ctx context.Context, owner domain.Conversati
 
 // reserveConversationSend uses the same owner fence for standalone queue
 // reservations and append-with-reservation. The caller owns the transaction.
-func reserveConversationSend(ctx context.Context, q *gen.Queries, owner domain.ConversationSendOwner, now time.Time) (domain.QueuedTurn, error) {
+func reserveConversationSend(ctx context.Context, q *gen.Queries, db gen.DBTX, owner domain.ConversationSendOwner, now time.Time) (domain.QueuedTurn, error) {
 	held, err := q.HasUnresolvedConversationSend(ctx, owner.ConversationID)
 	if err != nil {
 		return domain.QueuedTurn{}, err
@@ -1058,6 +1061,9 @@ func reserveConversationSend(ctx context.Context, q *gen.Queries, owner domain.C
 	}
 	if rows != 1 {
 		return domain.QueuedTurn{}, domain.ErrConversationSendConflict
+	}
+	if err := commitOrdinarySendBoundary(ctx, db, owner, now); err != nil {
+		return domain.QueuedTurn{}, err
 	}
 	row, err := q.SelectOrdinarySendMessage(ctx, owner.TurnID)
 	if err != nil {

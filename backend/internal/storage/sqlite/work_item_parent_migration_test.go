@@ -49,6 +49,20 @@ func TestWorkItemParentMigration222FreshUpgradeReopenAndForwardOnly(t *testing.T
 	if desktop169Snapshot(t, db) != retained {
 		t.Fatal("failed 0222 downgrade changed schema/data/journal")
 	}
+	// Startup also applies 0223. Verify that its exact additive schema leaves
+	// all existing provenance/admission facts intact before freezing the full
+	// current schema for the reopen checks. Keep the 0222 downgrade test above
+	// isolated from later migrations.
+	excluded := map[string]bool{"goose_db_version": true, "sqlite_sequence": true}
+	beforeForward := desktop169SnapshotExcept(t, db, excluded)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	excluded["conversation_send_dispatch_boundaries"] = true
+	if desktop169SnapshotExcept(t, db, excluded) != beforeForward {
+		t.Fatal("0223 changed prior schema/data")
+	}
+	retained = desktop169Snapshot(t, db)
 	for range 2 {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
@@ -62,7 +76,7 @@ func TestWorkItemParentMigration222FreshUpgradeReopenAndForwardOnly(t *testing.T
 		}
 	}
 	var applied int
-	for _, version := range []int{218, 219, 220, 221, 222} {
+	for _, version := range []int{218, 219, 220, 221, 222, 223} {
 		if err := db.QueryRow(`SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1`, version).Scan(&applied); err != nil || applied != 1 {
 			t.Fatalf("migration %d: %d %v", version, applied, err)
 		}
