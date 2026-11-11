@@ -100,7 +100,7 @@ func TestWorkItemSpawnVerifiedChatAndTUIOneBirth(t *testing.T) {
 				}
 				return receipt, err
 			}}
-			rec, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &a)
+			rec, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &a)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +128,7 @@ func TestWorkItemSpawnVerifiedChatAndTUIOneBirth(t *testing.T) {
 			}
 			defer other.Close()
 			cold := f.newManager(other, f.runtime, &fakeWorkspace{})
-			if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+			if _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 				t.Fatalf("cold retry: %v", err)
 			}
 			records, err := other.ListSessions(t.Context(), f.auth.project)
@@ -183,7 +183,7 @@ func TestWorkItemSpawnRefusesUnprovenAndForeignBeforeBirth(t *testing.T) {
 				case "no-base":
 					a.base = ""
 				}
-				if _, _, _, err := f.manager.spawnWorkItem(t.Context(), cfg, pa); err == nil {
+				if _, err := f.manager.spawnWorkItem(t.Context(), cfg, pa); err == nil {
 					t.Fatal("unproven authorization launched")
 				}
 				if f.births.Load() != 1 || f.runtime.created != 0 {
@@ -243,7 +243,7 @@ func TestWorkItemSpawnFreshOwnerAndLeaseFences(t *testing.T) {
 					}
 				}
 				f.manager.store = st
-				if _, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+				if _, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 					t.Fatalf("stale fence: %v", err)
 				}
 				if f.births.Load() != 1 || f.runtime.created != 0 || f.ws.destroyed != 0 {
@@ -256,7 +256,7 @@ func TestWorkItemSpawnFreshOwnerAndLeaseFences(t *testing.T) {
 
 func TestWorkItemSpawnCapacityCompetitorsCannotLaunch(t *testing.T) {
 	f := newWorkSpawnFixture(t)
-	if _, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); err != nil {
+	if _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -275,7 +275,7 @@ func TestWorkItemSpawnCapacityCompetitorsCannotLaunch(t *testing.T) {
 		a := f.auth
 		a.work, a.attempt, a.grant.ID = domain.WorkItemID(fmt.Sprintf("competitor-%d", n)), domain.WorkAttemptID(fmt.Sprintf("attempt-%d", n)), fmt.Sprintf("lease-%d", n)
 		wg.Go(func() {
-			_, _, _, errs[n] = m.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &a)
+			_, errs[n] = m.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &a)
 			if rt.created != 0 {
 				t.Error("capacity competitor launched")
 			}
@@ -323,7 +323,7 @@ func TestWorkItemSpawnConcurrentSameAuthorizationOneBirth(t *testing.T) {
 		// IDs before contending at the real original-parent issuance boundary.
 		m := f.newManager(f.store, runtimes[n], &fakeWorkspace{path: filepath.Join(f.dir, fmt.Sprintf("same-work-%d", n))})
 		wg.Go(func() {
-			results[n], _, _, errs[n] = m.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &a)
+			results[n], errs[n] = m.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &a)
 		})
 	}
 	<-ready
@@ -367,7 +367,7 @@ func TestWorkItemSpawnUncertainBirthRetainsCapacityAndNoRetryBirth(t *testing.T)
 				// Count provider birth, then lose its launch acknowledgement.
 				f.manager.chat = &recordingLauncher{startErr: context.DeadlineExceeded, beforeStart: func(ChatStart) { f.births.Add(1) }}
 			}
-			if _, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) || !errors.Is(err, context.DeadlineExceeded) {
+			if _, err := f.manager.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) || !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("uncertain birth: %v", err)
 			}
 			if f.ws.destroyed != 0 || f.runtime.destroyed != 0 {
@@ -381,7 +381,7 @@ func TestWorkItemSpawnUncertainBirthRetainsCapacityAndNoRetryBirth(t *testing.T)
 			coldRT := &fakeRuntime{}
 			cold := f.newManager(other, coldRT, &fakeWorkspace{})
 			for range 2 {
-				if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+				if _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 					t.Fatalf("uncertain retry: %v", err)
 				}
 			}
@@ -402,7 +402,7 @@ func TestWorkItemSpawnUncertainBirthRetainsCapacityAndNoRetryBirth(t *testing.T)
 			// A different work item also cannot consume the held slot.
 			next := f.auth
 			next.work, next.attempt, next.grant.ID = "next-work", "next-attempt", "next-lease"
-			if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) || coldRT.created != 0 {
+			if _, err := cold.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) || coldRT.created != 0 {
 				t.Fatalf("uncertain capacity reclaimed: %v", err)
 			}
 		})
@@ -418,7 +418,7 @@ func TestWorkItemSpawnCrashAfterBirthNeverReissues(t *testing.T) {
 				t.Fatalf("crash boundary: %v", got)
 			}
 		}()
-		_, _, _, _ = f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth)
+		_, _ = f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth)
 	}()
 	other, err := sqlite.Open(f.dir)
 	if err != nil {
@@ -427,7 +427,7 @@ func TestWorkItemSpawnCrashAfterBirthNeverReissues(t *testing.T) {
 	defer other.Close()
 	rt := &fakeRuntime{}
 	cold := f.newManager(other, rt, &fakeWorkspace{})
-	if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+	if _, err := cold.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 		t.Fatalf("crash retry: %v", err)
 	}
 	work, _, err := other.GetWorkItem(t.Context(), f.auth.work)
@@ -455,7 +455,7 @@ func TestWorkItemSpawnCrashAfterBirthNeverReissues(t *testing.T) {
 
 func TestWorkItemSpawnCapturedParentCannotFollowReplacement(t *testing.T) {
 	f := newWorkSpawnFixture(t)
-	if _, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); err != nil {
+	if _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &f.auth); err != nil {
 		t.Fatal(err)
 	}
 	want, err := f.store.GetWorkItemOriginalParent(t.Context(), f.auth.work, f.auth.attempt)
@@ -482,7 +482,7 @@ func TestWorkItemSpawnCapturedParentCannotFollowReplacement(t *testing.T) {
 	}
 	next := f.auth
 	next.work, next.attempt, next.grant.ID = "replacement-work", "replacement-attempt", "replacement-lease"
-	if _, _, _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &next); !errors.Is(err, domain.ErrWorkItemParentHeld) {
+	if _, err := f.manager.spawnWorkItem(t.Context(), f.config(domain.SessionModeTUI), &next); !errors.Is(err, domain.ErrWorkItemParentHeld) {
 		t.Fatalf("captured issuer followed replacement: %v", err)
 	}
 	got, err := f.store.GetWorkItemOriginalParent(t.Context(), f.auth.work, f.auth.attempt)
@@ -551,7 +551,7 @@ func TestWorkItemSpawnIssuerCommitLostACKBlocksConcurrentIdentity(t *testing.T) 
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
 			result := make(chan error, 1)
-			go func() { _, _, _, err := f.manager.spawnWorkItem(ctx, f.config(mode), &a); result <- err }()
+			go func() { _, err := f.manager.spawnWorkItem(ctx, f.config(mode), &a); result <- err }()
 			select {
 			case <-committed:
 			case err := <-result:
@@ -574,7 +574,7 @@ func TestWorkItemSpawnIssuerCommitLostACKBlocksConcurrentIdentity(t *testing.T) 
 			next.work, next.attempt, next.grant.ID = "lost-ack-competitor", "competitor-attempt", "competitor-lease"
 			// The first request is still awaiting the issuer ACK as the second requests
 			// another work identity through a separate manager/database handle.
-			if _, _, _, err := cold.spawnWorkItem(ctx, f.config(mode), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+			if _, err := cold.spawnWorkItem(ctx, f.config(mode), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 				t.Fatalf("competitor: %v", err)
 			}
 			cancel() // Drop the first ACK after its successful commit.
@@ -582,10 +582,10 @@ func TestWorkItemSpawnIssuerCommitLostACKBlocksConcurrentIdentity(t *testing.T) 
 				t.Fatalf("lost ACK: %v", err)
 			}
 			for range 2 {
-				if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &a); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+				if _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &a); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 					t.Fatalf("retry: %v", err)
 				}
-				if _, _, _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
+				if _, err := cold.spawnWorkItem(t.Context(), f.config(mode), &next); !errors.Is(err, domain.ErrWorkAdmissionHeld) {
 					t.Fatalf("capacity after timeout: %v", err)
 				}
 			}

@@ -38,35 +38,36 @@ type workItemSpawnStore interface {
 // allocates a fresh worker; immutable WorkItem issuance rejects its reuse for an
 // already issued attempt. A durable lease additionally rejects retries BEFORE
 // allocating a seed. Neither exact reservation retries nor expiry permit launch.
-func (m *Manager) spawnWorkItem(ctx context.Context, cfg ports.SpawnConfig, a *workItemSpawnAuthorization) (domain.SessionRecord, int, int, error) {
+func (m *Manager) spawnWorkItem(ctx context.Context, cfg ports.SpawnConfig, a *workItemSpawnAuthorization) (domain.SessionRecord, error) {
 	if a == nil || a.issuer == nil {
-		return domain.SessionRecord{}, 0, 0, &domain.WorkItemParentHold{Reason: domain.WorkItemParentIssuanceUnbound}
+		return domain.SessionRecord{}, &domain.WorkItemParentHold{Reason: domain.WorkItemParentIssuanceUnbound}
 	}
 	snapshot := *a
 	snapshot.grant.AllowedEffects = slices.Clone(a.grant.AllowedEffects)
 	a = &snapshot
 	if cfg.Kind != domain.KindWorker || cfg.ProjectID != a.project || cfg.ParentSessionID != a.parent ||
 		(cfg.ExecutionBaseSHA != "" && cfg.ExecutionBaseSHA != a.base) {
-		return domain.SessionRecord{}, 0, 0, domain.ErrWorkIdentityMismatch
+		return domain.SessionRecord{}, domain.ErrWorkIdentityMismatch
 	}
 	// Validate the authorization's shape before allocating anything; all worker
 	// identity fields below are replaced with AO's materialized facts at issuance.
 	i := a.identity("unallocated", ports.WorkspaceInfo{Path: "unallocated", Branch: "unallocated"})
 	if err := i.Validate(); err != nil {
-		return domain.SessionRecord{}, 0, 0, err
+		return domain.SessionRecord{}, err
 	}
 	if err := a.grant.Validate(); err != nil {
-		return domain.SessionRecord{}, 0, 0, err
+		return domain.SessionRecord{}, err
 	}
 	s, ok := m.store.(workItemSpawnStore)
 	if !ok {
-		return domain.SessionRecord{}, 0, 0, domain.ErrWorkAdmissionHeld
+		return domain.SessionRecord{}, domain.ErrWorkAdmissionHeld
 	}
 	if _, found, err := s.GetWorkItemLease(ctx, a.work); err != nil || found {
-		return domain.SessionRecord{}, 0, 0, errors.Join(domain.ErrWorkAdmissionHeld, err)
+		return domain.SessionRecord{}, errors.Join(domain.ErrWorkAdmissionHeld, err)
 	}
 	cfg.ExecutionBaseSHA = a.base
-	return m.spawn(ctx, cfg, a)
+	rec, _, _, err := m.spawn(ctx, cfg, a)
+	return rec, err
 }
 
 func (a *workItemSpawnAuthorization) identity(worker domain.SessionID, ws ports.WorkspaceInfo) domain.WorkItemIdentity {
