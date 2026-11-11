@@ -13,26 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reportactor"
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
-
-// Missing caller authentication must stop before either writer or receipt lookup.
-// The real store below is used only to inspect and seed disposable fixture state.
-type unauthenticatedReportStore struct{ t *testing.T }
-
-func (s unauthenticatedReportStore) AcceptWorkerReport(context.Context, domain.WorkerReport) (domain.WorkerReportReceipt, error) {
-	s.t.Error("unauthenticated submission reached report writer")
-	return domain.WorkerReportReceipt{}, domain.ErrWorkerReportActorBindingUnavailable
-}
-
-func (s unauthenticatedReportStore) GetWorkerReport(context.Context, string) (domain.WorkerReportReceipt, bool, error) {
-	s.t.Error("unauthenticated submission reached receipt lookup")
-	return domain.WorkerReportReceipt{}, false, domain.ErrWorkerReportActorBindingUnavailable
-}
 
 func reportFixture(t *testing.T) (*sqlite.Store, domain.WorkerReport) {
 	t.Helper()
@@ -64,12 +50,8 @@ func reportFixture(t *testing.T) (*sqlite.Store, domain.WorkerReport) {
 func TestWorkerReportCLIIngress(t *testing.T) {
 	cfg := setConfigEnv(t)
 	s, report := reportFixture(t)
-	// This is a negative ingress fixture, not an authenticated native caller.
-	submission, err := reportactor.NewAcceptance(reportactor.Unavailable{}, unauthenticatedReportStore{t: t})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(httpd.NewWorkerReportHandler(submission))
+	// Exercise the production router's typed hold, not an injected acceptance.
+	srv := httptest.NewServer(httpd.NewRouterWithControl(config.Config{}, nil, nil, httpd.APIDeps{}, httpd.ControlDeps{}))
 	defer srv.Close()
 	writeRunFileFor(t, cfg, srv)
 	submit := func(r domain.WorkerReport, file bool) (string, error) {

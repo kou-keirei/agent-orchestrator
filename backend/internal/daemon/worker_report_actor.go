@@ -3,10 +3,29 @@ package daemon
 import (
 	"context"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reportactor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
+
+// submitNativeWorkerReport is the private daemon boundary for an authored
+// native invocation holding an already-issued Chat actor. It must never be
+// called by minting an actor from report JSON, environment, or loopback access.
+// The guard pins the selected controller/turn through transactional acceptance.
+// No native authored-report callback currently supplies this handle; callers
+// without one receive the typed production HOLD before any store access.
+// Acceptance enqueues the existing outbox, never semantic parent ACK.
+func submitNativeWorkerReport(ctx context.Context, actor ports.WorkerReportActorGuard, st ports.WorkerReportStore, report domain.WorkerReport) (domain.WorkerReportReceipt, error) {
+	if actor == nil {
+		return domain.WorkerReportReceipt{}, domain.WorkerReportNativeIngressBlock{}
+	}
+	acceptance, err := reportactor.NewAcceptance(actor, st)
+	if err != nil {
+		return domain.WorkerReportReceipt{}, err
+	}
+	return acceptance.SubmitWorkerReport(ctx, report)
+}
 
 // workerReportBindings adapts existing authoritative reads without changing the
 // WorkItem store. It is for internal native caller binding only; no public report
