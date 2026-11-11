@@ -76,6 +76,237 @@ func (f *ordinarySendFixture) append(t *testing.T, id string) domain.Conversatio
 	return owner
 }
 
+func evidenceRequest(owner domain.ConversationSendOwner) store.OrdinarySendEvidenceRequest {
+	return store.OrdinarySendEvidenceRequest{
+		ConversationSendOwner: owner, Harness: domain.HarnessClaudeCode,
+		ProviderConversationID: "native-thread", ProviderScopeID: owner.BranchID,
+	}
+}
+
+func assertSendEvidenceHold(t *testing.T, f *ordinarySendFixture, want store.OrdinarySendEvidenceRequest, reason store.SendEvidenceHoldReason) store.OrdinarySendEvidence {
+	t.Helper()
+	got, err := f.s.ReadOrdinarySendEvidence(t.Context(), want)
+	var hold *store.SendEvidenceHold
+	if !errors.As(err, &hold) || hold.Reason != reason {
+		t.Fatalf("evidence=%+v err=%v, want HOLD %s", got, err, reason)
+	}
+	if reason == store.SendEvidenceAdmissionGap || reason == store.SendEvidenceNativeGap {
+		if hold.MissingProducerContract != store.OrdinarySendProducerContract || got.Owner != want.ConversationSendOwner {
+			t.Fatalf("missing producer contract or exact owner: %+v %+v", got, hold)
+		}
+	} else if got.Owner.TurnID != "" || got.AttemptState != "" {
+		t.Fatalf("failed identity/fence exposed usable evidence: %+v", got)
+	}
+	return got
+}
+
+func TestOrdinarySendEvidenceJournalStatesNeverAuthorize(t *testing.T) {
+	for _, state := range []domain.ConversationSendState{
+		domain.ConversationSendPending, domain.ConversationSendReserved, domain.ConversationSendBound,
+		domain.ConversationSendLegacy, domain.ConversationSendNotDelivered,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			owner := f.append(t, "evidence")
+			want := evidenceRequest(owner)
+			reason := store.SendEvidenceNativeGap
+			switch state {
+			case domain.ConversationSendPending:
+				reason = store.SendEvidenceAdmissionGap
+			case domain.ConversationSendLegacy:
+				reason = store.SendEvidenceAdmissionGap
+				if _, err := f.db.Exec(`UPDATE conversation_send_attempts SET state='legacy' WHERE turn_id=?`, owner.TurnID); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if _, err := f.s.ReserveOrdinarySend(t.Context(), owner, testNow); err != nil {
+					t.Fatal(err)
+				}
+				if state == domain.ConversationSendBound {
+					// A caller may bind before external dispatch. This reference
+					// must not be upgraded into native acceptance by the reader.
+					want.ProviderTurnID = "native-evidence"
+					if err := f.s.BindReservedOrdinarySend(t.Context(), owner, want.ProviderTurnID, testNow); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if state == domain.ConversationSendNotDelivered {
+					if err := f.s.ConfirmOrdinarySendNotDelivered(t.Context(), owner, "opaque-refusal", testNow); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			var beforeChanges int
+			if err := f.db.QueryRow(`SELECT COUNT(*) FROM change_log`).Scan(&beforeChanges); err != nil {
+				t.Fatal(err)
+			}
+			got := assertSendEvidenceHold(t, f, want, reason)
+			if got.AttemptState != state || got.AdmissionGeneration != "g1" || got.ProviderTurnID != want.ProviderTurnID ||
+				got.ProviderConversationID != want.ProviderConversationID || got.ProviderScopeID != want.ProviderScopeID || got.Harness != want.Harness {
+				t.Fatalf("journal readback: %+v", got)
+			}
+			reserved := state != domain.ConversationSendPending && state != domain.ConversationSendLegacy
+			if (got.ReservedAt != nil) != reserved || (reserved && !got.ReservedAt.Equal(testNow)) ||
+				(state == domain.ConversationSendNotDelivered && got.NonDeliveryEvidence != "opaque-refusal") {
+				t.Fatalf("reservation/result readback: %+v", got)
+			}
+			var afterChanges int
+			if err := f.db.QueryRow(`SELECT COUNT(*) FROM change_log`).Scan(&afterChanges); err != nil || afterChanges != beforeChanges {
+				t.Fatalf("readback mutated CDC: %d -> %d: %v", beforeChanges, afterChanges, err)
+			}
+			if err := f.s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			f.s, err = sqlite.Open(f.dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSendEvidenceHold(t, f, want, reason)
+		})
+	}
+}
+
+func TestOrdinarySendEvidenceExactIdentity(t *testing.T) {
+	for _, field := range []string{"conversation", "branch", "session", "generation", "turn", "client", "harness", "provider", "scope", "native-turn", "empty-generation"} {
+		t.Run(field, func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			want := evidenceRequest(f.append(t, "evidence"))
+			reason := store.SendEvidenceIdentity
+			switch field {
+			case "conversation":
+				want.ConversationID = "foreign"
+			case "branch":
+				want.BranchID = "foreign"
+			case "session":
+				want.SessionID = "foreign"
+			case "generation":
+				want.ControllerGeneration = "foreign"
+			case "turn":
+				want.TurnID = "absent"
+				reason = store.SendEvidenceMissing
+			case "client":
+				want.ClientMessageID = "foreign"
+			case "harness":
+				want.Harness = domain.HarnessFake
+			case "provider":
+				want.ProviderConversationID = "foreign"
+			case "scope":
+				want.ProviderScopeID = "foreign"
+			case "native-turn":
+				want.ProviderTurnID = "foreign"
+			case "empty-generation":
+				want.ControllerGeneration = ""
+				reason = store.SendEvidenceInvalidRequest
+			}
+			assertSendEvidenceHold(t, f, want, reason)
+		})
+	}
+}
+
+func TestOrdinarySendEvidenceDurableIdentityMutation(t *testing.T) {
+	for _, mutation := range []string{
+		`UPDATE sessions SET controller_generation='g2'`,
+		`UPDATE conversation_turns SET controller_generation='g2'`,
+		`UPDATE conversation_send_attempts SET controller_generation='g2'`,
+		`UPDATE sessions SET provider_conversation_id='other-native'`,
+		`UPDATE conversation_branches SET provider_conversation_id='other-native'`,
+		`UPDATE conversation_branches SET provider_scope_id='other-scope'`,
+		`UPDATE conversation_branches SET provider_ids_scoped=0`,
+		`UPDATE conversation_branches SET session_id='foreign'`,
+		`UPDATE conversations SET current_session_id=NULL`,
+		`UPDATE conversations SET active_branch_id='foreign'`,
+		`UPDATE sessions SET is_terminated=1`,
+		`UPDATE sessions SET session_mode='tui'`,
+		`UPDATE conversation_turns SET rolled_back_at=CURRENT_TIMESTAMP`,
+		`UPDATE conversation_messages SET client_message_id='replaced-request'`,
+	} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			owner := f.append(t, "evidence")
+			if _, err := f.s.ReserveOrdinarySend(t.Context(), owner, testNow); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec(mutation); err != nil {
+				t.Fatal(err)
+			}
+			assertSendEvidenceHold(t, f, evidenceRequest(owner), store.SendEvidenceIdentity)
+			// Matching a successor's current generation cannot relabel the
+			// admission/reservation from its predecessor.
+			if strings.Contains(mutation, "sessions SET controller_generation") {
+				owner.ControllerGeneration = "g2"
+				assertSendEvidenceHold(t, f, evidenceRequest(owner), store.SendEvidenceIdentity)
+			}
+		})
+	}
+}
+
+func TestOrdinarySendEvidenceMissingAndAmbiguous(t *testing.T) {
+	for _, mutation := range []string{
+		`DELETE FROM conversation_send_attempts`,
+		`DELETE FROM conversation_messages`,
+		`INSERT INTO conversation_messages(id, conversation_id, turn_id, sequence, role, origin, text, client_message_id, created_at, updated_at, branch_id)
+		 SELECT 'duplicate', conversation_id, turn_id, sequence+1, role, origin, text, 'duplicate-client', created_at, updated_at, branch_id FROM conversation_messages`,
+	} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newOrdinarySendFixture(t)
+			owner := f.append(t, "evidence")
+			if _, err := f.db.Exec(mutation); err != nil {
+				t.Fatal(err)
+			}
+			reason := store.SendEvidenceMissing
+			if strings.HasPrefix(mutation, "INSERT") {
+				reason = store.SendEvidenceAmbiguous
+			}
+			assertSendEvidenceHold(t, f, evidenceRequest(owner), reason)
+		})
+	}
+}
+
+func TestOrdinarySendEvidenceRejectsWritersAndProjection(t *testing.T) {
+	f := newOrdinarySendFixture(t)
+	owner := f.append(t, "evidence")
+	want := evidenceRequest(owner)
+	release := store.LockReportWriterForTest(f.s)
+	assertSendEvidenceHold(t, f, want, store.SendEvidenceConcurrentWrite)
+	release()
+	conn, err := f.db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(t.Context(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	// Hold a real independent SQLite writer until the read has returned.
+	start := time.Now()
+	assertSendEvidenceHold(t, f, want, store.SendEvidenceConcurrentWrite)
+	if time.Since(start) > time.Second {
+		t.Error("evidence reader waited on a concurrent SQLite writer")
+	}
+	if _, err := conn.ExecContext(t.Context(), `ROLLBACK`); err != nil {
+		t.Fatal(err)
+	}
+	rollback := errors.New("evidence projection rollback")
+	_, err = f.s.ProjectProviderEvent(t.Context(), owner.ConversationID, owner.SessionID, "g1", "evidence-event", "turn.updated", `{}`, testNow, func(ctx context.Context) error {
+		_, err := f.s.ReadOrdinarySendEvidence(ctx, want)
+		var hold *store.SendEvidenceHold
+		if !errors.As(err, &hold) || hold.Reason != store.SendEvidenceTransaction {
+			t.Errorf("uncommitted projection read: %v", err)
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := f.s.ReadOrdinarySendEvidence(ctx, want); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled read: %v", err)
+	}
+	assertSendEvidenceHold(t, f, want, store.SendEvidenceAdmissionGap)
+}
+
 func assertOrdinarySendQueued(t *testing.T, f *ordinarySendFixture, owner domain.ConversationSendOwner, state domain.ConversationSendState) {
 	t.Helper()
 	turn, err := f.s.TurnByID(t.Context(), owner.TurnID)
