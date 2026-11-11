@@ -25,13 +25,21 @@ type OrdinarySendEvidenceRequest struct {
 type SendEvidenceHoldReason string
 
 const (
+	// SendEvidenceInvalidRequest rejects an incomplete evidence comparison target.
 	SendEvidenceInvalidRequest  SendEvidenceHoldReason = "invalid_request"
+	// SendEvidenceTransaction rejects a nested evidence snapshot transaction.
 	SendEvidenceTransaction     SendEvidenceHoldReason = "nested_transaction"
+	// SendEvidenceConcurrentWrite holds when a stable snapshot is unavailable.
 	SendEvidenceConcurrentWrite SendEvidenceHoldReason = "concurrent_mutation"
+	// SendEvidenceMissing indicates required durable source rows are absent.
 	SendEvidenceMissing         SendEvidenceHoldReason = "missing_evidence"
+	// SendEvidenceAmbiguous indicates conflicting or incomplete durable evidence.
 	SendEvidenceAmbiguous       SendEvidenceHoldReason = "ambiguous_evidence"
+	// SendEvidenceIdentity rejects stale or foreign owner and provider identities.
 	SendEvidenceIdentity        SendEvidenceHoldReason = "stale_or_foreign_identity"
+	// SendEvidenceAdmissionGap marks the missing immutable admission producer.
 	SendEvidenceAdmissionGap    SendEvidenceHoldReason = "missing_admission_producer"
+	// SendEvidenceNativeGap marks the missing correlated native result producer.
 	SendEvidenceNativeGap       SendEvidenceHoldReason = "missing_native_result_producer"
 )
 
