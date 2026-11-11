@@ -27,19 +27,29 @@ type FirstSendIdentity struct {
 type FirstSendDisposition string
 
 const (
+	// FirstSendUnknown indicates native first-send delivery is not proven.
 	FirstSendUnknown FirstSendDisposition = "UNKNOWN"
+	// FirstSendHold indicates the readback cannot safely qualify this identity.
 	FirstSendHold    FirstSendDisposition = "HOLD"
 )
 
+// FirstSendReason identifies a specific fail-closed first-send evidence gap.
 type FirstSendReason string
 
 const (
+	// FirstSendIdentityMismatch rejects a changed or foreign session identity.
 	FirstSendIdentityMismatch  FirstSendReason = "identity_mismatch"
+	// FirstSendReadUnavailable means the required durable readback failed.
 	FirstSendReadUnavailable   FirstSendReason = "read_unavailable"
+	// FirstSendNoAdmission means no authoritative first admission is available.
 	FirstSendNoAdmission       FirstSendReason = "no_authoritative_admission"
+	// FirstSendSnapshotChanged marks conflicting observations across reads.
 	FirstSendSnapshotChanged   FirstSendReason = "snapshot_changed"
+	// FirstSendAttemptUncertain means the provider call may already have occurred.
 	FirstSendAttemptUncertain  FirstSendReason = "send_may_have_occurred"
+	// FirstSendAdmissionUnbound indicates the original request binding is unavailable.
 	FirstSendAdmissionUnbound  FirstSendReason = "immutable_first_admission_unbound"
+	// FirstSendAcceptanceUnbound means native provider acceptance is unproven.
 	FirstSendAcceptanceUnbound FirstSendReason = "native_acceptance_unbound"
 )
 
@@ -52,6 +62,7 @@ type FirstSendAttestation struct {
 	JournalState domain.ConversationSendState
 }
 
+// ErrFirstSendIdentity rejects a readback whose original AO-owned identity cannot be proven.
 var ErrFirstSendIdentity = errors.New("first-send readback identity mismatch")
 
 // FirstSendReader is fixed to one identity and one service controller. It never
