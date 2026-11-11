@@ -1,8 +1,10 @@
 # Exact original-parent worker reports
 
-`ExactParentReports` is an opt-in, transport-neutral consumer of an existing
-immutable worker-report receipt and its existing singleton outbox event. It is
-not wired into the daemon, report ingress, generic dispatcher or provider driver.
+`ExactParentReports` consumes an existing immutable worker-report receipt and
+its existing singleton outbox event. The daemon binds the existing outbox runner
+to this consumer, SQLite's immutable parent reader and Chat's native owner gate.
+The source scan selects due report IDs only; delivery revalidates the receipt,
+immutable parent and fresh work/outbox leases. No caller-asserted target is used.
 The generic transport ACK paths continue to refuse reports and mixed batches.
 
 The reviewed source scaffold is W571
@@ -21,9 +23,11 @@ existing input, controller and dispatch gates. It independently compares the
 live handle/generation and active branch/scope with the immutable target, reads
 native history against AO's existing high-water contract, then uses Chat's
 durable client-message reservation. Busy parents are held before claim; reports
-are never queued for a later unfenced drain. The adapter and consumer remain
-unmounted. Missing capabilities produce durable HOLD; native activation is
-`BLOCKS_PRODUCTION`. There is no coordinator discovery or metadata backfill.
+are never queued for a later unfenced drain. Missing capabilities produce durable
+HOLD. The public report handler remains unmounted: the existing native authored
+report invocation must carry a genuinely issued caller handle before production
+ingress can be bound. HTTP fields cannot mint it. There is no coordinator
+discovery or metadata backfill.
 
 - PR61 corrected source `6d94d85b9e2d4e868019966e1970492b23df2e9c`
   and independently reviewed W593 composition
@@ -57,9 +61,9 @@ unmounted. Missing capabilities produce durable HOLD; native activation is
   semantic producer for this interface. W584 pre-thread tool registration
   remains `HUMAN_DECISION_REQUIRED`; no worker tool or asserted ACK is substituted.
 
-Integration trigger: independent review and executable qualification of the
-delivery adapter, plus owner adjudication of trusted parent-native semantics and
-Resume generation continuity. Source delivery does not clear those two holds.
+Qualification still requires independent review and native executable evidence,
+plus owner adjudication of trusted parent-native semantics and Resume generation
+continuity. Source delivery does not clear those holds.
 No driver changes, runtime installation or production ECP263 wake belong here.
 
 ## Delivery and retry behavior

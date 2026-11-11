@@ -73,6 +73,7 @@ type Submission struct{ Submitted, Acknowledged bool }
 type Dispatcher struct {
 	Store     Store
 	Transport Transport
+	Reports   *ExactParentReports
 	Notifier  interface {
 		Notify(context.Context, ports.NotificationIntent) error
 		Resolve(context.Context, ports.NotificationResolution) error
@@ -105,6 +106,14 @@ func (d *Dispatcher) DispatchProject(ctx context.Context, project domain.Project
 			err = ErrReportDeliveryHeld
 		}
 	}()
+	// Reports use the same outbox and project admission gate, but never the
+	// generic destination/transport path. A report HOLD cannot starve legacy work.
+	if d.Reports != nil {
+		reportErr := d.Reports.DispatchProject(ctx, project)
+		if reportErr != nil {
+			defer func() { err = errors.Join(err, reportErr) }()
+		}
+	}
 	// A semantically resolved report can still carry a notification retry marker,
 	// even when no report remains held and there is no due transport work.
 	if err := d.ReconcileAttention(ctx, project, now); err != nil {

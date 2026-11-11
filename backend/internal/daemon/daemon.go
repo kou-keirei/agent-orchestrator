@@ -534,6 +534,7 @@ func Run() error {
 		Store:     store,
 		Transport: orchestrationTransport{sender: wiredSessMgr},
 		Notifier:  notificationWriter,
+		Reports:   newExactParentReports(store, chatSvc),
 	}
 	orchestrationWake := make(chan domain.ProjectID, 64)
 	lcStack.LCM.SetOrchestrationWake(func(project domain.ProjectID) {

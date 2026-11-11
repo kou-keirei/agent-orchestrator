@@ -11,15 +11,51 @@ import (
 )
 
 // ExactParentReports is an opt-in, singleton worker-report delivery engine.
-// It is deliberately NOT wired into Dispatcher or production Chat. W557's
-// validated immutable reader and a genuine native continuity/semantic event
-// adapter must be supplied by integration; missing capabilities durably HOLD.
+// The daemon binds it to the existing dispatcher, immutable reader and Chat
+// ownership gate. Missing semantic capabilities continue to durably HOLD.
 type ExactParentReports struct {
-	Store   ports.ExactReportStore
+	Store  ports.ExactReportStore
+	Source interface {
+		ListDueExactParentReports(context.Context, domain.ProjectID, time.Time, string, int) ([]string, error)
+	}
 	Parents ports.ExactReportParentReader
 	Native  ports.ExactReportNative
 	Resume  ports.ExactReportResumer
 	Now     func() time.Time
+}
+
+// DispatchProject consumes a bounded durable scan, never caller-asserted routes.
+// Selection is advisory: Deliver re-reads the receipt, parent and lease under
+// the existing project gate. Submitted reports await a genuine semantic event.
+func (d *ExactParentReports) DispatchProject(ctx context.Context, project domain.ProjectID) error {
+	if d.Source == nil {
+		return &ports.ReportDeliveryHold{Reason: "report_source_unbound"}
+	}
+	now := d.now()
+	after := ""
+	var failures []error
+	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		ids, err := d.Source.ListDueExactParentReports(ctx, project, now, after, MaxBatchEvents)
+		if err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+		for _, id := range ids {
+			// Keyset progress also protects against a malformed source looping.
+			if id <= after {
+				return errors.New("report source did not advance")
+			}
+			after = id
+			if err := d.Deliver(ctx, project, id); err != nil && !errors.Is(err, ErrReportDeliveryHeld) && !errors.Is(err, ErrDispatchHeld) {
+				failures = append(failures, err)
+			}
+		}
+		if len(ids) < MaxBatchEvents {
+			return errors.Join(failures...)
+		}
+	}
 }
 
 func (d *ExactParentReports) now() time.Time {
