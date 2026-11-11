@@ -1,21 +1,236 @@
 package store_test
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reportactor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
+type runtimeReportVerifier func(context.Context, domain.WorkerReport) error
+
+func (v runtimeReportVerifier) VerifyWorkerReportActor(ctx context.Context, r domain.WorkerReport) error {
+	return v(ctx, r)
+}
+
+func TestReportRuntimeIngressRestartAndUntrustedRoutes(t *testing.T) {
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	r, native := seedComposedParentReport(t, s, dir, func(report domain.WorkerReport) (domain.WorkerReportReceipt, error) {
+		a, err := reportactor.NewAcceptance(runtimeReportVerifier(func(_ context.Context, got domain.WorkerReport) error {
+			if got != report {
+				return domain.ErrWorkerReportActorMismatch
+			}
+			return nil
+		}), s)
+		if err != nil {
+			return domain.WorkerReportReceipt{}, err
+		}
+		body, err := json.Marshal(report)
+		if err != nil {
+			return domain.WorkerReportReceipt{}, err
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/worker/reports", bytes.NewReader(body))
+		req.RemoteAddr, req.Host = "127.0.0.1:1234", "localhost"
+		w := httptest.NewRecorder()
+		httpd.NewWorkerReportHandler(a).ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("ingress acceptance: %d %s", w.Code, w.Body.String())
+		}
+		var receipt domain.WorkerReportReceipt
+		err = json.Unmarshal(w.Body.Bytes(), &receipt)
+		return receipt, err
+	})
+	verified := 0
+	// A fixture represents possession of an already-issued native caller handle.
+	// Production HTTP has no such handle; request fields never mint one.
+	a, err := reportactor.NewAcceptance(runtimeReportVerifier(func(_ context.Context, got domain.WorkerReport) error {
+		verified++
+		if got != r.Report {
+			return domain.ErrWorkerReportActorMismatch
+		}
+		return nil
+	}), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, peer, host, origin string
+		status                   int
+	}{
+		{"remote", "192.0.2.2:1234", "localhost", "", http.StatusForbidden},
+		{"foreign-host", "127.0.0.1:1234", "attacker.example", "", http.StatusForbidden},
+		{"browser", "127.0.0.1:1234", "localhost", "https://attacker.example", http.StatusForbidden},
+		{"trusted-fixture", "127.0.0.1:1234", "localhost", "", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(r.Report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/worker/reports", bytes.NewReader(body))
+			req.RemoteAddr, req.Host = tc.peer, tc.host
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			w := httptest.NewRecorder()
+			httpd.NewWorkerReportHandler(a).ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+	if verified != 1 || native.sendCalls != 0 {
+		t.Fatal("ingress bypassed caller fence or sent directly")
+	}
+	tr := &capturedOrchestrationTransport{}
+	n := &reportAttentionFixture{}
+	d := &orchestrationevents.Dispatcher{Store: s, Transport: tr, Notifier: n,
+		Reports: &orchestrationevents.ExactParentReports{Store: s, Source: s, Parents: s, Native: native}}
+	if err := orchestrationevents.Recover(t.Context(), s, d); err != nil {
+		t.Fatal(err)
+	}
+	e := exactReportEvent(t, s, r)
+	m, err := ports.ParseExactReportMessage(e.LeaseToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.State != domain.OrchestrationSubmitted || !e.AcknowledgedAt.IsZero() || native.sendCalls != 1 ||
+		len(tr.batches) != 0 || m.Parent != native.parent || native.acceptedID != m.ClientMessageID() {
+		t.Fatalf("runtime bypass or false ACK: %+v", e)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Store = s
+	d.Reports.Store, d.Reports.Source, d.Reports.Parents = s, s, s
+	for range 2 {
+		if err := orchestrationevents.Recover(t.Context(), s, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := exactReportEvent(t, s, r); got.LeaseToken != e.LeaseToken || !got.AcknowledgedAt.IsZero() ||
+		got.AttentionRequiredAt.IsZero() || native.sendCalls != 1 || native.providerWrites != 1 || len(tr.batches) != 0 {
+		t.Fatalf("restart resent/ACKed report: %+v", got)
+	}
+}
+
+type runtimeParentReader struct {
+	ports.ExactReportParentReader
+	afterRead func()
+}
+
+func TestReportRuntimeLostTransportRestartStableBinding(t *testing.T) {
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	r, native := seedComposedParentReport(t, s, dir)
+	native.firstSendErr = errors.New("fixture lost transport result")
+	now := time.Now().UTC()
+	exact := &orchestrationevents.ExactParentReports{Store: s, Source: s, Parents: s, Native: native, Now: func() time.Time { return now }}
+	d := &orchestrationevents.Dispatcher{Store: s, Reports: exact}
+	if err := d.DispatchProject(t.Context(), r.Report.Identity.ProjectID); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
+		t.Fatal(err)
+	}
+	prepared := exactReportEvent(t, s, r)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Store = s
+	exact.Store, exact.Source, exact.Parents = s, s, s
+	now = now.Add(orchestrationevents.LeaseDuration + time.Second)
+	for range 2 {
+		if err := d.DispatchProject(t.Context(), r.Report.Identity.ProjectID); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
+			t.Fatal(err)
+		}
+	}
+	e := exactReportEvent(t, s, r)
+	if e.LeaseToken != prepared.LeaseToken || e.DestinationSessionID != prepared.DestinationSessionID ||
+		e.State != domain.OrchestrationSubmitted || !e.AcknowledgedAt.IsZero() || native.sendCalls != 2 || native.providerWrites != 1 {
+		t.Fatalf("lost result changed binding or duplicated native delivery: %+v", e)
+	}
+}
+
+func (r runtimeParentReader) ReadReportOriginalParent(ctx context.Context, work domain.WorkItemID, attempt domain.WorkAttemptID) (ports.ExactReportParent, error) {
+	p, err := r.ExactReportParentReader.ReadReportOriginalParent(ctx, work, attempt)
+	r.afterRead()
+	return p, err
+}
+
+func TestReportRuntimeReaderLeaseRaceAndUntrustedParent(t *testing.T) {
+	for _, change := range []string{"reader-lease-race", "wrong-live-parent", "legacy-parent", "project-hold"} {
+		t.Run(change, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := sqlite.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			r, native := seedComposedParentReport(t, s, dir)
+			exact := &orchestrationevents.ExactParentReports{Store: s, Source: s, Parents: s, Native: native}
+			switch change {
+			case "reader-lease-race":
+				exact.Parents = runtimeParentReader{s, func() {
+					lease, _, err := s.GetWorkItemLease(t.Context(), r.Report.Identity.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := s.RenewWorkItemLease(t.Context(), r.Report.Identity, lease, lease.ExpiresAt.Add(time.Hour)); err != nil {
+						t.Fatal(err)
+					}
+				}}
+			case "wrong-live-parent":
+				native.observed.SessionID = "untrusted-replacement"
+			case "legacy-parent":
+				exact.Parents = native
+				native.parentErr = domain.ErrWorkItemParentHeld
+			case "project-hold":
+				if err := s.SetOrchestrationDispatchHold(t.Context(), r.Report.Identity.ProjectID, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			d := &orchestrationevents.Dispatcher{Store: s, Reports: exact}
+			if err := d.DispatchProject(t.Context(), r.Report.Identity.ProjectID); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) && !errors.Is(err, orchestrationevents.ErrDispatchHeld) {
+				t.Fatal(err)
+			}
+			if e := exactReportEvent(t, s, r); native.sendCalls != 0 || e.AttemptCount != 0 || e.LeaseToken != "" || !e.AcknowledgedAt.IsZero() {
+				t.Fatalf("stale/untrusted runtime delivery: %+v", e)
+			}
+		})
+	}
+}
+
 // Compose real immutable-parent persistence/readback, admission and the report
 // outbox. Only native ownership/delivery/semantics are synthetic. This fixture
 // does not establish live issuer acquisition or authenticated provider behavior.
-func seedComposedParentReport(t *testing.T, s *sqlite.Store, dir string) (domain.WorkerReportReceipt, *exactParentChatFixture) {
+func seedComposedParentReport(t *testing.T, s *sqlite.Store, dir string, ingress ...func(domain.WorkerReport) (domain.WorkerReportReceipt, error)) (domain.WorkerReportReceipt, *exactParentChatFixture) {
 	t.Helper()
 	work, target := seedParentPersistence(t, s)
 	// The shared persistence fixture uses a worker-shaped parent. Delivery needs
@@ -37,7 +252,13 @@ func seedComposedParentReport(t *testing.T, s *sqlite.Store, dir string) (domain
 		LeaseID: lease.Grant.ID, LeaseRevision: lease.Revision, WorkerSessionID: work.Identity.OriginalWorkerSessionID,
 		NativeSessionID: work.OriginalNativeSessionID, OriginalNativeSessionID: work.OriginalNativeSessionID,
 		NativeTurnID: "composed-worker-turn", Content: "composed checkpoint", Digest: reportDigest("composed checkpoint")}
-	receipt, err := s.AcceptWorkerReport(t.Context(), report)
+	accept := func(report domain.WorkerReport) (domain.WorkerReportReceipt, error) {
+		return s.AcceptWorkerReport(t.Context(), report)
+	}
+	if len(ingress) > 0 {
+		accept = ingress[0]
+	}
+	receipt, err := accept(report)
 	if err != nil {
 		t.Fatal(err)
 	}

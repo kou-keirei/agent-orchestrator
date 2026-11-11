@@ -5,7 +5,15 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
+
+// Bind only accepted native boundaries. Semantic reconciliation remains the
+// Chat adapter's typed producer-unbound HOLD; no public ACK is introduced.
+func newExactParentReports(store *sqlite.Store, native ports.ExactReportNative) *orchestrationevents.ExactParentReports {
+	return &orchestrationevents.ExactParentReports{Store: store, Source: store, Parents: store, Native: native}
+}
 
 type automationSender interface {
 	SendAutomation(context.Context, domain.SessionID, string, string) error

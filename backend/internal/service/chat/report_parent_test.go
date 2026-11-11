@@ -394,7 +394,9 @@ func (f *reportParentFixture) settle(t *testing.T) {
 func TestReportParentAdapterDeliveryIsNotSemanticACK(t *testing.T) {
 	f := newReportParentFixture(t)
 	d := f.engine()
-	if err := d.Deliver(t.Context(), testProject, f.receipt.Report.ID); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
+	d.Source = f.store
+	runtime := &orchestrationevents.Dispatcher{Store: f.store, Reports: d}
+	if err := runtime.DispatchProject(t.Context(), testProject); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
 		t.Fatal(err)
 	}
 	f.settle(t)
@@ -439,7 +441,7 @@ func TestReportParentAdapterDeliveryIsNotSemanticACK(t *testing.T) {
 		t.Fatalf("false semantic ACK: %+v", got)
 	}
 	for range 2 {
-		if err := d.Deliver(t.Context(), testProject, f.receipt.Report.ID); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
+		if err := runtime.DispatchProject(t.Context(), testProject); !errors.Is(err, ports.ErrWorkerReportDeliveryHeld) {
 			t.Fatal(err)
 		}
 	}
