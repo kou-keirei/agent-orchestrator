@@ -42,6 +42,30 @@ type ConversationSendAttempt struct {
 	ReservedAt *time.Time
 }
 
+// ConversationSendDispatchState is write-ahead evidence, never provider acceptance
+// or permission to replay. Only a newly committed reservation grants one call.
+type ConversationSendDispatchState string
+
+const (
+	// ConversationSendDispatchUnknown covers missing, legacy or mismatched evidence.
+	ConversationSendDispatchUnknown ConversationSendDispatchState = "unknown"
+	// ConversationSendDispatchNeverCalled is an exact immutable admission with no call marker.
+	ConversationSendDispatchNeverCalled ConversationSendDispatchState = "never_called"
+	// ConversationSendDispatchCallCommitted means a native call may have happened.
+	ConversationSendDispatchCallCommitted ConversationSendDispatchState = "call_committed"
+)
+
+// ConversationSendDispatchBoundary preserves the original admission identity and
+// the generation which committed the mandatory pre-call fence. Neither a marker
+// nor a bound provider reference proves delivery, an ACK, or native acceptance.
+type ConversationSendDispatchBoundary struct {
+	ConversationSendOwner
+	AdmissionGeneration string
+	AdmittedAt          *time.Time
+	CallCommittedAt     *time.Time
+	State               ConversationSendDispatchState
+}
+
 var (
 	// ErrConversationSendUncertain requires correlated evidence before resolution.
 	ErrConversationSendUncertain = errors.New("ordinary send requires correlated delivery resolution")

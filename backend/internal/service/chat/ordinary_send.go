@@ -14,6 +14,12 @@ import (
 // OrdinarySendStore is the existing durable pre-provider reservation contract.
 // A successful Reserve commits authority for one call using its returned prompt;
 // no error or readback grants that authority. Resolution requires the same owner.
+// SQLite commits the immutable dispatch boundary in that same transaction.
+// The report path bypasses reserveOrdinarySend via AppendReservedUserMessage,
+// which uses the same store fence. Both dominate SendTurn and deferred start.
+// Steering and branch/fork operations are separate contracts, not negative
+// evidence from this ordinary-send boundary. Empty original client keys also
+// cannot qualify for exact-key negative evidence.
 type OrdinarySendStore interface {
 	OrdinarySendAttempt(context.Context, string) (domain.ConversationSendAttempt, error)
 	ReserveOrdinarySend(context.Context, domain.ConversationSendOwner, time.Time) (domain.QueuedTurn, error)

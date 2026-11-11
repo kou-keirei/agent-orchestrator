@@ -81,12 +81,15 @@ func TestWorkerReportMigrationPreservesOutboxAndForeignKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, q := range queries {
-		if i == 4 { // Existing triggers retain exact SQL; the four new triggers are additive.
-			q = `SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name NOT IN ('worker_reports_immutable_update','worker_reports_immutable_delete','orchestration_worker_report_binding','orchestration_worker_report_immutable') ORDER BY name`
+		if i == 4 { // Existing triggers retain exact SQL; 0220 and 0223 add these triggers.
+			q = `SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name NOT IN ('worker_reports_immutable_update','worker_reports_immutable_delete','orchestration_worker_report_binding','orchestration_worker_report_immutable','conversation_dispatch_boundary_immutable') ORDER BY name`
 		}
 		if got := reportMigrationRows(t, db, q); !reflect.DeepEqual(got, before[i]) {
 			t.Fatalf("migration changed %s\nbefore=%v\nafter=%v", q, before[i], got)
 		}
+	}
+	if rows := reportMigrationRows(t, db, `SELECT name FROM sqlite_master WHERE type='trigger' AND name='conversation_dispatch_boundary_immutable' AND tbl_name='conversation_send_dispatch_boundaries'`); len(rows) != 1 {
+		t.Fatal("0223 dispatch boundary trigger missing")
 	}
 	if got := reportMigrationRows(t, db, `PRAGMA foreign_key_check`); len(got) != 0 {
 		t.Fatalf("foreign key violations: %v", got)
