@@ -8,10 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -201,9 +202,16 @@ func TestPStackNativeLifecycleCrashResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(before, after) {
-		t.Fatal("correlated native history changed across crash/resume")
+	// A successful native exchange must not contain errors on either side.
+	// Check them explicitly before comparing every history field, so error
+	// implementation details never stand in for successful replay semantics.
+	for i, event := range before {
+		require.NoError(t, event.Err, "native history before crash, event %d", i)
 	}
+	for i, event := range after {
+		require.NoError(t, event.Err, "native history after resume, event %d", i)
+	}
+	require.Equal(t, before, after, "correlated native history changed across crash/resume")
 	if err := nativeResumeRequireExchange(after, turn.ProviderTurnID, prompt); err != nil {
 		t.Fatal(err)
 	}
