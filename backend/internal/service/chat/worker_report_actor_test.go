@@ -16,6 +16,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -93,7 +94,7 @@ func newReportActorFixture(t *testing.T) *reportActorFixture {
 	t.Helper()
 	ctx := t.Context()
 	dir := t.TempDir()
-	st, err := sqlite.Open(dir)
+	st, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

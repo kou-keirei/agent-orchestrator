@@ -19,6 +19,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 // This is a deliberately bounded test transport, not a production archive API
@@ -56,7 +57,7 @@ func ao16Must(t *testing.T, err error) {
 func ao16Open(t *testing.T) (*sqlite.Store, *sql.DB) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := sqlite.Open(dir) // Each destination starts empty and runs migrations.
+	st, err := sqlitetest.Open(dir) // Each destination starts with an empty migrated schema.
 	ao16Must(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	// A Windows drive must be in the URI path (file:///C:/...), not the
