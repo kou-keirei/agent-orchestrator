@@ -15,10 +15,45 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/reportactor"
+	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestWorkerReportProductionRouterHoldsUntrustedClaims(t *testing.T) {
+	router := NewRouterWithControl(config.Config{}, discardLogger(), nil, APIDeps{}, ControlDeps{})
+	_, body := workerReportHTTPClaim(t)
+	for _, claim := range []string{body, "{}", "{"} {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/worker/reports", strings.NewReader(claim))
+		r.RemoteAddr = "127.0.0.1:123"
+		r.Header.Set("X-Request-ID", "report-request")
+		// Publicly supplied identity/credential hints cannot issue a handle.
+		r.Header.Set("Authorization", "Bearer claimed-native-handle")
+		r.Header.Set("X-AO-Session-ID", "worker")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		requireWorkerReportHTTPRefusal(t, w, 503, "WORKER_REPORT_ACTOR_BINDING_UNAVAILABLE")
+	}
+	for _, peer := range []string{"192.0.2.1:123", "127.0.0.1:123"} {
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/v1/worker/reports", strings.NewReader(body))
+		r.RemoteAddr = peer
+		if strings.HasPrefix(peer, "127.") {
+			r.Header.Set("Origin", "http://127.0.0.1")
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("untrusted request: %d %s", w.Code, w.Body.String())
+		}
+	}
+	// The private interception does not capture adjacent public paths.
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("health route: %d", w.Code)
+	}
+}
 
 type reportSubmissionStub struct {
 	calls int
