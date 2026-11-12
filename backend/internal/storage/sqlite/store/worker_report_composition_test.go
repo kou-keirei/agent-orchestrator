@@ -17,6 +17,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 type runtimeReportVerifier func(context.Context, domain.WorkerReport) error
@@ -27,7 +28,7 @@ func (v runtimeReportVerifier) VerifyWorkerReportActor(ctx context.Context, r do
 
 func TestReportRuntimeIngressRestartAndUntrustedRoutes(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ type runtimeParentReader struct {
 
 func TestReportRuntimeLostTransportRestartStableBinding(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func TestReportRuntimeReaderLeaseRaceAndUntrustedParent(t *testing.T) {
 	for _, change := range []string{"reader-lease-race", "wrong-live-parent", "legacy-parent", "project-hold"} {
 		t.Run(change, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -275,7 +276,7 @@ func seedComposedParentReport(t *testing.T, s *sqlite.Store, dir string, ingress
 
 func TestComposedParentReportReceiptLostACKAndRestart(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +338,7 @@ func TestComposedParentReportStaleLeaseGenerationAndWrongParent(t *testing.T) {
 	for _, change := range []string{"lease_revision", "owner_generation", "parent_generation", "wrong_parent", "worker_native"} {
 		t.Run(change, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -386,7 +387,7 @@ func TestComposedParentReportStaleLeaseGenerationAndWrongParent(t *testing.T) {
 
 func TestComposedParentReportDeadLetterRestartNoResend(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
