@@ -85,6 +85,7 @@ func (c *NativeWorkItemCommand) WorkItemID() domain.WorkItemID {
 	return c.authorization.work
 }
 
+// Spawn materializes the command using its retained authorization across retries.
 func (c *NativeWorkItemCommand) Spawn(ctx context.Context) (domain.SessionRecord, error) {
 	if c == nil || c.manager == nil || c.authorization == nil {
 		return domain.SessionRecord{}, domain.ErrWorkAdmissionHeld

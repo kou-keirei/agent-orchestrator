@@ -802,37 +802,6 @@ func Run(ctx context.Context, cfg Config) error {
 	return runErr
 }
 
-// finishProviderExit is called exactly once, after child.Wait. A transport error,
-// cancellation, kill request, or shutdown acknowledgement is never sufficient.
-func (h *host) finishProviderExit(waitErr error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for h.replaying {
-		h.cond.Wait()
-	}
-	h.exiting = true // No new attachment may relabel this observation.
-	var exitErr *exec.ExitError
-	if h.exitObserver != nil {
-		if h.codexNativeThreadID != "" && h.child != nil && h.child.Process != nil && h.child.ProcessState != nil &&
-			h.child.ProcessState.Pid() == h.child.Process.Pid && (waitErr == nil || errors.As(waitErr, &exitErr)) {
-			proof := ProviderExitEvidence{
-				SessionID: h.sessionID, NativeThreadID: h.codexNativeThreadID,
-				OwnerID: h.ownerID, AttachmentGeneration: h.clientGeneration,
-				RuntimeGeneration: h.runtimeGeneration, ControllerGeneration: h.controllerGeneration,
-				ExitCode: h.child.ProcessState.ExitCode(), ObservedAt: time.Now().UTC(),
-			}
-			_ = h.exitObserver.SetWriteDeadline(time.Now().Add(handshakeTimeout))
-			_ = json.NewEncoder(h.exitObserver).Encode(helloResponse{OK: true, ProviderExit: &proof})
-		}
-		_ = h.exitObserver.Close()
-		h.exitObserver = nil
-	}
-	if h.client != nil {
-		_ = h.client.Close()
-		h.client = nil
-	}
-}
-
 type host struct {
 	ctx                  context.Context
 	listener             net.Listener
@@ -865,6 +834,37 @@ type host struct {
 	codexNativeThreadGeneration uint64
 	shutdown                    chan struct{}
 	shutdownOnce                sync.Once
+}
+
+// finishProviderExit is called exactly once, after child.Wait. A transport error,
+// cancellation, kill request, or shutdown acknowledgement is never sufficient.
+func (h *host) finishProviderExit(waitErr error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for h.replaying {
+		h.cond.Wait()
+	}
+	h.exiting = true // No new attachment may relabel this observation.
+	var exitErr *exec.ExitError
+	if h.exitObserver != nil {
+		if h.codexNativeThreadID != "" && h.child != nil && h.child.Process != nil && h.child.ProcessState != nil &&
+			h.child.ProcessState.Pid() == h.child.Process.Pid && (waitErr == nil || errors.As(waitErr, &exitErr)) {
+			proof := ProviderExitEvidence{
+				SessionID: h.sessionID, NativeThreadID: h.codexNativeThreadID,
+				OwnerID: h.ownerID, AttachmentGeneration: h.clientGeneration,
+				RuntimeGeneration: h.runtimeGeneration, ControllerGeneration: h.controllerGeneration,
+				ExitCode: h.child.ProcessState.ExitCode(), ObservedAt: time.Now().UTC(),
+			}
+			_ = h.exitObserver.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+			_ = json.NewEncoder(h.exitObserver).Encode(helloResponse{OK: true, ProviderExit: &proof})
+		}
+		_ = h.exitObserver.Close()
+		h.exitObserver = nil
+	}
+	if h.client != nil {
+		_ = h.client.Close()
+		h.client = nil
+	}
 }
 
 type pendingRequest struct {
