@@ -303,7 +303,10 @@ func MissingCapabilitiesForPermissions(caps ChatCapabilities, permissions Permis
 
 // ChatStartConfig is what a driver needs to open a new provider conversation.
 type ChatStartConfig struct {
-	SessionID domain.SessionID
+	// WorkerReportTool is set only after internal WorkItem admission. It offers
+	// the native tool; a committed-turn callback must still authorize each call.
+	WorkerReportTool bool
+	SessionID        domain.SessionID
 	// RuntimeGeneration and ControllerGeneration are the AO execution fence
 	// expected by a persistent provider host. Provider evidence from another
 	// generation is not admissible, even when its session and thread match.

@@ -385,6 +385,9 @@ func Run() error {
 	var agentSvc *agentsvc.Service
 	var sessMgr sessionLifecycle
 	chatSvc := chatsvc.New(chatsvc.Options{
+		PrepareWorkerReportTool: func(ctx context.Context, work domain.WorkItemID, worker domain.SessionID) (ports.WorkerReportToolAdmission, error) {
+			return prepareWorkerReportTool(ctx, store, work, worker)
+		},
 		Store:    store,
 		Sessions: store,
 		StopProviderHost: func(ctx context.Context, id domain.SessionID) error {

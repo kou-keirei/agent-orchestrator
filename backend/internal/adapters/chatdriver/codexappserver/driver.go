@@ -64,6 +64,14 @@ type process struct {
 	reconnected   bool
 	nextRequestID int64
 	codexReadOnly []persistenthost.CodexReadOnlyProof
+	// These fields are captured from one authenticated host attachment. They
+	// are immutable, including across a later controller or host replacement.
+	providerExit         <-chan persistenthost.ProviderExitEvidence
+	sessionID            domain.SessionID
+	ownerID              string
+	attachmentGeneration uint64
+	runtimeGeneration    string
+	controllerGeneration string
 	// stop releases the process. It must be safe to call more than once.
 	stop func() error
 	// terminate destroys a persistent host for explicit session shutdown.
@@ -391,6 +399,18 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if cfg.SystemPrompt != "" {
 		params["developerInstructions"] = cfg.SystemPrompt
 	}
+	if cfg.WorkerReportTool {
+		if cfg.SessionID == "" || cfg.ControllerGeneration == "" {
+			_ = conv.Terminate()
+			return nil, domain.WorkerReportNativeIngressBlock{}
+		}
+		conv.mu.Lock()
+		conv.reportToolOffered = true
+		conv.mu.Unlock()
+		// dynamicTools is the experimental thread/start extension. Keep it at
+		// this adapter boundary; generated protocol sources remain untouched.
+		params["dynamicTools"] = workerReportToolSpecs()
+	}
 
 	var resp struct {
 		Thread struct {
@@ -668,7 +688,10 @@ func (d *Driver) connectSession(
 		reconnected:   transport.Reconnected,
 		nextRequestID: transport.NextRequestID,
 		codexReadOnly: append([]persistenthost.CodexReadOnlyProof(nil), transport.CodexReadOnly...),
-		stop:          transport.Stdin.Close,
+		providerExit:  transport.ProviderExit, sessionID: sessionID,
+		ownerID: transport.OwnerID, attachmentGeneration: transport.AttachmentGeneration,
+		runtimeGeneration: runtimeGeneration, controllerGeneration: controllerGeneration,
+		stop: transport.Stdin.Close,
 		terminate: func() error {
 			_ = transport.Stdin.Close()
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
