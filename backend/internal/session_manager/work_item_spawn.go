@@ -11,9 +11,8 @@ import (
 )
 
 // workItemSpawnAuthorization is an internal authorization snapshot, never an
-// ingress DTO. BLOCKS_PRODUCTION: selecting the AO producer authorized to mint
-// work/attempt IDs and approve the frozen base requires a product decision.
-// There is deliberately no exported constructor, dependency or production caller.
+// ingress DTO. The internal native command freezes an explicitly authorized
+// base/grant and mints work/attempt IDs once; public spawn remains separate.
 // That producer must capture parent at authorization time using Chat's
 // OriginalParentIssuer; it must never resolve today's coordinator at launch.
 // Owner and generation are NOT inputs: first issuance belongs to the new worker

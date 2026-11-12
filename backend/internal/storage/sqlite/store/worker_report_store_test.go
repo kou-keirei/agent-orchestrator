@@ -16,6 +16,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 func reportDigest(content string) string {
@@ -59,7 +60,7 @@ func reportDB(t *testing.T, dir string) *sql.DB {
 func TestWorkerReportRestartAndRetry(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +174,7 @@ func TestWorkerReportFreshIdentityAndLease(t *testing.T) {
 	for _, state := range []string{"expired", "released", "completed", "renewed", "superseded", "identity-only-claim"} {
 		t.Run(state, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -214,7 +215,7 @@ func TestWorkerReportFreshIdentityAndLease(t *testing.T) {
 
 func TestWorkerReportAtomicRollbackAndBinding(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +267,7 @@ func TestWorkerReportConcurrentIndependentOpens(t *testing.T) {
 		t.Run(map[bool]string{false: "same-id", true: "duplicate-done"}[differentIDs], func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			first, err := sqlite.Open(dir)
+			first, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -325,7 +326,7 @@ func TestWorkerReportConcurrentIndependentOpens(t *testing.T) {
 
 func TestWorkerReportDoneSurvivesOwnerChangeAndCleanup(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +412,7 @@ func TestWorkerReportAllTypesAndLostResponseRetry(t *testing.T) {
 
 func TestWorkerReportWaitsForDurableWriter(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +451,7 @@ func TestWorkerReportWaitsForDurableWriter(t *testing.T) {
 
 func TestWorkerReportExpiredRetryAndCurrentOwnerWithOldLease(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

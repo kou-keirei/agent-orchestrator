@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -17,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 func ao16Strings(table ao16Table) [][]string {
@@ -299,7 +303,12 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 			}
 			return conversation, nil
 		}}}, NewID: func() string { return fmt.Sprintf("ao16-import-%d", next.Add(1)) }})
-		t.Cleanup(func() { _ = svc.Stop(context.Background(), testSession) })
+		stop := func() {
+			stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			ao16Must(t, svc.Stop(stopCtx, testSession))
+		}
+		t.Cleanup(stop)
 		beforeRows := ao16ResumeRowFingerprint(t, db)
 		startCtx, cancel := context.WithTimeout(ctx, time.Second)
 		controller, err := svc.Start(startCtx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: "/synthetic/ao16", ProviderConversationID: "thread-1", HistoryMode: ports.ChatHistoryRequired, HistoryPolicy: domain.SessionInterfaceTransitionHistoryStrict})
@@ -330,12 +339,12 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 				t.Fatal("rejected Start mutated projected/raw history")
 			}
 			ao16AssertResumeProjection(t, db)
-			_ = svc.Stop(ctx, testSession)
+			stop()
 			t.Logf("HOLD: %s rejected: %v", variant, err)
 			return
 		}
 		if err != nil {
-			_ = svc.Stop(ctx, testSession)
+			stop()
 			t.Fatal(err)
 		}
 		if !resumed || conversation.historyReads() == 0 {
@@ -379,19 +388,57 @@ func ao16Resume(t *testing.T, st *sqlite.Store, db *sql.DB, variant string, cont
 			}
 			ao16AssertResumeProjection(t, db)
 		}
-		ao16Must(t, svc.Stop(ctx, testSession))
+		stop()
 	}
 }
 
+// ao16OpenResume isolates each case without rerunning the migration chain.
+// The source is copied only after both seed connections close (including WAL);
+// destinations use the existing empty, fully migrated test template.
+func ao16OpenResume(t *testing.T, seed []byte) (*sqlite.Store, *sql.DB) {
+	t.Helper()
+	dir := t.TempDir()
+	var st *sqlite.Store
+	var err error
+	if seed == nil {
+		st, err = sqlitetest.Open(dir)
+	} else {
+		ao16Must(t, os.WriteFile(filepath.Join(dir, "ao.db"), seed, 0o600))
+		st, err = sqlite.OpenPreMigrated(dir)
+	}
+	ao16Must(t, err)
+	t.Cleanup(func() { ao16Must(t, st.Close()) })
+	path := filepath.ToSlash(filepath.Join(dir, "ao.db"))
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	u := url.URL{Scheme: "file", Path: path}
+	db, err := sql.Open("sqlite", u.String()+"?_pragma=foreign_keys(1)")
+	ao16Must(t, err)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { ao16Must(t, db.Close()) })
+	return st, db
+}
+
 func TestAO16RestoreFakeResumeEquivalence(t *testing.T) {
+	// Migrate and seed once, then snapshot the closed database. Each source
+	// still starts from the original seeded rows, independently of ao16Restore.
+	seedStore, seedDB := ao16Seed(t)
+	archive := ao16Archive(t, seedDB)
+	var sequence int
+	var name, seedPath string
+	ao16Must(t, seedDB.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &seedPath))
+	ao16Must(t, seedDB.Close())
+	ao16Must(t, seedStore.Close())
+	seed, err := os.ReadFile(seedPath)
+	ao16Must(t, err)
 	for _, variant := range []string{"matching", "missing history", "missing checkpoint", "mismatched checkpoint", "missing checkpoint with matching history"} {
 		t.Run(variant, func(t *testing.T) {
-			source, sourceDB := ao16Seed(t)
-			archive := ao16Archive(t, sourceDB)
+			source, sourceDB := ao16OpenResume(t, seed)
 			ao16Resume(t, source, sourceDB, variant, false)
 			ao16Must(t, sourceDB.Close())
 			ao16Must(t, source.Close())
-			destination, db := ao16Open(t)
+			destination, db := ao16OpenResume(t, nil)
 			ao16Must(t, ao16Restore(db, archive))
 			ao16Resume(t, destination, db, variant, true)
 		})

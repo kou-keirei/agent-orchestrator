@@ -13,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 type reportDeliveryTransport struct{ batches []orchestrationevents.Batch }
@@ -25,7 +26,7 @@ func (t *reportDeliveryTransport) Submit(_ context.Context, _ domain.SessionReco
 func TestReportDeliveryHoldRestartAndIndependentLegacy(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestReportDeliveryHoldRestartAndIndependentLegacy(t *testing.T) {
 func TestReportDeliveryRejectsGenericPathsAndPartialMixedBatch(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +168,7 @@ func TestReportDeliveryRejectsGenericPathsAndPartialMixedBatch(t *testing.T) {
 func TestReportDeliveryHoldRespectsProjectHoldAcrossIndependentOpens(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +363,7 @@ func TestExactParentReportReservesSQLiteWriterBeforeSourceReads(t *testing.T) {
 	for _, operation := range []string{"prepare", "admit", "resolve"} {
 		t.Run(operation, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -418,7 +419,7 @@ func TestExactParentReportReservesSQLiteWriterBeforeSourceReads(t *testing.T) {
 
 func TestExactParentReportStoreColdReplayAndSemanticResolution(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +505,7 @@ func TestExactParentReportStoreNegativeBoundaries(t *testing.T) {
 	for _, name := range []string{"unbound", "missing", "ambiguous", "terminated", "replaced", "project_hold", "mixed", "retarget_retry", "changed_payload", "lost_admission_receipt"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -654,7 +655,7 @@ func TestExactParentAttentionDispatchFirstRetryAndReopen(t *testing.T) {
 	for _, name := range []string{"success", "resolve_failure", "no_notifier", "unresolved_peer"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -784,7 +785,7 @@ func TestExactParentReportReclaimDeadLetterSemanticOnly(t *testing.T) {
 	for _, name := range []string{"submitted", "lost_receipt", "authentication", "foreign_generation", "foreign_conversation", "foreign_parent", "client_id", "event", "payload", "lease_revision", "work_attempt", "mixed", "project_hold"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -905,7 +906,7 @@ func TestExactParentReportReclaimDeadLetterSemanticOnly(t *testing.T) {
 
 func TestExactParentSemanticResolutionSurvivesLegacyHoldAttentionAndReopen(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -974,7 +975,7 @@ func TestReportLegacyAckDoesNotAcquireSemanticResolution(t *testing.T) {
 	for _, name := range []string{"generic_ack", "transport_only", "malformed", "foreign_source", "foreign_destination", "mixed", "no_attempt", "no_ack_time"} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}

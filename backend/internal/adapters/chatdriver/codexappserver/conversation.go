@@ -71,9 +71,14 @@ type conversation struct {
 	// the immutable anchor even if turn/started races the response delivery.
 	dispatchFirstTurnResponseObserved bool
 
-	mu      sync.Mutex
-	pending map[string]*parkedRequest
-	closed  bool
+	mu                sync.Mutex
+	pending           map[string]*parkedRequest
+	closed            bool
+	reportToolOffered bool
+	reportToolTurn    string
+	reportToolSubmit  func(context.Context, ports.AuthoredWorkerReportContent) (domain.WorkerReportReceipt, error)
+	reportToolReady   bool
+	reportToolChanged chan struct{}
 
 	// sendMu serializes turn dispatch so only one operation mutates the provider
 	// conversation at a time.
@@ -128,12 +133,13 @@ var _ ports.ChatMCPReloader = (*conversation)(nil)
 
 func newConversation(proc *process, log *slog.Logger, providerScopeID string) *conversation {
 	c := &conversation{
-		proc:            proc,
-		log:             log,
-		events:          make(chan ports.ChatEvent, eventBuffer),
-		pending:         make(map[string]*parkedRequest),
-		pumpDone:        make(chan struct{}),
-		providerScopeID: providerScopeID,
+		proc:              proc,
+		log:               log,
+		events:            make(chan ports.ChatEvent, eventBuffer),
+		pending:           make(map[string]*parkedRequest),
+		reportToolChanged: make(chan struct{}),
+		pumpDone:          make(chan struct{}),
+		providerScopeID:   providerScopeID,
 		nativeEvidence: ports.ChatNativeEvidence{
 			Provider:             "codex",
 			EffectivePermission:  "unknown",
@@ -152,7 +158,9 @@ func newConversation(proc *process, log *slog.Logger, providerScopeID string) *c
 // called once, after the thread is open, so no event is emitted for a
 // conversation the caller does not yet have a handle to.
 func (c *conversation) start(threadID, model, effort string) {
+	c.mu.Lock()
 	c.threadID = threadID
+	c.mu.Unlock()
 	c.threadModel = model
 	c.threadEffort = effort
 	c.positiveExit = newPositiveExitEvidence(c.proc, threadID, c.providerScopeID)
@@ -927,7 +935,7 @@ func (c *conversation) handleServerRequest(ctx context.Context, req serverReques
 	case codexproto.MethodAccountChatgptAuthTokensRefresh:
 		return nil, c.reportAuthRefreshRequest(req.Params)
 	case codexproto.MethodItemToolCall:
-		return nil, c.refuseDynamicToolCall(req.Params)
+		return c.handleWorkerReportTool(ctx, req.Params)
 	}
 
 	kind, known := approvalMethods[req.Method]
@@ -1017,18 +1025,14 @@ func (c *conversation) reportAuthRefreshRequest(params json.RawMessage) error {
 		ports.ErrChatAuthRequired, reason)
 }
 
-// refuseDynamicToolCall declines a request to run a tool AO never offered.
-//
-// `item/tool/call` asks the CLIENT to execute a tool the client declared during
-// initialize. AO declares none, so a well-behaved provider will never send this and
-// one that does is asking AO to run something it has no definition for. Refusing is
-// the only safe answer: inventing a result would feed the model a fabrication.
+// refuseDynamicToolCall declines every tool outside this conversation's offered
+// report capability. A known tool name on an unadmitted conversation also fails.
 func (c *conversation) refuseDynamicToolCall(params json.RawMessage) error {
 	var p codexproto.DynamicToolCallParams
 	_ = json.Unmarshal(params, &p)
-	c.log.Warn("refusing dynamic tool call: AO declares no client-side tools",
+	c.log.Warn("refusing unregistered dynamic tool call",
 		"tool", p.Tool, "callId", p.CallID)
-	return fmt.Errorf("client declares no tools; %q is not available", p.Tool)
+	return fmt.Errorf("client did not offer this tool; %q is not available", p.Tool)
 }
 
 // ReloadMCPServers restarts the provider's tool servers and reports their state.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -39,7 +40,7 @@ func requireWorkItem(t *testing.T, s *sqlite.Store, want store.WorkItemRecord) {
 func TestWorkItemRestartAndStaleRetry(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +251,7 @@ func TestWorkItemConcurrentCreateAndClaims(t *testing.T) {
 func TestWorkItemClaimRollbackAndCanceledContext(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

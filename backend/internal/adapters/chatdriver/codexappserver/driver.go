@@ -399,6 +399,18 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if cfg.SystemPrompt != "" {
 		params["developerInstructions"] = cfg.SystemPrompt
 	}
+	if cfg.WorkerReportTool {
+		if cfg.SessionID == "" || cfg.ControllerGeneration == "" {
+			_ = conv.Terminate()
+			return nil, domain.WorkerReportNativeIngressBlock{}
+		}
+		conv.mu.Lock()
+		conv.reportToolOffered = true
+		conv.mu.Unlock()
+		// dynamicTools is the experimental thread/start extension. Keep it at
+		// this adapter boundary; generated protocol sources remain untouched.
+		params["dynamicTools"] = workerReportToolSpecs()
+	}
 
 	var resp struct {
 		Thread struct {
