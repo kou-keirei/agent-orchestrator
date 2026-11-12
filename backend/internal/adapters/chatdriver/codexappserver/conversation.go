@@ -57,6 +57,7 @@ type conversation struct {
 	// approval and sandbox posture for this thread.
 	preventiveReadOnly bool
 	nativeEvidence     ports.ChatNativeEvidence
+	positiveExit       *positiveExitEvidence
 	// Effective defaults returned when Codex opened or resumed this thread.
 	threadModel, threadEffort string
 
@@ -154,6 +155,7 @@ func (c *conversation) start(threadID, model, effort string) {
 	c.threadID = threadID
 	c.threadModel = model
 	c.threadEffort = effort
+	c.positiveExit = newPositiveExitEvidence(c.proc, threadID, c.providerScopeID)
 	go c.pump()
 }
 

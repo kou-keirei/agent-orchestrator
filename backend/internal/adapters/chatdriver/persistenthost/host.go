@@ -137,6 +137,25 @@ type Transport struct {
 	// is not permission evidence: callers must validate the correlated session,
 	// runtime, controller, and permission-configuration generations as well.
 	CodexReadOnly []CodexReadOnlyProof
+	// ProviderExit is separate from provider stdout: provider frames and EOF
+	// cannot forge an OS wait observation. Nil means this host lacks the source.
+	OwnerID              string
+	AttachmentGeneration uint64
+	ProviderExit         <-chan ProviderExitEvidence
+}
+
+// ProviderExitEvidence records the host's successful wait on its own child.
+// It belongs only to the authenticated controller attachment that observed it.
+// ExitCode may be nonzero (or -1 for a signal); exit is not semantic success.
+type ProviderExitEvidence struct {
+	SessionID            string    `json:"sessionId"`
+	NativeThreadID       string    `json:"nativeThreadId"`
+	OwnerID              string    `json:"ownerId"`
+	AttachmentGeneration uint64    `json:"attachmentGeneration"`
+	RuntimeGeneration    string    `json:"runtimeGeneration"`
+	ControllerGeneration string    `json:"controllerGeneration"`
+	ExitCode             int       `json:"exitCode"`
+	ObservedAt           time.Time `json:"observedAt"`
 }
 
 // CodexReadOnlyProof is a host-driver receipt for one provider thread. The host
@@ -160,14 +179,20 @@ type hello struct {
 	Action               string `json:"action"`
 	RuntimeGeneration    string `json:"runtimeGeneration,omitempty"`
 	ControllerGeneration string `json:"controllerGeneration,omitempty"`
+	OwnerID              string `json:"ownerId,omitempty"`
+	AttachmentGeneration uint64 `json:"attachmentGeneration,omitempty"`
 }
 
 type helloResponse struct {
-	OK            bool                 `json:"ok"`
-	Error         string               `json:"error,omitempty"`
-	NextRequestID int64                `json:"nextRequestId,omitempty"`
-	ACPState      *ACPState            `json:"acpState,omitempty"`
-	CodexReadOnly []CodexReadOnlyProof `json:"codexReadOnly,omitempty"`
+	OK                   bool                  `json:"ok"`
+	Error                string                `json:"error,omitempty"`
+	NextRequestID        int64                 `json:"nextRequestId,omitempty"`
+	ACPState             *ACPState             `json:"acpState,omitempty"`
+	CodexReadOnly        []CodexReadOnlyProof  `json:"codexReadOnly,omitempty"`
+	OwnerID              string                `json:"ownerId,omitempty"`
+	AttachmentGeneration uint64                `json:"attachmentGeneration,omitempty"`
+	ExitObservation      bool                  `json:"exitObservation,omitempty"`
+	ProviderExit         *ProviderExitEvidence `json:"providerExit,omitempty"`
 }
 
 func hostDir(dataDir, sessionID string) (string, error) {
@@ -504,11 +529,83 @@ func attachWithGenerations(
 			return nil, errors.New(response.Error)
 		}
 	}
+	var stdin io.WriteCloser = conn
+	var providerExit <-chan ProviderExitEvidence
+	if response.ExitObservation {
+		observer, evidence := observeProviderExit(ctx, d, response, runtimeGeneration, controllerGeneration)
+		providerExit = evidence
+		stdin = &attachment{Conn: conn, observer: observer}
+	}
 	return &Transport{
-		Stdin: conn, Stdout: reader, Reconnected: reconnected,
+		Stdin: stdin, Stdout: reader, Reconnected: reconnected,
 		NextRequestID: response.NextRequestID, ACPState: response.ACPState,
 		CodexReadOnly: cloneCodexReadOnlyProofs(response.CodexReadOnly),
+		OwnerID:       response.OwnerID, AttachmentGeneration: response.AttachmentGeneration,
+		ProviderExit: providerExit,
 	}, nil
+}
+
+type attachment struct {
+	net.Conn
+	observer net.Conn
+}
+
+func (a *attachment) Close() error {
+	if a.observer != nil {
+		_ = a.observer.Close()
+	}
+	return a.Conn.Close()
+}
+
+// observeProviderExit subscribes before the transport is returned, closing the
+// immediate-exit race. Failure removes only this optional evidence capability.
+// The connection is pinned to the descriptor token and exact attachment lease;
+// it never rediscovers a host or follows a replacement descriptor.
+func observeProviderExit(ctx context.Context, d Descriptor, attached helloResponse, runtimeGeneration, controllerGeneration string) (net.Conn, <-chan ProviderExitEvidence) {
+	evidence := make(chan ProviderExitEvidence, 1)
+	if attached.OwnerID == "" || attached.AttachmentGeneration == 0 || runtimeGeneration == "" || controllerGeneration == "" {
+		close(evidence)
+		return nil, evidence
+	}
+	handshakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(handshakeCtx, "tcp", d.Address)
+	if err != nil {
+		close(evidence)
+		return nil, evidence
+	}
+	finish := bindConnToContext(handshakeCtx, conn)
+	err = json.NewEncoder(conn).Encode(hello{
+		Version: ProtocolVersion, Token: d.Token, Action: "observe-exit",
+		OwnerID: attached.OwnerID, AttachmentGeneration: attached.AttachmentGeneration,
+		RuntimeGeneration: runtimeGeneration, ControllerGeneration: controllerGeneration,
+	})
+	reader := bufio.NewReader(conn)
+	decoder := json.NewDecoder(reader)
+	var response helloResponse
+	if err == nil {
+		err = decoder.Decode(&response)
+	}
+	if err = finish(err); err != nil || !response.OK || response.OwnerID != attached.OwnerID || response.AttachmentGeneration != attached.AttachmentGeneration {
+		_ = conn.Close()
+		close(evidence)
+		return nil, evidence
+	}
+	go func() {
+		defer close(evidence)
+		defer func() { _ = conn.Close() }()
+		var result helloResponse
+		if decoder.Decode(&result) != nil || !result.OK || result.ProviderExit == nil {
+			return
+		}
+		proof := *result.ProviderExit
+		if proof.SessionID == d.SessionID && proof.OwnerID == attached.OwnerID &&
+			proof.AttachmentGeneration == attached.AttachmentGeneration &&
+			proof.RuntimeGeneration == runtimeGeneration && proof.ControllerGeneration == controllerGeneration && !proof.ObservedAt.IsZero() {
+			evidence <- proof
+		}
+	}()
+	return conn, evidence
 }
 
 func bindConnToContext(ctx context.Context, conn net.Conn) func(error) error {
@@ -602,6 +699,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	ownerID, err := randomToken()
+	if err != nil {
+		return err
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -638,7 +739,7 @@ func Run(ctx context.Context, cfg Config) error {
 	defer func() { _ = os.Remove(path) }()
 
 	h := &host{
-		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token,
+		ctx: ctx, listener: listener, child: child, stdin: stdin, token: token, ownerID: ownerID,
 		sessionID: cfg.SessionID, runtimeGeneration: cfg.RuntimeGeneration,
 		controllerGeneration: cfg.ControllerGeneration,
 		detached:             make([][]byte, 0, 64), pendingRequests: make(map[string]*pendingRequest),
@@ -685,11 +786,19 @@ func Run(ctx context.Context, cfg Config) error {
 	case err := <-acceptDone:
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			_ = killProviderProcess(context.WithoutCancel(ctx), child)
-			return err
+			runErr = err
 		}
 	}
+	// Fence attachment changes BEFORE waiting. Otherwise a late controller can
+	// attach between Wait returning and publication and inherit the old exit.
+	h.mu.Lock()
+	for h.replaying {
+		h.cond.Wait()
+	}
+	h.exiting = true
+	h.mu.Unlock()
 	_ = listener.Close()
-	_ = child.Wait()
+	h.finishProviderExit(child.Wait())
 	return runErr
 }
 
@@ -699,26 +808,63 @@ type host struct {
 	child                *exec.Cmd
 	stdin                io.WriteCloser
 	token                string
+	ownerID              string
 	sessionID            string
 	runtimeGeneration    string
 	controllerGeneration string
 	acp                  *acpRelay
 
-	mu                        sync.Mutex
-	cond                      *sync.Cond
-	client                    net.Conn
-	clientGeneration          uint64
-	detached                  [][]byte
-	detachedBytes             int
-	pendingRequests           map[string]*pendingRequest
-	pendingOrder              []string
-	maxRequestID              int64
-	codexReadOnly             map[string]codexReadOnlyReceipt
-	codexPermissions          map[string]codexPermissionRequest
-	codexThreadGeneration     map[string]uint64
-	codexPermissionGeneration uint64
-	shutdown                  chan struct{}
-	shutdownOnce              sync.Once
+	mu                          sync.Mutex
+	cond                        *sync.Cond
+	client                      net.Conn
+	clientGeneration            uint64
+	replaying                   bool
+	exitObserver                net.Conn
+	exiting                     bool
+	detached                    [][]byte
+	detachedBytes               int
+	pendingRequests             map[string]*pendingRequest
+	pendingOrder                []string
+	maxRequestID                int64
+	codexReadOnly               map[string]codexReadOnlyReceipt
+	codexPermissions            map[string]codexPermissionRequest
+	codexThreadGeneration       map[string]uint64
+	codexPermissionGeneration   uint64
+	codexNativeThreadID         string
+	codexNativeThreadGeneration uint64
+	shutdown                    chan struct{}
+	shutdownOnce                sync.Once
+}
+
+// finishProviderExit is called exactly once, after child.Wait. A transport error,
+// cancellation, kill request, or shutdown acknowledgement is never sufficient.
+func (h *host) finishProviderExit(waitErr error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for h.replaying {
+		h.cond.Wait()
+	}
+	h.exiting = true // No new attachment may relabel this observation.
+	var exitErr *exec.ExitError
+	if h.exitObserver != nil {
+		if h.codexNativeThreadID != "" && h.child != nil && h.child.Process != nil && h.child.ProcessState != nil &&
+			h.child.ProcessState.Pid() == h.child.Process.Pid && (waitErr == nil || errors.As(waitErr, &exitErr)) {
+			proof := ProviderExitEvidence{
+				SessionID: h.sessionID, NativeThreadID: h.codexNativeThreadID,
+				OwnerID: h.ownerID, AttachmentGeneration: h.clientGeneration,
+				RuntimeGeneration: h.runtimeGeneration, ControllerGeneration: h.controllerGeneration,
+				ExitCode: h.child.ProcessState.ExitCode(), ObservedAt: time.Now().UTC(),
+			}
+			_ = h.exitObserver.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+			_ = json.NewEncoder(h.exitObserver).Encode(helloResponse{OK: true, ProviderExit: &proof})
+		}
+		_ = h.exitObserver.Close()
+		h.exitObserver = nil
+	}
+	if h.client != nil {
+		_ = h.client.Close()
+		h.client = nil
+	}
 }
 
 type pendingRequest struct {
@@ -727,15 +873,16 @@ type pendingRequest struct {
 }
 
 type codexPermissionRequest struct {
-	method               string
-	threadID             string
-	threadIDRequired     bool
-	readOnly             bool
-	permissionProvided   bool
-	generation           uint64
-	clientGeneration     uint64
-	runtimeGeneration    string
-	controllerGeneration string
+	method                   string
+	threadID                 string
+	threadIDRequired         bool
+	readOnly                 bool
+	permissionProvided       bool
+	generation               uint64
+	clientGeneration         uint64
+	runtimeGeneration        string
+	controllerGeneration     string
+	nativeThreadRequestValid bool
 }
 
 type codexReadOnlyReceipt struct {
@@ -775,6 +922,25 @@ func (h *host) handle(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	if request.Action == "observe-exit" {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.exiting || h.client == nil || h.exitObserver != nil || h.ownerID == "" || request.OwnerID != h.ownerID ||
+			request.AttachmentGeneration == 0 || request.AttachmentGeneration != h.clientGeneration ||
+			request.RuntimeGeneration == "" || request.RuntimeGeneration != h.runtimeGeneration ||
+			request.ControllerGeneration == "" || request.ControllerGeneration != h.controllerGeneration {
+			_ = json.NewEncoder(conn).Encode(helloResponse{Error: ErrOwnershipInconclusive.Error()})
+			_ = conn.Close()
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+		if err := json.NewEncoder(conn).Encode(helloResponse{OK: true, OwnerID: h.ownerID, AttachmentGeneration: h.clientGeneration}); err != nil {
+			_ = conn.Close()
+			return
+		}
+		h.exitObserver = conn
+		return
+	}
 	if request.Action == "shutdown" {
 		_ = json.NewEncoder(conn).Encode(helloResponse{OK: true})
 		_ = conn.Close()
@@ -788,7 +954,7 @@ func (h *host) handle(conn net.Conn) {
 	}
 
 	h.mu.Lock()
-	if h.client != nil {
+	if h.client != nil || h.exiting {
 		h.mu.Unlock()
 		_ = json.NewEncoder(conn).Encode(helloResponse{Error: ErrAttached.Error()})
 		_ = conn.Close()
@@ -804,6 +970,7 @@ func (h *host) handle(conn net.Conn) {
 	response := helloResponse{
 		OK: true, NextRequestID: h.maxRequestID,
 		CodexReadOnly: h.codexReadOnlySnapshotLocked(),
+		OwnerID:       h.ownerID, AttachmentGeneration: generation, ExitObservation: h.acp == nil && h.ownerID != "",
 	}
 	if h.acp != nil {
 		response.ACPState = h.acp.snapshot()
@@ -812,12 +979,24 @@ func (h *host) handle(conn net.Conn) {
 	if writeErr == nil && h.acp != nil {
 		writeErr = h.acp.replayTo(h.ctx, conn)
 	}
+	if h.acp == nil {
+		// The attaching driver registers its exit observer before it starts
+		// reading stdout. Let that handshake acquire h.mu even when replay is
+		// backpressured; forwardProvider waits below to preserve replay order.
+		h.replaying = true
+		h.mu.Unlock()
+	}
 	if writeErr == nil {
 		for _, frame := range h.detached {
 			if _, writeErr = conn.Write(frame); writeErr != nil {
 				break
 			}
 		}
+	}
+	if h.acp == nil {
+		h.mu.Lock()
+		h.replaying = false
+		h.cond.Broadcast()
 	}
 	if writeErr == nil {
 		h.detached = h.detached[:0]
@@ -913,6 +1092,10 @@ func (h *host) observeClientFrame(frame []byte) {
 func (h *host) detach(conn net.Conn) {
 	h.mu.Lock()
 	if h.client == conn {
+		if h.exitObserver != nil {
+			_ = h.exitObserver.Close()
+			h.exitObserver = nil
+		}
 		h.client = nil
 		h.bufferPendingRequestsLocked()
 	}
@@ -926,6 +1109,9 @@ func (h *host) forwardProvider(stdout io.Reader) error {
 		frame, err := reader.ReadBytes('\n')
 		if len(frame) > 0 {
 			h.mu.Lock()
+			for h.replaying {
+				h.cond.Wait()
+			}
 			if h.acp == nil {
 				h.observeCodexReadOnly(frame)
 			}
@@ -959,6 +1145,10 @@ func (h *host) forwardProvider(stdout io.Reader) error {
 			if h.client != nil {
 				if _, writeErr := h.client.Write(frame); writeErr != nil {
 					_ = h.client.Close()
+					if h.exitObserver != nil {
+						_ = h.exitObserver.Close()
+						h.exitObserver = nil
+					}
 					h.client = nil
 					h.bufferPendingRequestsLocked()
 					if _, pending := serverRequestID(frame); !pending && !retainedByACP {
@@ -1015,6 +1205,14 @@ func (h *host) observeCodexRequest(frame []byte) {
 		threadID = ""
 		threadValid = false
 	}
+	nativeThreadRequestValid := paramsValid && threadValid &&
+		(value.Method == "thread/start" || (value.Method == "thread/resume" && threadPresent && threadID != ""))
+	if value.Method == "thread/start" || value.Method == "thread/resume" {
+		// A failed, missing or stale thread response must not inherit an older
+		// native handle, regardless of the requested permission posture.
+		h.codexNativeThreadID = ""
+		h.codexNativeThreadGeneration = generation
+	}
 
 	threadIDRequired := value.Method == "thread/resume" || value.Method == "turn/start"
 	if !paramsValid || !threadValid || (threadIDRequired && !threadPresent) ||
@@ -1040,15 +1238,16 @@ func (h *host) observeCodexRequest(frame []byte) {
 	}
 
 	h.codexPermissions[string(value.ID)] = codexPermissionRequest{
-		method:               value.Method,
-		threadID:             threadID,
-		threadIDRequired:     threadIDRequired,
-		readOnly:             posture.readOnly,
-		permissionProvided:   posture.provided,
-		generation:           generation,
-		clientGeneration:     h.clientGeneration,
-		runtimeGeneration:    h.runtimeGeneration,
-		controllerGeneration: h.controllerGeneration,
+		method:                   value.Method,
+		threadID:                 threadID,
+		threadIDRequired:         threadIDRequired,
+		readOnly:                 posture.readOnly,
+		permissionProvided:       posture.provided,
+		generation:               generation,
+		clientGeneration:         h.clientGeneration,
+		runtimeGeneration:        h.runtimeGeneration,
+		controllerGeneration:     h.controllerGeneration,
+		nativeThreadRequestValid: nativeThreadRequestValid,
 	}
 }
 
@@ -1090,6 +1289,7 @@ func (h *host) observeCodexReadOnly(frame []byte) {
 		h.observeCodexTurnResponseLocked(request, value.Result)
 		return
 	}
+	h.observeCodexNativeThreadLocked(request, value.Result)
 
 	threadID, approvalPolicy, sandbox, valid := codexThreadResponse(value.Result)
 	if !valid || (request.threadID != "" && request.threadID != threadID) ||
@@ -1117,6 +1317,30 @@ func (h *host) observeCodexReadOnly(frame []byte) {
 		approvalPolicy: approvalPolicy, sandbox: sandbox,
 		runtimeGeneration: request.runtimeGeneration, controllerGeneration: request.controllerGeneration,
 	}
+}
+
+// The native handle is an ordinary successful thread response, independently
+// of read-only permission proof. It never comes from a notification or caller's
+// desired resume ID, and a late response cannot restore a superseded handle.
+func (h *host) observeCodexNativeThreadLocked(request codexPermissionRequest, raw json.RawMessage) {
+	if !request.nativeThreadRequestValid || request.generation != h.codexNativeThreadGeneration {
+		return
+	}
+	result, valid := jsonObject(raw)
+	if !valid {
+		return
+	}
+	if _, hasError := result["error"]; hasError {
+		return
+	}
+	var thread struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(result["thread"], &thread) != nil || thread.ID == "" ||
+		(request.threadIDRequired && request.threadID != thread.ID) {
+		return
+	}
+	h.codexNativeThreadID = thread.ID
 }
 
 func (h *host) observeCodexTurnResponseLocked(request codexPermissionRequest, raw json.RawMessage) {
