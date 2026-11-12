@@ -22,6 +22,8 @@ type ReportParentSemanticACKSource struct {
 
 var _ ports.ExactReportNative = ReportParentSemanticACKSource{}
 
+// WithLiveReportParent supplies committed semantic ACK readback under the live
+// Chat owner/input gates.
 func (s ReportParentSemanticACKSource) WithLiveReportParent(ctx context.Context, expected ports.ExactReportParent,
 	fn func(ports.ExactReportParent, ports.ExactReportChat) error,
 ) error {
@@ -147,7 +149,11 @@ func (s *Service) BindReportParentSemanticACK(ctx context.Context, m ports.Exact
 	}
 	var ready atomic.Bool
 	err := s.WithLiveReportParent(ctx, m.Parent, func(parent ports.ExactReportParent, chat ports.ExactReportChat) error {
-		p := semanticACKParentChat{reportParentChat: chat.(reportParentChat), parent: parent}
+		live, ok := chat.(reportParentChat)
+		if !ok {
+			return &ports.ReportDeliveryHold{Reason: "report_live_parent_mismatch"}
+		}
+		p := semanticACKParentChat{reportParentChat: live, parent: parent}
 		source, ok := p.controller.conv.(ports.AuthenticatedParentSemanticACKSource)
 		if !ok {
 			return &ports.ReportDeliveryHold{Reason: "report_parent_semantic_producer_unbound"}

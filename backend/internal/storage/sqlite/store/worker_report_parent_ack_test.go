@@ -13,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/orchestrationevents"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -207,7 +208,7 @@ func TestParentReportRejectsStaleWorkLeaseBeforeSend(t *testing.T) {
 	for _, state := range []string{"expired", "released", "renewed", "foreign_owner"} {
 		t.Run(state, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -254,7 +255,7 @@ func TestParentReportOwnershipChangesDuringWriterContention(t *testing.T) {
 	for _, change := range []string{"released", "renewed", "foreign_owner"} {
 		t.Run(change, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := sqlite.Open(dir)
+			s, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -366,7 +367,7 @@ func (f *parentResumeFixture) WithResumedReportParent(_ context.Context, expecte
 
 func TestParentReportResumeLostACKAndNotifierRestart(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +437,7 @@ func TestParentReportResumeLostACKAndNotifierRestart(t *testing.T) {
 
 func TestParentReportFinalAttemptReclaimStaysWithinSchemaBudget(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
