@@ -10,6 +10,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
@@ -73,7 +74,7 @@ func seedParentPersistence(t *testing.T, s *sqlite.Store) (store.WorkItemRecord,
 func TestWorkItemParentPositiveConcurrentRetryColdReopenAndLeaseIdentity(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +168,7 @@ func TestWorkItemParentPositiveConcurrentRetryColdReopenAndLeaseIdentity(t *test
 
 func TestWorkItemParentInsertFailureRollsBackWorkAndAllowsExactRetry(t *testing.T) {
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +325,7 @@ func TestWorkItemParentUnboundConcurrentIssuanceCreatesNothing(t *testing.T) {
 func TestWorkItemParentLegacyHoldAcrossClaimsLeasesReportsAndReopen(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
-	s, err := sqlite.Open(dir)
+	s, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +424,7 @@ func TestWorkItemParentMissingForeignAndCanceled(t *testing.T) {
 func TestWorkItemSpawnAtomicRetryCapacityAndReconciliation(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
-	st, err := sqlite.Open(dir)
+	st, err := sqlitetest.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +506,7 @@ func TestWorkItemSpawnAtomicRefusesIncompleteIssuanceAndRollsBack(t *testing.T) 
 		t.Run(fault, func(t *testing.T) {
 			ctx := t.Context()
 			dir := t.TempDir()
-			st, err := sqlite.Open(dir)
+			st, err := sqlitetest.Open(dir)
 			if err != nil {
 				t.Fatal(err)
 			}

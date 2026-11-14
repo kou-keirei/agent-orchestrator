@@ -59,6 +59,8 @@ type Service struct {
 	restoreController      func(context.Context, domain.SessionID) error
 	admitInput             func(context.Context, domain.SessionID, string) (func(), error)
 
+	prepareWorkerReportTool func(context.Context, domain.WorkItemID, domain.SessionID) (ports.WorkerReportToolAdmission, error)
+
 	mu           sync.RWMutex
 	controllers  map[domain.SessionID]*Controller
 	startConfigs map[domain.SessionID]StartConfig
@@ -96,6 +98,10 @@ func (g controllerGate) unlock() { <-g }
 // Options configures a Service. The id factory and clock are injected so tests
 // are deterministic.
 type Options struct {
+	// PrepareWorkerReportTool reads the trusted spawn's immutable admission.
+	// Nil leaves native report tools unavailable.
+	PrepareWorkerReportTool func(context.Context, domain.WorkItemID, domain.SessionID) (ports.WorkerReportToolAdmission, error)
+
 	Store      Store
 	Reader     SnapshotReader
 	PageReader SnapshotPageReader
@@ -147,6 +153,8 @@ func New(opts Options) *Service {
 		gates:                  make(map[domain.SessionID]controllerGate),
 		inputGates:             make(map[domain.SessionID]controllerGate),
 		probed:                 make(map[capabilityProbeKey]ports.ChatCapabilities),
+
+		prepareWorkerReportTool: opts.PrepareWorkerReportTool,
 	}
 }
 
@@ -592,6 +600,17 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		}
 	}
 
+	var reportAdmission ports.WorkerReportToolAdmission
+	reportTool := cfg.WorkerReportWorkItem != "" && cfg.Harness == domain.HarnessCodex && s.prepareWorkerReportTool != nil
+	if reportTool {
+		if cfg.Kind != domain.KindWorker || cfg.ProviderConversationID != "" {
+			return nil, domain.WorkerReportNativeIngressBlock{}
+		}
+		reportAdmission, err = s.prepareWorkerReportTool(ctx, cfg.WorkerReportWorkItem, cfg.SessionID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var conv ports.ChatConversation
 	if cfg.ProviderConversationID != "" {
 		conv, err = driver.Resume(ctx, ports.ChatResumeConfig{
@@ -615,6 +634,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		})
 	} else {
 		conv, err = driver.Start(ctx, ports.ChatStartConfig{
+			WorkerReportTool:      reportTool,
 			ProviderIDsScoped:     providerBoundaryID != "" || activeBranch.ProviderIDsScoped,
 			SessionID:             cfg.SessionID,
 			RuntimeGeneration:     cfg.RuntimeGeneration,
@@ -736,6 +756,12 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	// replaced can be told apart from the current one's.
 	controller := newController(
 		cfg.SessionID, conversation, generation, cfg.Harness, cfg.Permissions, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged)
+	if reportTool {
+		controller.connectWorkerReport = func(ctx context.Context, turn string) error {
+			return s.bindAuthenticatedControllerReportCallback(ctx, reportAdmission.Binding,
+				reportAdmission.Bindings, reportAdmission.Acceptance, controller, turn)
+		}
+	}
 	var commitProviderHistory func(context.Context) error
 	if liveReconnect {
 		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
@@ -906,6 +932,8 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	cfg.ProviderHandoff = nil
 	cfg.ProviderScopeID = ""
 	cfg.HistoryMode = ports.ChatHistoryImport
+	// A controller restart must not silently reissue native report authority.
+	cfg.WorkerReportWorkItem = ""
 	s.startConfigs[cfg.SessionID] = cloneStartConfig(cfg)
 	controller.start()
 	s.mu.Unlock()

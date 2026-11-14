@@ -33,7 +33,7 @@ type workSpawnFixture struct {
 	dir     string
 }
 
-func newWorkSpawnFixture(t *testing.T) *workSpawnFixture {
+func newWorkSpawnFixture(t *testing.T, configure ...func(*workSpawnFixture, *chatsvc.Options)) *workSpawnFixture {
 	t.Helper()
 	f := &workSpawnFixture{dir: t.TempDir()}
 	f.store = sqlitetest.MustOpenAt(t, f.dir)
@@ -42,12 +42,16 @@ func newWorkSpawnFixture(t *testing.T) *workSpawnFixture {
 		t.Fatal(err)
 	}
 	var ids atomic.Int32
-	f.service = chatsvc.New(chatsvc.Options{Store: f.store, Sessions: f.store,
+	opts := chatsvc.Options{Store: f.store, Sessions: f.store,
 		Drivers: integrationChatRegistry{domain.HarnessCodex: integrationChatDriver{harness: domain.HarnessCodex,
 			start: func() ports.ChatConversation {
 				return newIntegrationChatConversation(fmt.Sprintf("native-%d", f.births.Add(1)))
 			}}},
-		NewID: func() string { return fmt.Sprintf("work-spawn-%d", ids.Add(1)) }})
+		NewID: func() string { return fmt.Sprintf("work-spawn-%d", ids.Add(1)) }}
+	for _, configure := range configure {
+		configure(f, &opts)
+	}
+	f.service = chatsvc.New(opts)
 	t.Cleanup(func() { f.service.StopAll(context.Background()) })
 	f.runtime = &fakeRuntime{}
 	f.ws = &fakeWorkspace{}

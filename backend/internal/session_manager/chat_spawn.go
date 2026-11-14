@@ -137,6 +137,12 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		return domain.SessionRecord{}, workItemSpawnHeld(id, err)
 	}
 	_, err = m.chat.StartChat(ctx, ChatStart{
+		WorkerReportWorkItem: func() domain.WorkItemID {
+			if in.workItem != nil {
+				return in.workItem.work
+			}
+			return ""
+		}(),
 		SessionID:               id,
 		ProjectID:               in.cfg.ProjectID,
 		Kind:                    in.cfg.Kind,

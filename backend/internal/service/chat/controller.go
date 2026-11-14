@@ -214,7 +214,12 @@ type Controller struct {
 	// reportTurn is captured only from a committed primary native turn event.
 	// Its pointer identity retires report callers when a turn is replaced.
 	reportTurn *workerReportNativeTurn
-	state      ports.ChatControllerState
+	// reportCallback reserves the current turn's single native installation,
+	// including pending/failed installs. Protected by mu; replaced only by a
+	// verified later turn, so a retained failed callback cannot be reinstalled.
+	reportCallback      *authenticatedControllerReportCallback
+	connectWorkerReport func(context.Context, string) error
+	state               ports.ChatControllerState
 	// settings are the provider choices applied to the next dispatch. Held here as
 	// well as on disk so a dispatch does not need a read, and updated together with
 	// the row so the two cannot drift.
@@ -2655,6 +2660,14 @@ func (c *Controller) project() {
 		}
 		if lifecycle {
 			c.sendMu.Unlock()
+		}
+		if err == nil && projected && primaryTurn && event.Kind == ports.ChatEventTurnStarted && c.connectWorkerReport != nil {
+			if source, ok := c.conv.(ports.CommittedWorkerReportTool); ok {
+				turn := event.ProviderTurnID
+				source.ConnectCommittedWorkerReportTurn(ctx, turn, func(ctx context.Context) error {
+					return c.connectWorkerReport(ctx, turn)
+				})
+			}
 		}
 	}
 
