@@ -12,9 +12,23 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
-// NewWorkerReportHandler is an independent loopback ingress, not yet mounted
-// by the production daemon. Mount only on the primary loopback listener, with
-// its existing request-ID middleware. The daemon must inject guarded submission;
+// workerReportIngressHold handles the private CLI path before API routing.
+// It deliberately registers no public API operation and accepts no actor from
+// HTTP. Even knowledge of an existing report must not disclose its receipt.
+func workerReportIngressHold(next http.Handler) http.Handler {
+	hold := NewWorkerReportHandler(nil)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/worker/reports" {
+			hold.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// NewWorkerReportHandler handles the local report path. The production router
+// mounts it with nil submission (typed HOLD): loopback is not caller authority.
+// A private in-process invocation may inject guarded submission for tests;
 // request fields never issue caller authority. Acceptance is not provider delivery
 // or an original-parent semantic ACK. Native references remain authored claims.
 func NewWorkerReportHandler(submission ports.WorkerReportSubmission) http.Handler {
