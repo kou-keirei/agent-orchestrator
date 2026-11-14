@@ -2484,6 +2484,13 @@ func (m *Manager) resumeAgentRecordWithPolicy(
 	return m.resumeAgentRecordWithReservedGeneration(ctx, operation, rec, forceFresh, requireNativeHistory, "")
 }
 
+// resumeChatParentRecord is called only under the original-parent lineage and
+// session operation fences. Require native history and a fresh reserved epoch;
+// ordinary Resume and the worker's lazy restore policy remain unchanged.
+func (m *Manager) resumeChatParentRecord(ctx context.Context, rec domain.SessionRecord, generation string) (RestoreResult, error) {
+	return m.resumeAgentRecordWithReservedGeneration(ctx, "resume original parent", rec, false, true, generation)
+}
+
 func (m *Manager) resumeAgentRecordWithReservedGeneration(
 	ctx context.Context,
 	operation string,
