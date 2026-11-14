@@ -2599,7 +2599,10 @@ func (c *Controller) project() {
 	ctx := context.WithoutCancel(context.Background())
 	acknowledger, persistent := c.conv.(ports.ChatProviderEventAcknowledger)
 
-	for event := range c.conv.Events() {
+	_, batching := c.store.(providerEventBatchStore)
+	reader := deltaBatchReader{events: c.conv.Events(), enabled: batching}
+	for events := reader.next(); len(events) > 0; events = reader.next() {
+		event := events[0]
 		c.mu.Lock()
 		preserveProvider := c.preserveProviderOnStop
 		c.mu.Unlock()
@@ -2616,16 +2619,23 @@ func (c *Controller) project() {
 		if lifecycle {
 			c.sendMu.Lock()
 		}
-		projected, primaryTurn, err := c.projectEvent(ctx, event)
+		projected, primaryTurn, err := c.projectEvents(ctx, events, persistent)
 		// A terminal receipt compacts the entire prompt, so it cannot pass a
 		// failed earlier projection. Retry transient store errors in order; if
 		// still failing, detach and leave the journal for a replacement controller.
 		for attempt := 0; err != nil && persistent && attempt < 3; attempt++ {
 			time.Sleep(20 * time.Millisecond)
-			projected, primaryTurn, err = c.projectEvent(ctx, event)
+			projected, primaryTurn, err = c.projectEvents(ctx, events, persistent)
 		}
-		if err == nil && persistent && event.ProviderEventID != "" {
-			err = acknowledger.AcknowledgeProviderEvent(ctx, event.ProviderEventID)
+		if err == nil && persistent {
+			for _, committed := range events {
+				if committed.ProviderEventID != "" {
+					err = acknowledger.AcknowledgeProviderEvent(ctx, committed.ProviderEventID)
+					if err != nil {
+						break
+					}
+				}
+			}
 		}
 		if err != nil && persistent {
 			// Ordinary projections may proceed during guarded storage, but their
