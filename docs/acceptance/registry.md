@@ -1,21 +1,22 @@
 # AO-Fork Full Wave Acceptance Registry
 
-**Registry:** `ao-fork.acceptance.v0.1.0-draft`
-**State:** PROPOSED, not integrated, approved, or a frozen scoring baseline
-**Scope:** P0 and P1, unified BLD/INT work; definitions only
-**Source baseline:** AO-Fork `origin/main` `7b3eec94be8b3113f0ecea6c4419be6e8bcd9902` (checked 2026-11-14)
+**Registry:** `ao-fork.acceptance.v1.0.0`
+**State:** APPROVED/FROZEN definitions; native acceptance remains evidence-qualified
+**Scope:** P0 and P1, unified BLD/INT; 11 P0 and 10 P1 evidence gates
+**Definition source:** AO-Fork merged [PR #93](https://github.com/kou-keirei/agent-orchestrator/pull/93), `72cc284f30de8ac26186349e538d4893d3b5112b`
+**Initial benchmark:** [2026-11-14 v1.0.0](baselines/2026-11-14-v1.md)
 **Workspace policy:** ECP `main` `bc49f0c8b4d479b466a8d8a4d1643dff13e6a6e1`
 
 ## Authority and interpretation
 
-This is a **proposed, versioned `C/WS/G/V` acceptance definition**, not a second
+This is an **approved, versioned `C/WS/G/V` acceptance definition**, not a second
 issue tracker, stage machine, score ledger, evaluator, permission Gate or source
 of runtime verdicts. The [existing roadmap](../plans/ao-fork-autonomy-roadmap.md)
 and [readiness tracker](../plans/ao-autonomy-readiness.json) retain their nine
 established macro-capability IDs, weighted maturity logic, and formal `M0–M5`
 milestones. Their older snapshots are **not** current native acceptance scores.
 Existing P0 F1–F5 functional evidence remains a separate historical witness,
-not a replacement or denominator for these proposed gates. Original receipt:
+not a replacement or denominator for these frozen gates. Original receipt:
 `~/.ao/handoffs/agent-orchestrator/p0-unified-W1420-20261113/evidence/W1420-functional-scorecard.json`
 (machine-local, not a portable repository link).
 
@@ -26,29 +27,30 @@ Issue IDs are owners and evidence pointers, never extra `G`s. A gate can
 consume many issues/features; a feature can contribute to several gates.
 `P0` and `P1` classify scope, **not** permission or worker custody.
 
-No percentage, PASS, release, or M-promotion is implied by documenting a gate.
-On approval, freeze this version and its applicable gate denominator; calculate
-unique proven gates once, only from matching source/receipts and qualified
-native observation. Otherwise display `NOT_BASELINED`. Version future scope
-changes without retroactively recalculating an earlier baseline. Keep the
-local/external obligation ledger and Git/AO/CI/evaluator receipts as execution truth.
+Approval freezes definitions, **not** native PASS, a release, or M-promotion.
+Version v1.0.0 fixes **11 P0 and 10 P1 unique gates**. The immutable [initial
+benchmark](baselines/2026-11-14-v1.md) reports **0/21 proven** under the
+bounded evidence available on 2026-11-14, not zero implementation. Future
+progress requires matching source-bound receipts and qualified native
+observations; unknown evidence is never PASS. Version changed criteria rather
+than retroactively changing this denominator. The local/external obligation
+ledger and Git/AO/CI/evaluator receipts retain execution truth.
 
 Each gate has exactly one owning C in the tables below. Other capability
 relationships are shared prerequisites, never additional ownership or a second
 count. Repeated WS and V IDs deliberately reuse delivery/evidence surfaces;
 sharing a witness does not prove every consuming gate.
 
-This corrected draft defines **10 C (nine weighted, one unweighted), 15 distinct
+This frozen v1.0.0 defines **10 C (nine weighted, one unweighted), 15 distinct
 WS, 21 distinct G (11 P0, 10 P1), and 14 distinct V (7 P0, 7 P1)**.
-These are definition counts only: the applicable scoring denominator is **not
-yet approved** and remains `NOT_BASELINED` until separate explicit acceptance.
-Source merge alone neither freezes criteria nor proves any native V.
+The denominator is approved, and the [initial native benchmark](baselines/2026-11-14-v1.md)
+is evidence-scoped. Neither merge nor an approved definition proves any V.
 
 ## C: capability index
 
 The first nine IDs below are **reused verbatim** from the existing readiness
 tracker; they are not newly renumbered. `storage-sustainability` is a new
-**proposed, unweighted supporting** capability, not an extra autonomy weight.
+**unweighted supporting** capability, not an extra autonomy weight.
 
 | C ID | Outcome | Priority | Canonical issue family |
 | --- | --- | --- | --- |
@@ -61,7 +63,7 @@ tracker; they are not newly renumbered. `storage-sustainability` is a new
 | `parent-reengagement` | Re-engage the original parent and prove semantic ACK | P0 | [#9](https://github.com/kou-keirei/agent-orchestrator/issues/9) |
 | `dag-admission-backpressure` | Resource-bounded and dependency-aware work issuance | P0, P1 | [#10](https://github.com/kou-keirei/agent-orchestrator/issues/10), [#28](https://github.com/kou-keirei/agent-orchestrator/issues/28) |
 | `overnight-chaos` | One uninterrupted native prompt-to-PR, then resilient overnight operation | P0, P1 | [#1](https://github.com/kou-keirei/agent-orchestrator/issues/1), [#11](https://github.com/kou-keirei/agent-orchestrator/issues/11) |
-| `storage-sustainability` **(proposed)** | Replay-safe retention, bounded storage and lower write amplification | P1 | [#16](https://github.com/kou-keirei/agent-orchestrator/issues/16), [#17](https://github.com/kou-keirei/agent-orchestrator/issues/17), [#32](https://github.com/kou-keirei/agent-orchestrator/issues/32) |
+| `storage-sustainability` | Replay-safe retention, bounded storage and lower write amplification | P1 | [#16](https://github.com/kou-keirei/agent-orchestrator/issues/16), [#17](https://github.com/kou-keirei/agent-orchestrator/issues/17), [#32](https://github.com/kou-keirei/agent-orchestrator/issues/32) |
 
 ## P0: workstreams, missing gates and native witnesses
 
@@ -152,14 +154,15 @@ custody or turn a prerequisite into a second scheduler, outbox or evaluator.
 2. Independently review this exact Markdown against the current accepted
    `main` and linked owner contracts. A Git commit or PR alone does not
    approve new gates or mean the registry is integrated.
-3. On explicit acceptance, freeze `v1` criteria and denominator by priority
-   and capability scope. Use **qualified native evidence**, not inference,
-   to establish first gate baselines; allow `NOT_BASELINED` until supported.
+3. This accepted `v1.0.0` freezes the P0/P1 criteria and denominator. The
+   initial snapshot records 0/11 P0 and 0/10 P1 fully proven under its bounded
+   evidence; later PASS requires **qualified native evidence**, not inference.
 4. `FULLWAVE` then reconciles the existing receipts; `FULLWAVE REPORT`
    reads them. `FULLWAVE REGISTRY` evolves definitions under version control.
    No extra dispatch Gate, issue migration, historical backfill or new
    mutable score store is created.
 
-**No effects performed:** This proposed registry does not dispatch workers,
-replay old provider turns, publish a PR, update issues or the obligation
-ledger, merge code, install a binary, or delete data.
+**Effect boundary:** This adopted registry records criteria and a historical
+benchmark only. It cannot dispatch workers, replay provider turns, grant Git
+or evaluator authority, mutate the obligation ledger, install a binary or
+delete data. PR #93 integrated the original definitions, not native PASS.
