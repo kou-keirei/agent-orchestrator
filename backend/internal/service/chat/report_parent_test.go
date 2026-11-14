@@ -73,6 +73,10 @@ type reportParentFixture struct {
 }
 
 func newReportParentFixture(t *testing.T, wrap ...func(*sqlite.Store) chatsvc.Store) *reportParentFixture {
+	return newReportParentFixtureWithNative(t, nil, wrap...)
+}
+
+func newReportParentFixtureWithNative(t *testing.T, native func(*reportParentProvider) ports.ChatConversation, wrap ...func(*sqlite.Store) chatsvc.Store) *reportParentFixture {
 	t.Helper()
 	f := &reportParentFixture{dir: t.TempDir(), provider: &reportParentProvider{fakeConversation: newFakeConversation()}}
 	st, err := sqlitetest.Open(f.dir)
@@ -80,6 +84,10 @@ func newReportParentFixture(t *testing.T, wrap ...func(*sqlite.Store) chatsvc.St
 		t.Fatal(err)
 	}
 	f.store = st
+	var conversation ports.ChatConversation = f.provider
+	if native != nil {
+		conversation = native(f.provider)
+	}
 	t.Cleanup(func() {
 		if f.service != nil {
 			_ = f.service.Stop(context.Background(), testSession)
@@ -120,7 +128,7 @@ func newReportParentFixture(t *testing.T, wrap ...func(*sqlite.Store) chatsvc.St
 	}
 	f.service = chatsvc.New(chatsvc.Options{Store: chatStore, Sessions: st, Reader: fullSnapshotReader(st),
 		Drivers: fakeRegistry{driver: fakeDriver{
-			start: func(ports.ChatStartConfig) (ports.ChatConversation, error) { f.starts.Add(1); return f.provider, nil },
+			start: func(ports.ChatStartConfig) (ports.ChatConversation, error) { f.starts.Add(1); return conversation, nil },
 			resume: func(ports.ChatResumeConfig) (ports.ChatConversation, error) {
 				f.resumes.Add(1)
 				return nil, ports.ErrChatResumeFailed
