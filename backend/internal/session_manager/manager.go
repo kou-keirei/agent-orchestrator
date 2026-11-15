@@ -1433,6 +1433,7 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 			Kind:             cfg.Kind,
 			SessionPrefix:    sessionPrefix(project),
 			Branch:           branch,
+			FreshBranch:      cfg.Kind == domain.KindWorker && cfg.Branch == "",
 			BaseBranch:       baseBranch,
 			BaseRef:          baseRefs[filepath.Clean(project.Path)],
 			ExecutionBaseSHA: strings.TrimSpace(cfg.ExecutionBaseSHA),

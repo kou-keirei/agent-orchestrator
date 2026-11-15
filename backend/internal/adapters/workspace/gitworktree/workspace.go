@@ -295,6 +295,9 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
+	if cfg.FreshBranch {
+		return w.createFreshWorktree(ctx, repo, path, cfg)
+	}
 	if info, ok, err := w.existingWorktree(ctx, repo, path, cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
 	} else if ok {
@@ -1724,9 +1727,14 @@ func (w *Workspace) resolveWorktreeRefs(ctx, remoteCtx context.Context, repo, br
 		return w.resolveWorktreeRefsFromDefault(ctx, repo, branch, baseBranch)
 	}
 	resolver := gitdefault.New(w.binary, gitdefault.Runner(w.run))
-	remote, requestedRef, requestedExists, requestedErr := resolver.FindCachedRemoteBranch(ctx, repo, branch)
-	if requestedErr != nil && !errors.Is(requestedErr, gitdefault.ErrUnresolved) {
-		return worktreeRefs{}, fmt.Errorf("gitworktree: inspect requested branch for %q: %w", repo, requestedErr)
+	var remote, requestedRef string
+	var requestedExists bool
+	if branch != "" {
+		var requestedErr error
+		remote, requestedRef, requestedExists, requestedErr = resolver.FindCachedRemoteBranch(ctx, repo, branch)
+		if requestedErr != nil && !errors.Is(requestedErr, gitdefault.ErrUnresolved) {
+			return worktreeRefs{}, fmt.Errorf("gitworktree: inspect requested branch for %q: %w", repo, requestedErr)
+		}
 	}
 	resolution, err := resolver.Resolve(ctx, remoteCtx, repo)
 	if err != nil {

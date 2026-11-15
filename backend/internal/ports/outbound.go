@@ -418,6 +418,9 @@ type WorkspaceProject interface {
 // can map them to typed errors rather than collapsing every adapter failure
 // into an opaque 500. Adapters wrap these via fmt.Errorf("...: %w", sentinel).
 var (
+	// ErrWorkspaceFreshConflict reports that a fresh session cannot safely
+	// allocate its own branch or path. Existing refs and registrations are kept.
+	ErrWorkspaceFreshConflict = errors.New("workspace: fresh allocation conflict")
 	// ErrWorkspaceBranchCheckedOutElsewhere reports the requested branch is
 	// already checked out in another worktree of the same repo.
 	ErrWorkspaceBranchCheckedOutElsewhere = errors.New("workspace: branch is already checked out in another worktree")
@@ -507,6 +510,10 @@ type WorkspaceConfig struct {
 	// orchestrator worktree. Defaults to a truncation of ProjectID when empty.
 	SessionPrefix string
 	Branch        string
+	// FreshBranch asks Create to allocate a new branch namespace from the base,
+	// never attach historical refs or worktrees. Explicit branch requests and
+	// Restore leave this false.
+	FreshBranch bool
 	// BaseBranch is the explicitly configured branch new session branches are
 	// created from. Empty asks the workspace adapter to resolve an authoritative
 	// repository default; it must never infer from the checked-out branch.
