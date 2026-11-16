@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/gitworktree"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -24,6 +25,83 @@ type sourceCleanupWorkspace struct {
 	check, at   int
 	move        func()
 	created     ports.WorkspaceInfo
+}
+
+type deadlineCleanupWorkspace struct {
+	*sourceCleanupWorkspace
+	destroyCalls int
+	destroyErr   error
+}
+
+func (w *deadlineCleanupWorkspace) Destroy(ctx context.Context, _ ports.WorkspaceInfo) error {
+	w.destroyCalls++
+	<-ctx.Done()
+	w.destroyErr = ctx.Err()
+	return w.destroyErr
+}
+
+func TestExactSourceFailedAdmissionCleanupDeadlinePreservesDurableOwner(t *testing.T) {
+	f := newWorkSpawnFixture(t)
+	_, repo, _, old, base := newSwitchExecutionBaseFixture(t, "")
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, _, err := f.store.GetProject(t.Context(), string(f.auth.project))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project.Path = repo
+	if err := f.store.UpsertProject(t.Context(), project); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := gitworktree.New(gitworktree.Options{Binary: git, ManagedRoot: filepath.Join(t.TempDir(), "managed"), RepoResolver: gitworktree.StaticRepoResolver{f.auth.project: repo}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &deadlineCleanupWorkspace{sourceCleanupWorkspace: &sourceCleanupWorkspace{Workspace: adapter, at: 1}}
+	const unfinished = "unfinished worker content\n"
+	w.move = func() {
+		if err := os.WriteFile(filepath.Join(w.created.Path, "unfinished.txt"), []byte(unfinished), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runSwitchGit(t, git, repo, "update-ref", "refs/heads/main", old, base)
+	}
+	f.manager.workspace = w
+	cfg := f.config(domain.SessionModeChat)
+	cfg.Branch = "ao/exact-cleanup-deadline"
+	cfg.ExecutionBaseSHA, cfg.SourceRef = base, "main"
+	if _, _, _, err := f.manager.Spawn(t.Context(), cfg); !errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch) {
+		t.Fatalf("source drift error = %v", err)
+	}
+	if w.destroyCalls != 1 || !errors.Is(w.destroyErr, context.DeadlineExceeded) {
+		t.Fatalf("teardown did not exhaust its deadline exactly once: calls=%d err=%v", w.destroyCalls, w.destroyErr)
+	}
+	if f.births.Load() != 1 || f.runtime.created != 0 {
+		t.Fatalf("rejected birth reached provider: chat=%d runtime=%d", f.births.Load()-1, f.runtime.created)
+	}
+	if content, err := os.ReadFile(filepath.Join(w.created.Path, "unfinished.txt")); err != nil || string(content) != unfinished {
+		t.Fatalf("unfinished work changed: content=%q err=%v", content, err)
+	}
+	if registered := runSwitchGit(t, git, repo, "worktree", "list", "--porcelain"); strings.Count(registered, "worktree ") != 3 || !strings.Contains(registered+"\n", "branch refs/heads/"+cfg.Branch+"\n") {
+		t.Fatalf("retained workspace registration or branch missing: %s", registered)
+	}
+	// Reopen SQLite and read with a fresh bounded context after teardown's
+	// deadline, independently of the spawn and its rollback context.
+	reopened, err := sqlite.Open(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	readCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	owner, found, err := reopened.GetSession(readCtx, w.created.SessionID)
+	if err != nil || !found {
+		t.Fatalf("retained owner missing after reopen: found=%v err=%v", found, err)
+	}
+	if !owner.IsTerminated || owner.Activity.State != domain.ActivityExited || owner.Metadata.WorkspacePath != w.created.Path || owner.Metadata.Branch != cfg.Branch || owner.Metadata.WorkspaceRepoPath != w.created.RepoPath || owner.Metadata.ExecutionBaseSHA != base || owner.Metadata.SourceRef != "refs/heads/main" || owner.Metadata.RuntimeHandleID != "" || owner.Metadata.ProviderConversationID != "" {
+		t.Fatalf("cleanup deadline lost durable ownership: %+v", owner)
+	}
 }
 
 func (w *sourceCleanupWorkspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {

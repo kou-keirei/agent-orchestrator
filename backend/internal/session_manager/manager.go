@@ -1616,14 +1616,22 @@ func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain
 }
 
 func (m *Manager) rollbackSeedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, prepared bool) {
-	// Admission can fail because the caller cancelled. Cleanup and retained
-	// ownership must still complete under a bounded, independent context.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
-	defer cancel()
-	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
+	// Admission can fail because the caller cancelled. Teardown gets its own
+	// bounded context, leaving a separate budget for durable ownership below.
+	teardownCtx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	destroyed := m.destroySpawnWorkspace(teardownCtx, ws, workspaceProject)
+	if destroyed {
 		if prepared {
-			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
+			m.cleanupAgentWorkspace(teardownCtx, rec, ws.Path)
 		}
+	}
+	cancelTeardown()
+
+	// Destroy may consume its entire deadline without removing the workspace.
+	// Persist the retained identity and termination with a fresh bounded budget.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if destroyed {
 		m.rollbackSpawnSeedRow(ctx, rec.ID)
 		return
 	}
