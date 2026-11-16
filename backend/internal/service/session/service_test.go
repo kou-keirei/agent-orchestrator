@@ -3434,6 +3434,8 @@ func TestToSpawnAPIErrorMapsSpawnStageSentinels(t *testing.T) {
 		wantKind apierr.Kind
 		wantCode string
 	}{
+		{"execution base mismatch", fmt.Errorf("spawn: %w", ports.ErrWorkspaceExecutionBaseMismatch), apierr.KindConflict, "WORKSPACE_EXECUTION_BASE_MISMATCH"},
+		{"execution base unsupported", fmt.Errorf("spawn: %w", ports.ErrWorkspaceExecutionBaseUnsupported), apierr.KindInvalid, "WORKSPACE_EXECUTION_BASE_UNSUPPORTED"},
 		{
 			"workspace create",
 			fmt.Errorf("spawn mer-1: %w: git worktree add failed", sessionmanager.ErrWorkspaceCreate),

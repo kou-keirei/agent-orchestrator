@@ -314,6 +314,8 @@ type WorkspaceReclaimer interface {
 
 // Workspace is the isolated checkout an agent works in (a git worktree or clone).
 type Workspace interface {
+	// Create may return a non-empty identity with an error after materializing
+	// a workspace. The caller must clean it up or durably retain its owner.
 	Create(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
 	Destroy(ctx context.Context, info WorkspaceInfo) error
 	Restore(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
@@ -528,6 +530,8 @@ type WorkspaceConfig struct {
 	// ExecutionBaseSHA is an optional exact commit authority. It is never used
 	// as comparison metadata and must be proven by the adapter before launch.
 	ExecutionBaseSHA string
+	// SourceRef is checked only during fresh creation, never on restore.
+	SourceRef string
 }
 
 // WorkspaceInfo describes a created workspace — where it lives and its branch.
@@ -544,8 +548,11 @@ type WorkspaceInfo struct {
 	// ExecutionBaseSHA is the exact commit authority admitted for this
 	// worktree, when requested.
 	ExecutionBaseSHA string
-	SessionID        domain.SessionID
-	ProjectID        domain.ProjectID
+	// SourceRef is the resolved full ref checked during birth admission. Callers
+	// must omit it for existing sessions so ref drift cannot mutate their authority.
+	SourceRef string
+	SessionID domain.SessionID
+	ProjectID domain.ProjectID
 	// RepoPath optionally overrides ProjectID-based repo resolution. It is used
 	// when the normal workspace lifecycle primitives operate on one child repo
 	// inside a workspace project.

@@ -20,40 +20,44 @@ import (
 const maxDisplayNameLen = 20
 
 type spawnOptions struct {
-	project         string
-	standalone      bool
-	harness         string
-	kind            string
-	mode            string
-	branch          string
-	prompt          string
-	issue           string
-	name            string
-	model           string
-	effort          string
-	permission      string
-	claimPR         string
-	noTakeover      bool
-	skipAgentCheck  bool
-	trackerProvider string
+	project          string
+	standalone       bool
+	harness          string
+	kind             string
+	mode             string
+	branch           string
+	executionBaseSHA string
+	sourceRef        string
+	prompt           string
+	issue            string
+	name             string
+	model            string
+	effort           string
+	permission       string
+	claimPR          string
+	noTakeover       bool
+	skipAgentCheck   bool
+	trackerProvider  string
 }
 
 // spawnRequest mirrors the daemon's SpawnSessionRequest body for
 // POST /api/v1/sessions. The CLI keeps its own copy so it need not import httpd.
 type spawnRequest struct {
-	ProjectID       string  `json:"projectId,omitempty"`
-	IssueID         string  `json:"issueId,omitempty"`
-	ParentSessionID string  `json:"parentSessionId,omitempty"`
-	TrackerProvider string  `json:"trackerProvider,omitempty"`
-	Kind            string  `json:"kind,omitempty"`
-	Mode            string  `json:"mode,omitempty"`
-	Harness         string  `json:"harness,omitempty"`
-	Branch          string  `json:"branch,omitempty"`
-	Prompt          string  `json:"prompt,omitempty"`
-	Model           string  `json:"model,omitempty"`
-	Effort          *string `json:"effort,omitempty"`
-	Permissions     string  `json:"permissions,omitempty"`
-	DisplayName     string  `json:"displayName"`
+	ProjectID        string  `json:"projectId,omitempty"`
+	IssueID          string  `json:"issueId,omitempty"`
+	ParentSessionID  string  `json:"parentSessionId,omitempty"`
+	TrackerProvider  string  `json:"trackerProvider,omitempty"`
+	Kind             string  `json:"kind,omitempty"`
+	Mode             string  `json:"mode,omitempty"`
+	Harness          string  `json:"harness,omitempty"`
+	Branch           string  `json:"branch,omitempty"`
+	ExecutionBaseSHA string  `json:"executionBaseSha,omitempty"`
+	SourceRef        string  `json:"sourceRef,omitempty"`
+	Prompt           string  `json:"prompt,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	Effort           *string `json:"effort,omitempty"`
+	Permissions      string  `json:"permissions,omitempty"`
+	DisplayName      string  `json:"displayName"`
 }
 
 type spawnResult struct {
@@ -76,6 +80,12 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			"fresh isolated workspace. Git projects use worktrees; standalone agents use an AO-managed plain directory.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if opts.executionBaseSHA != "" && (len(opts.executionBaseSHA) != 40 || strings.Trim(opts.executionBaseSHA, "0123456789abcdef") != "") {
+				return usageError{fmt.Errorf("--execution-base-sha must be a full lowercase 40-hex commit SHA")}
+			}
+			if opts.sourceRef != "" && opts.executionBaseSHA == "" {
+				return usageError{fmt.Errorf("--source-ref requires --execution-base-sha")}
+			}
 			if opts.standalone && strings.TrimSpace(opts.project) != "" {
 				return usageError{fmt.Errorf("--standalone and --project cannot be used together")}
 			}
@@ -113,6 +123,9 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 			if opts.standalone {
 				if opts.kind == "orchestrator" {
 					return usageError{fmt.Errorf("standalone sessions must be workers")}
+				}
+				if opts.executionBaseSHA != "" || opts.sourceRef != "" {
+					return usageError{fmt.Errorf("standalone sessions do not support --execution-base-sha or --source-ref")}
 				}
 				if strings.TrimSpace(opts.branch) != "" || strings.TrimSpace(opts.issue) != "" || strings.TrimSpace(opts.claimPR) != "" {
 					return usageError{fmt.Errorf("standalone sessions do not support --branch, --issue, or --claim-pr")}
@@ -174,19 +187,21 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 				effort = &opts.effort
 			}
 			req := spawnRequest{
-				ProjectID:       opts.project,
-				IssueID:         opts.issue,
-				ParentSessionID: strings.TrimSpace(os.Getenv("AO_SESSION_ID")),
-				TrackerProvider: opts.trackerProvider,
-				Kind:            opts.kind,
-				Harness:         opts.harness,
-				Mode:            opts.mode,
-				Branch:          opts.branch,
-				Prompt:          opts.prompt,
-				Model:           strings.TrimSpace(opts.model),
-				Effort:          effort,
-				Permissions:     permission,
-				DisplayName:     name,
+				ProjectID:        opts.project,
+				IssueID:          opts.issue,
+				ParentSessionID:  strings.TrimSpace(os.Getenv("AO_SESSION_ID")),
+				TrackerProvider:  opts.trackerProvider,
+				Kind:             opts.kind,
+				Harness:          opts.harness,
+				Mode:             opts.mode,
+				Branch:           opts.branch,
+				ExecutionBaseSHA: opts.executionBaseSHA,
+				SourceRef:        opts.sourceRef,
+				Prompt:           opts.prompt,
+				Model:            strings.TrimSpace(opts.model),
+				Effort:           effort,
+				Permissions:      permission,
+				DisplayName:      name,
 			}
 			var res spawnResult
 			if err := ctx.postJSON(cmd.Context(), "sessions", req, &res); err != nil {
@@ -226,6 +241,8 @@ func newSpawnCommand(ctx *commandContext) *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
+	f.StringVar(&opts.executionBaseSHA, "execution-base-sha", "", "Exact full lowercase commit SHA to materialize before agent startup")
+	f.StringVar(&opts.sourceRef, "source-ref", "", "Named Git ref that must resolve to --execution-base-sha at birth; independent of --branch")
 	// --agent is an alias for --harness so the more intuitive `ao spawn --agent
 	// droid` works identically; both resolve to the same harness flag.
 	f.SetNormalizeFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {

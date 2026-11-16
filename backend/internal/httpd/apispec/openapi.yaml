@@ -8850,6 +8850,8 @@ components:
           - Closed without merge
           - Terminated
           type: string
+        executionBaseSha:
+          type: string
         harness:
           type: string
         hiddenAt:
@@ -8948,6 +8950,8 @@ components:
           - mergeable
           - merged
           type: string
+        sourceRef:
+          type: string
         status:
           enum:
           - working
@@ -8979,6 +8983,8 @@ components:
           type: boolean
         updatedAt:
           format: date-time
+          type: string
+        worktreePath:
           type: string
       required:
       - id
@@ -12578,6 +12584,9 @@ components:
           type:
           - "null"
           - string
+        executionBaseSha:
+          maxLength: 40
+          type: string
         harness:
           enum:
           - claude-code
@@ -12637,6 +12646,8 @@ components:
           type: string
         prompt:
           maxLength: 16384
+          type: string
+        sourceRef:
           type: string
         trackerProvider:
           enum:

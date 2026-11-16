@@ -52,9 +52,9 @@ func (w *Workspace) createFreshWorktree(ctx context.Context, repo, path string, 
 	if _, err := w.run(ctx, w.binary, worktreeAddNewBranchArgs(repo, branch, path, seed, false)...); err != nil {
 		return ports.WorkspaceInfo{}, fmt.Errorf("%w: create branch %q at %s: %w", ports.ErrWorkspaceFreshConflict, branch, seed, err)
 	}
-	info := ports.WorkspaceInfo{Path: path, Branch: branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
+	info := ports.WorkspaceInfo{Path: path, Branch: branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SourceRef: cfg.SourceRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
 	if err := w.AttestExecutionBase(ctx, info); err != nil {
-		return ports.WorkspaceInfo{}, err
+		return info, err
 	}
 	return info, nil
 }

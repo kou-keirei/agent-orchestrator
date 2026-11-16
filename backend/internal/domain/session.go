@@ -79,11 +79,13 @@ type SessionMetadata struct {
 	// ExecutionBaseSHA is the exact commit AO authorized for execution. It is
 	// distinct from DiffBaseSHA, which remains comparison-only metadata.
 	ExecutionBaseSHA string `json:"executionBaseSha,omitempty"`
-	DiffBaseSHA      string `json:"diffBaseSha,omitempty"`
-	DiffBaseRef      string `json:"diffBaseRef,omitempty"`
-	RuntimeHandleID  string `json:"runtimeHandleId,omitempty"`
-	RuntimeLaunchID  string `json:"runtimeLaunchId,omitempty"`
-	AgentSessionID   string `json:"agentSessionId,omitempty"`
+	// SourceRef records the full Git ref resolved at birth, not a live binding.
+	SourceRef       string `json:"sourceRef,omitempty"`
+	DiffBaseSHA     string `json:"diffBaseSha,omitempty"`
+	DiffBaseRef     string `json:"diffBaseRef,omitempty"`
+	RuntimeHandleID string `json:"runtimeHandleId,omitempty"`
+	RuntimeLaunchID string `json:"runtimeLaunchId,omitempty"`
+	AgentSessionID  string `json:"agentSessionId,omitempty"`
 	// AgentSessionIDLaunchID identifies the terminal runtime generation proven to
 	// own AgentSessionID. Usually that proof comes from a provider hook. A
 	// coordinated Chat-to-TUI handoff may also establish it by launching the

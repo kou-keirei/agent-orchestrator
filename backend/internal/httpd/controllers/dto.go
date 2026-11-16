@@ -258,7 +258,14 @@ type WorkspaceTreeEntry struct {
 // filling them from another source.
 type SessionView struct {
 	domain.Session
-	Branch               string                      `json:"branch,omitempty"`
+	Branch string `json:"branch,omitempty"`
+	// ExecutionBaseSHA is the persisted execution authority, independent of
+	// model, permission, provider selection, and comparison metadata.
+	ExecutionBaseSHA string `json:"executionBaseSha,omitempty"`
+	// SourceRef is the full named Git ref resolved at birth. It is historical;
+	// moving it does not change an existing session's execution authority.
+	SourceRef            string                      `json:"sourceRef,omitempty"`
+	WorktreePath         string                      `json:"worktreePath,omitempty"`
 	ContinuationReadback SessionContinuationReadback `json:"continuationReadback"`
 	// TerminalGeneration is an opaque renderer fence. A restarted controller
 	// may deliberately reuse its terminal handle; clients must still discard the
@@ -333,6 +340,12 @@ type SpawnSessionRequest struct {
 	Kind            domain.SessionKind     `json:"kind,omitempty" enum:"worker,orchestrator"`
 	Harness         domain.AgentHarness    `json:"harness,omitempty" enum:"claude-code,codex,aider,opencode,grok,droid,amp,agy,crush,cursor,qwen,copilot,goose,auggie,continue,devin,cline,kimi,muse,kiro,kilocode,vibe,pi,kimchi,omp,prime-agent,autohand"`
 	Branch          string                 `json:"branch,omitempty"`
+	// ExecutionBaseSHA is an optional full lowercase 40-hex commit SHA. The
+	// workspace must match before any agent process or thread starts.
+	ExecutionBaseSHA string `json:"executionBaseSha,omitempty" maxLength:"40"`
+	// SourceRef optionally binds a named Git ref to ExecutionBaseSHA at birth.
+	// Requires executionBaseSha; destination branch selection stays separate.
+	SourceRef string `json:"sourceRef,omitempty"`
 	// Mode picks the conversation controller: chat talks to the agent over a
 	// structured connection, tui opens the agent's native terminal interface.
 	// Omitted resolves to the daemon-owned preference, which defaults to Chat for

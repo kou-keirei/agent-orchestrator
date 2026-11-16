@@ -50,17 +50,18 @@ func TestWorkItemParentMigration222FreshUpgradeReopenAndForwardOnly(t *testing.T
 		t.Fatal("failed 0222 downgrade changed schema/data/journal")
 	}
 	// Startup also applies 0223. Verify that its exact additive schema leaves
-	// all existing provenance/admission facts intact before freezing the full
-	// current schema for the reopen checks. Keep the 0222 downgrade test above
-	// isolated from later migrations.
+	// all existing provenance/admission facts intact. Pin that assertion to
+	// 0223, then freeze the current schema for the reopen checks. Keep the 0222
+	// downgrade test above isolated from later migrations.
 	excluded := map[string]bool{"goose_db_version": true, "sqlite_sequence": true}
 	beforeForward := desktop169SnapshotExcept(t, db, excluded)
-	if err := migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	upTo(t, db, 223)
 	excluded["conversation_send_dispatch_boundaries"] = true
 	if desktop169SnapshotExcept(t, db, excluded) != beforeForward {
 		t.Fatal("0223 changed prior schema/data")
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
 	}
 	retained = desktop169Snapshot(t, db)
 	for range 2 {

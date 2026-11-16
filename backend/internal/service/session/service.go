@@ -1250,6 +1250,10 @@ func mapSessionError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, ports.ErrWorkspaceExecutionBaseMismatch):
+		return apierr.Conflict("WORKSPACE_EXECUTION_BASE_MISMATCH", err.Error(), nil)
+	case errors.Is(err, ports.ErrWorkspaceExecutionBaseUnsupported):
+		return apierr.Invalid("WORKSPACE_EXECUTION_BASE_UNSUPPORTED", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrNotFound):
 		return apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
 	case errors.Is(err, sessionmanager.ErrNotRestorable):

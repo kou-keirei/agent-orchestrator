@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,21 @@ func TestSpawnHelpListsPrimeAgentHarness(t *testing.T) {
 	}
 	if !strings.Contains(out, "prime-agent") {
 		t.Fatalf("spawn help does not list prime-agent:\n%s", out)
+	}
+}
+
+func TestSpawnRejectsInvalidSourceAuthorityBeforeHTTP(t *testing.T) {
+	for _, args := range [][]string{
+		{"--execution-base-sha", "main"},
+		{"--execution-base-sha", strings.Repeat("A", 40)},
+		{"--source-ref", "main"},
+		{"--standalone", "--execution-base-sha", strings.Repeat("a", 40)},
+	} {
+		_, _, err := executeCLI(t, Deps{}, append([]string{"spawn", "--name", "worker", "--agent", "codex"}, args...)...)
+		var usage usageError
+		if !errors.As(err, &usage) {
+			t.Fatalf("args=%v: want usage error, got %v", args, err)
+		}
 	}
 }
 

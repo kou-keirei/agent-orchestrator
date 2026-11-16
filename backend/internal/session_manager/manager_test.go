@@ -1015,7 +1015,7 @@ func (w *fakeWorkspace) Create(_ context.Context, cfg ports.WorkspaceConfig) (po
 	if baseRef == "" {
 		baseRef = cfg.BaseBranch
 	}
-	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: w.createRepoPath}, nil
+	return ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SourceRef: cfg.SourceRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID, RepoPath: w.createRepoPath}, nil
 }
 func (w *fakeWorkspace) CreateWorkspaceProject(_ context.Context, cfg ports.WorkspaceProjectConfig) (ports.WorkspaceProjectInfo, error) {
 	if w.projectErr != nil {
@@ -2000,6 +2000,9 @@ func TestResumeAgentWithModeAdmitsMatchingExecutionBase(t *testing.T) {
 	agent := &resumeExecutionBaseAgent{supervisedLaunchAgent: supervisedLaunchAgent{launchArgvAgent{argv: []string{"codex", "resume", "agent-x"}}}}
 	manager, store, _ := newExitedResumeManager(t, runtime, agent)
 	configureResumeExecutionBase(t, manager, store, workspace, repo, authorizedB, attester)
+	rec := store.sessions["mer-1"]
+	rec.Metadata.SourceRef = "refs/heads/historical-source"
+	store.sessions[rec.ID] = rec
 
 	if _, err := manager.ResumeAgentWithMode(context.Background(), "mer-1"); err != nil {
 		t.Fatalf("ResumeAgentWithMode: %v", err)
@@ -2009,6 +2012,9 @@ func TestResumeAgentWithModeAdmitsMatchingExecutionBase(t *testing.T) {
 	}
 	if runtime.restarted != 1 || runtime.created != 0 {
 		t.Fatalf("resume runtime = restarts %d creates %d, want 1/0", runtime.restarted, runtime.created)
+	}
+	if got := store.sessions[rec.ID].Metadata.SourceRef; got != rec.Metadata.SourceRef {
+		t.Fatalf("resume lost historical source ref: %q", got)
 	}
 }
 

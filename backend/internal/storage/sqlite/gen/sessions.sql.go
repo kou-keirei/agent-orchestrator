@@ -164,7 +164,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at, source_ref
 FROM sessions WHERE id = ?
 `
 
@@ -227,6 +227,7 @@ type GetSessionRow struct {
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
 	HiddenAt                         sql.NullTime
+	SourceRef                        string
 }
 
 func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessionRow, error) {
@@ -291,6 +292,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.EffortResolved,
 		&i.ExecutionBaseSha,
 		&i.HiddenAt,
+		&i.SourceRef,
 	)
 	return i, err
 }
@@ -308,9 +310,9 @@ INSERT INTO sessions (
     preview_url, preview_revision, terminate_on_pr_merge, cleanup_generation, browser_capability_verifier,
     session_mode, provider_conversation_id, controller_generation, model, session_permissions,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
-    effort, effort_resolved, execution_base_sha, hidden_at
+    effort, effort_resolved, execution_base_sha, hidden_at, source_ref
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 )
 `
 
@@ -371,6 +373,7 @@ type InsertSessionParams struct {
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
 	HiddenAt                         sql.NullTime
+	SourceRef                        string
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
@@ -431,6 +434,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.EffortResolved,
 		arg.ExecutionBaseSha,
 		arg.HiddenAt,
+		arg.SourceRef,
 	)
 	return err
 }
@@ -447,7 +451,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at, source_ref
 FROM sessions ORDER BY project_id, num
 `
 
@@ -510,6 +514,7 @@ type ListAllSessionsRow struct {
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
 	HiddenAt                         sql.NullTime
+	SourceRef                        string
 }
 
 func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, error) {
@@ -580,6 +585,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.EffortResolved,
 			&i.ExecutionBaseSha,
 			&i.HiddenAt,
+			&i.SourceRef,
 		); err != nil {
 			return nil, err
 		}
@@ -606,7 +612,7 @@ SELECT id, project_id, num, issue_id, kind, harness,
     latest_user_prompt, latest_user_prompt_at, latest_assistant_update, latest_assistant_update_at,
     conversation_checkpoint_state, conversation_checkpoint_generation, conversation_checkpoint_native_id,
     conversation_checkpoint_unsettled, conversation_checkpoint_turn_id, native_checkpoint_evidence,
-    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at
+    native_transcript_path, auto_inject_review, auto_inject_ci, auto_review_enabled, model, session_permissions, effort, effort_resolved, execution_base_sha, hidden_at, source_ref
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -669,6 +675,7 @@ type ListSessionsByProjectRow struct {
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
 	HiddenAt                         sql.NullTime
+	SourceRef                        string
 }
 
 func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.ProjectID) ([]ListSessionsByProjectRow, error) {
@@ -739,6 +746,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.EffortResolved,
 			&i.ExecutionBaseSha,
 			&i.HiddenAt,
+			&i.SourceRef,
 		); err != nil {
 			return nil, err
 		}
@@ -1180,7 +1188,7 @@ UPDATE sessions SET
     preview_url = ?, preview_revision = ?, terminate_on_pr_merge = ?,
     cleanup_generation = ?, browser_capability_verifier = ?,
     provider_conversation_id = ?, controller_generation = ?, model = ?, updated_at = ?,
-    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?, effort = ?, effort_resolved = ?, execution_base_sha = ?
+    is_pinned = ?, pinned_at = ?, auto_inject_review = ?, auto_inject_ci = ?, effort = ?, effort_resolved = ?, execution_base_sha = ?, source_ref = ?
 WHERE id = ?
 `
 
@@ -1234,6 +1242,7 @@ type UpdateSessionParams struct {
 	Effort                           string
 	EffortResolved                   bool
 	ExecutionBaseSha                 string
+	SourceRef                        string
 	ID                               domain.SessionID
 }
 
@@ -1290,6 +1299,7 @@ func (q *Queries) UpdateSession(ctx context.Context, arg UpdateSessionParams) er
 		arg.Effort,
 		arg.EffortResolved,
 		arg.ExecutionBaseSha,
+		arg.SourceRef,
 		arg.ID,
 	)
 	return err

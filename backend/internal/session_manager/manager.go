@@ -856,6 +856,12 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 }
 
 func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, workItem *workItemSpawnAuthorization) (domain.SessionRecord, int, int, error) {
+	if cfg.ExecutionBaseSHA != "" && (len(cfg.ExecutionBaseSHA) != 40 || strings.Trim(cfg.ExecutionBaseSHA, "0123456789abcdef") != "") {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("%w: executionBaseSha must be a full lowercase 40-hex commit SHA", ports.ErrWorkspaceExecutionBaseMismatch)
+	}
+	if cfg.SourceRef != "" && cfg.ExecutionBaseSHA == "" {
+		return domain.SessionRecord{}, 0, 0, fmt.Errorf("%w: sourceRef requires executionBaseSha", ports.ErrWorkspaceExecutionBaseMismatch)
+	}
 	project, err := m.loadProject(ctx, cfg.ProjectID)
 	if err != nil {
 		return domain.SessionRecord{}, 0, 0, fmt.Errorf("spawn: %w", err)
@@ -1010,11 +1016,26 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, workItem *wo
 	baseRefs := m.refreshDefaultBranchesBestEffort(ctx, project)
 	ws, workspaceProject, err := m.createSessionWorkspace(ctx, project, cfg, id, branch, baseRefs)
 	if err != nil {
-		// Nothing observable exists yet — no worktree, no runtime — so the seed
-		// row is deleted outright instead of accumulating as a terminated orphan
-		// in session lists (e.g. when gitworktree refuses the branch).
-		m.rollbackSpawnSeedRow(ctx, id)
+		if ws.Path != "" {
+			// A post-create rejection still owns a worktree. Never discard its
+			// seed row before cleanup succeeds or its identity is retained.
+			m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
+		} else {
+			m.rollbackSpawnSeedRow(ctx, id)
+		}
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
+	}
+	if cfg.ExecutionBaseSHA != "" {
+		// Persist the admitted source before either controller can start.
+		// Lifecycle preserves these seed facts and commits workspace/controller
+		// metadata at launch. An uncertain birth must retain its seed shape so
+		// recovery cannot mistake it for a committed controller.
+		rec.Metadata.ExecutionBaseSHA = ws.ExecutionBaseSHA
+		rec.Metadata.SourceRef = ws.SourceRef
+		if err := m.store.UpdateSession(ctx, rec); err != nil {
+			m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
+			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
+		}
 	}
 
 	// Per-project workspace provisioning: symlink shared files, then run any
@@ -1142,6 +1163,13 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, workItem *wo
 	if err := m.admitWorkItemSpawn(ctx, workItem, rec, ws); err != nil {
 		return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
 	}
+	if err := m.admitExecutionBase(ctx, ws); err != nil {
+		if workItem != nil {
+			return domain.SessionRecord{}, 0, 0, workItemSpawnHeld(id, err)
+		}
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
+	}
 	handle, err := m.runtime.Create(ctx, ports.RuntimeConfig{
 		SessionID:     id,
 		WorkspacePath: ws.Path,
@@ -1162,6 +1190,7 @@ func (m *Manager) spawn(ctx context.Context, cfg ports.SpawnConfig, workItem *wo
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
 		ExecutionBaseSHA:          firstNonEmptyString(ws.ExecutionBaseSHA, strings.TrimSpace(cfg.ExecutionBaseSHA)),
+		SourceRef:                 ws.SourceRef,
 		RuntimeHandleID:           handle.ID,
 		RuntimeLaunchID:           launchID,
 		Prompt:                    prompt,
@@ -1419,7 +1448,7 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 	if cfg.ProjectID == "" {
 		projectKind = domain.ProjectKindScratch
 	}
-	if strings.TrimSpace(cfg.ExecutionBaseSHA) != "" && projectKind != domain.ProjectKindSingleRepo {
+	if (cfg.ExecutionBaseSHA != "" || cfg.SourceRef != "") && projectKind != domain.ProjectKindSingleRepo {
 		return ports.WorkspaceInfo{}, nil, fmt.Errorf("%w: exact execution base requires a single-repository Git workspace", ports.ErrWorkspaceExecutionBaseUnsupported)
 	}
 	if projectKind != domain.ProjectKindWorkspace {
@@ -1437,11 +1466,15 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 			BaseBranch:       baseBranch,
 			BaseRef:          baseRefs[filepath.Clean(project.Path)],
 			ExecutionBaseSHA: strings.TrimSpace(cfg.ExecutionBaseSHA),
+			SourceRef:        cfg.SourceRef,
 		})
 		if err == nil && strings.TrimSpace(cfg.ExecutionBaseSHA) != "" {
+			if (ws.ExecutionBaseSHA != "" && ws.ExecutionBaseSHA != cfg.ExecutionBaseSHA) || (cfg.SourceRef != "" && ws.SourceRef == "") {
+				return ws, nil, fmt.Errorf("%w: workspace source readback differs from spawn request", ports.ErrWorkspaceExecutionBaseMismatch)
+			}
 			ws.ExecutionBaseSHA = firstNonEmptyString(ws.ExecutionBaseSHA, strings.TrimSpace(cfg.ExecutionBaseSHA))
 			if err := m.admitExecutionBase(ctx, ws); err != nil {
-				return ports.WorkspaceInfo{}, nil, err
+				return ws, nil, err
 			}
 		}
 		return ws, nil, err
@@ -1583,6 +1616,10 @@ func (m *Manager) rollbackPreparedSpawnWorkspace(ctx context.Context, rec domain
 }
 
 func (m *Manager) rollbackSeedSpawnWorkspace(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo, prepared bool) {
+	// Admission can fail because the caller cancelled. Cleanup and retained
+	// ownership must still complete under a bounded, independent context.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	defer cancel()
 	if m.destroySpawnWorkspace(ctx, ws, workspaceProject) {
 		if prepared {
 			m.cleanupAgentWorkspace(ctx, rec, ws.Path)
@@ -1607,6 +1644,8 @@ func (m *Manager) preserveFailedSpawnWorkspace(ctx context.Context, id domain.Se
 	rec.Metadata.Branch = ws.Branch
 	rec.Metadata.WorkspacePath = ws.Path
 	rec.Metadata.WorkspaceRepoPath = ws.RepoPath
+	rec.Metadata.ExecutionBaseSHA = ws.ExecutionBaseSHA
+	rec.Metadata.SourceRef = ws.SourceRef
 	if runtimeDestroyed {
 		rec.Metadata.RuntimeHandleID = ""
 		rec.Metadata.RuntimeLaunchID = ""
@@ -2676,6 +2715,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 		WorkspacePath:             ws.Path,
 		WorkspaceRepoPath:         ws.RepoPath,
 		ExecutionBaseSHA:          rec.Metadata.ExecutionBaseSHA,
+		SourceRef:                 rec.Metadata.SourceRef,
 		RuntimeHandleID:           handle.ID,
 		RuntimeLaunchID:           launchID,
 		AgentSessionID:            rec.Metadata.AgentSessionID,
@@ -5576,6 +5616,8 @@ func runtimeHandle(meta domain.SessionMetadata) ports.RuntimeHandle {
 }
 
 func workspaceInfo(rec domain.SessionRecord) ports.WorkspaceInfo {
+	// SourceRef is historical birth evidence. Existing sessions keep their
+	// execution SHA even when that ref moves; only new births check ref drift.
 	return ports.WorkspaceInfo{
 		Path:             rec.Metadata.WorkspacePath,
 		Branch:           rec.Metadata.Branch,
