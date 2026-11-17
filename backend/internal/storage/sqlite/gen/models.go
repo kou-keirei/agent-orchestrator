@@ -655,6 +655,7 @@ type Session struct {
 	ExecutionBaseSha                 string
 	HiddenAt                         sql.NullTime
 	TerminalRevision                 int64
+	SourceRef                        string
 }
 
 type SessionCleanupFact struct {

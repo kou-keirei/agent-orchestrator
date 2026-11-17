@@ -136,6 +136,13 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 	if err := m.admitWorkItemSpawn(ctx, in.workItem, in.record, in.workspace); err != nil {
 		return domain.SessionRecord{}, workItemSpawnHeld(id, err)
 	}
+	if err := m.admitExecutionBase(ctx, in.workspace); err != nil {
+		if in.workItem != nil {
+			return domain.SessionRecord{}, workItemSpawnHeld(id, err)
+		}
+		m.rollbackSeedSpawnWorkspace(ctx, in.record, in.workspace, in.workspaceProject, false)
+		return domain.SessionRecord{}, wrapSpawnStage(id, ErrChatController, err)
+	}
 	_, err = m.chat.StartChat(ctx, ChatStart{
 		SessionID:               id,
 		ProjectID:               in.cfg.ProjectID,
@@ -152,6 +159,13 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 		AdditionalDirectories:   workspaceProjectDirectories(in.workspace.Path, in.workspaceProject),
 		ExpectedControllerOwner: in.record.ControllerOwner(),
 		PrepareControllerEnv: func(launchCtx context.Context, expected domain.SessionControllerOwner) (map[string]string, error) {
+			// Chat retains this callback for controller rebuilds. Admission
+			// here is birth-only; existing sessions use their normal resume path.
+			if !controllerCommitted {
+				if err := m.admitExecutionBase(launchCtx, in.workspace); err != nil {
+					return nil, err
+				}
+			}
 			prepared, launchEnv, prepareErr := m.prepareChatControllerEnv(
 				launchCtx, in.record, in.project.Config.Env, expected,
 			)
@@ -172,6 +186,7 @@ func (m *Manager) launchChatController(ctx context.Context, in chatSpawn) (domai
 				WorkspacePath:     in.workspace.Path,
 				WorkspaceRepoPath: in.workspace.RepoPath,
 				ExecutionBaseSHA:  firstNonEmptyString(in.workspace.ExecutionBaseSHA, strings.TrimSpace(in.cfg.ExecutionBaseSHA)),
+				SourceRef:         in.workspace.SourceRef,
 				Prompt:            in.prompt,
 				DiffBaseSHA:       diffBaseSHA,
 				DiffBaseRef:       diffBaseRef,

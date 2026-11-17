@@ -288,12 +288,21 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 			return ports.WorkspaceInfo{}, err
 		}
 	}
+	if cfg.SourceRef != "" {
+		cfg.SourceRef, err = w.resolveSourceRef(ctx, repo, cfg.SourceRef, cfg.ExecutionBaseSHA)
+		if err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
+	}
 	if err := w.validateBranch(ctx, repo, cfg.Branch); err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
 	path, err := w.managedPath(cfg)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
+	}
+	if cfg.FreshBranch {
+		return w.createFreshWorktree(ctx, repo, path, cfg)
 	}
 	if info, ok, err := w.existingWorktree(ctx, repo, path, cfg); err != nil {
 		return ports.WorkspaceInfo{}, err
@@ -304,6 +313,7 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 		}
 		info.BaseRef = refs.baseRef
 		info.ExecutionBaseSHA = cfg.ExecutionBaseSHA
+		info.SourceRef = cfg.SourceRef
 		if err := w.AttestExecutionBase(ctx, info); err != nil {
 			return ports.WorkspaceInfo{}, err
 		}
@@ -313,9 +323,11 @@ func (w *Workspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (port
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
 	}
-	info := ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
+	info := ports.WorkspaceInfo{Path: path, Branch: cfg.Branch, BaseRef: baseRef, ExecutionBaseSHA: cfg.ExecutionBaseSHA, SourceRef: cfg.SourceRef, SessionID: cfg.SessionID, ProjectID: cfg.ProjectID}
 	if err := w.AttestExecutionBase(ctx, info); err != nil {
-		return ports.WorkspaceInfo{}, err
+		// Creation succeeded: the caller must clean up or retain ownership of
+		// this exact worktree even when its final admission fails.
+		return info, err
 	}
 	return info, nil
 }
@@ -1637,11 +1649,35 @@ func (w *Workspace) resolveExecutionBase(ctx context.Context, repo, requested st
 	if target == "" {
 		return "", nil
 	}
+	if len(target) != 40 || strings.Trim(target, "0123456789abcdef") != "" || target != requested {
+		return "", fmt.Errorf("%w: execution base must be a full lowercase 40-hex commit SHA", ports.ErrWorkspaceExecutionBaseMismatch)
+	}
 	sha, err := w.revParse(ctx, repo, target+"^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("%w: target %q is not a resolvable commit: %s", ports.ErrWorkspaceExecutionBaseMismatch, target, err.Error())
 	}
+	if sha != target {
+		return "", fmt.Errorf("%w: resolved commit %s differs from %s", ports.ErrWorkspaceExecutionBaseMismatch, sha, target)
+	}
 	return sha, nil
+}
+
+// resolveSourceRef delegates named-ref resolution to Git. It never fetches or
+// substitutes a default, destination branch, or revision expression.
+func (w *Workspace) resolveSourceRef(ctx context.Context, repo, sourceRef, target string) (string, error) {
+	if target == "" {
+		return "", fmt.Errorf("%w: sourceRef requires executionBaseSha", ports.ErrWorkspaceExecutionBaseMismatch)
+	}
+	out, err := w.run(ctx, w.binary, "-C", repo, "rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", sourceRef)
+	ref := strings.TrimSpace(string(out))
+	if err != nil || !strings.HasPrefix(ref, "refs/") || strings.ContainsAny(ref, "\r\n") {
+		return "", fmt.Errorf("%w: source ref %q is not an available named ref", ports.ErrWorkspaceExecutionBaseMismatch, sourceRef)
+	}
+	sha, err := w.revParse(ctx, repo, ref+"^{commit}")
+	if err != nil || sha != target {
+		return "", fmt.Errorf("%w: source ref %q resolved to %q, requested %s", ports.ErrWorkspaceExecutionBaseMismatch, ref, sha, target)
+	}
+	return ref, nil
 }
 
 // AttestExecutionBase proves the exact execution authority at the worktree
@@ -1684,6 +1720,10 @@ func (w *Workspace) AttestExecutionBase(ctx context.Context, info ports.Workspac
 	if strings.TrimSpace(string(status)) != "" {
 		return fmt.Errorf("%w: worktree has tracked or untracked changes", ports.ErrWorkspaceExecutionBaseMismatch)
 	}
+	if info.SourceRef != "" {
+		_, err := w.resolveSourceRef(ctx, repo, info.SourceRef, canonical)
+		return err
+	}
 	return nil
 }
 
@@ -1724,9 +1764,14 @@ func (w *Workspace) resolveWorktreeRefs(ctx, remoteCtx context.Context, repo, br
 		return w.resolveWorktreeRefsFromDefault(ctx, repo, branch, baseBranch)
 	}
 	resolver := gitdefault.New(w.binary, gitdefault.Runner(w.run))
-	remote, requestedRef, requestedExists, requestedErr := resolver.FindCachedRemoteBranch(ctx, repo, branch)
-	if requestedErr != nil && !errors.Is(requestedErr, gitdefault.ErrUnresolved) {
-		return worktreeRefs{}, fmt.Errorf("gitworktree: inspect requested branch for %q: %w", repo, requestedErr)
+	var remote, requestedRef string
+	var requestedExists bool
+	if branch != "" {
+		var requestedErr error
+		remote, requestedRef, requestedExists, requestedErr = resolver.FindCachedRemoteBranch(ctx, repo, branch)
+		if requestedErr != nil && !errors.Is(requestedErr, gitdefault.ErrUnresolved) {
+			return worktreeRefs{}, fmt.Errorf("gitworktree: inspect requested branch for %q: %w", repo, requestedErr)
+		}
 	}
 	resolution, err := resolver.Resolve(ctx, remoteCtx, repo)
 	if err != nil {

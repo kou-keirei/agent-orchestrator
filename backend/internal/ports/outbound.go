@@ -314,6 +314,8 @@ type WorkspaceReclaimer interface {
 
 // Workspace is the isolated checkout an agent works in (a git worktree or clone).
 type Workspace interface {
+	// Create may return a non-empty identity with an error after materializing
+	// a workspace. The caller must clean it up or durably retain its owner.
 	Create(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
 	Destroy(ctx context.Context, info WorkspaceInfo) error
 	Restore(ctx context.Context, cfg WorkspaceConfig) (WorkspaceInfo, error)
@@ -418,6 +420,9 @@ type WorkspaceProject interface {
 // can map them to typed errors rather than collapsing every adapter failure
 // into an opaque 500. Adapters wrap these via fmt.Errorf("...: %w", sentinel).
 var (
+	// ErrWorkspaceFreshConflict reports that a fresh session cannot safely
+	// allocate its own branch or path. Existing refs and registrations are kept.
+	ErrWorkspaceFreshConflict = errors.New("workspace: fresh allocation conflict")
 	// ErrWorkspaceBranchCheckedOutElsewhere reports the requested branch is
 	// already checked out in another worktree of the same repo.
 	ErrWorkspaceBranchCheckedOutElsewhere = errors.New("workspace: branch is already checked out in another worktree")
@@ -507,6 +512,10 @@ type WorkspaceConfig struct {
 	// orchestrator worktree. Defaults to a truncation of ProjectID when empty.
 	SessionPrefix string
 	Branch        string
+	// FreshBranch asks Create to allocate a new branch namespace from the base,
+	// never attach historical refs or worktrees. Explicit branch requests and
+	// Restore leave this false.
+	FreshBranch bool
 	// BaseBranch is the explicitly configured branch new session branches are
 	// created from. Empty asks the workspace adapter to resolve an authoritative
 	// repository default; it must never infer from the checked-out branch.
@@ -521,6 +530,8 @@ type WorkspaceConfig struct {
 	// ExecutionBaseSHA is an optional exact commit authority. It is never used
 	// as comparison metadata and must be proven by the adapter before launch.
 	ExecutionBaseSHA string
+	// SourceRef is checked only during fresh creation, never on restore.
+	SourceRef string
 }
 
 // WorkspaceInfo describes a created workspace — where it lives and its branch.
@@ -537,8 +548,11 @@ type WorkspaceInfo struct {
 	// ExecutionBaseSHA is the exact commit authority admitted for this
 	// worktree, when requested.
 	ExecutionBaseSHA string
-	SessionID        domain.SessionID
-	ProjectID        domain.ProjectID
+	// SourceRef is the resolved full ref checked during birth admission. Callers
+	// must omit it for existing sessions so ref drift cannot mutate their authority.
+	SourceRef string
+	SessionID domain.SessionID
+	ProjectID domain.ProjectID
 	// RepoPath optionally overrides ProjectID-based repo resolution. It is used
 	// when the normal workspace lifecycle primitives operate on one child repo
 	// inside a workspace project.

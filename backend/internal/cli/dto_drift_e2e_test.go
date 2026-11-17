@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -214,6 +215,8 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 			"--project", "mer",
 			"--harness", "codex",
 			"--branch", "feat/x",
+			"--execution-base-sha", strings.Repeat("a", 40),
+			"--source-ref", "refs/remotes/origin/main",
 			"--prompt", "hi",
 			"--issue", "ISS-1",
 			"--name", "my worker",
@@ -233,6 +236,9 @@ func TestE2E_SpawnAndProjectAddDTORoundTrip(t *testing.T) {
 		}
 		if got.Branch != "feat/x" {
 			t.Errorf("Branch = %q, want %q", got.Branch, "feat/x")
+		}
+		if got.ExecutionBaseSHA != strings.Repeat("a", 40) || got.SourceRef != "refs/remotes/origin/main" {
+			t.Errorf("source authority lost across CLI/HTTP: %+v", got)
 		}
 		if got.Prompt != "hi" {
 			t.Errorf("Prompt = %q, want %q", got.Prompt, "hi")

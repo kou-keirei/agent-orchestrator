@@ -3375,6 +3375,7 @@ func TestToAPIErrorMapsWorkspaceBranchSentinels(t *testing.T) {
 		wantCode string
 	}{
 		{"checked out elsewhere", fmt.Errorf("spawn mer-1: workspace: %w: \"x\" is checked out at \"/tmp\"", ports.ErrWorkspaceBranchCheckedOutElsewhere), apierr.KindConflict, "BRANCH_CHECKED_OUT_ELSEWHERE"},
+		{"fresh allocation conflict", fmt.Errorf("spawn mer-1: %w: occupied path", ports.ErrWorkspaceFreshConflict), apierr.KindConflict, "WORKSPACE_FRESH_CONFLICT"},
 		{"default branch unresolved", fmt.Errorf("spawn mer-1: %w: configure defaultBranch", ports.ErrWorkspaceDefaultBranchUnresolved), apierr.KindInvalid, "DEFAULT_BRANCH_UNRESOLVED"},
 		{"not fetched", fmt.Errorf("spawn mer-1: workspace: %w: \"x\" has no local head", ports.ErrWorkspaceBranchNotFetched), apierr.KindInvalid, "BRANCH_NOT_FETCHED"},
 		{"invalid branch", fmt.Errorf("spawn mer-1: workspace: %w: \"bad!!\" (exit 1)", ports.ErrWorkspaceBranchInvalid), apierr.KindInvalid, "INVALID_BRANCH"},
@@ -3433,6 +3434,8 @@ func TestToSpawnAPIErrorMapsSpawnStageSentinels(t *testing.T) {
 		wantKind apierr.Kind
 		wantCode string
 	}{
+		{"execution base mismatch", fmt.Errorf("spawn: %w", ports.ErrWorkspaceExecutionBaseMismatch), apierr.KindConflict, "WORKSPACE_EXECUTION_BASE_MISMATCH"},
+		{"execution base unsupported", fmt.Errorf("spawn: %w", ports.ErrWorkspaceExecutionBaseUnsupported), apierr.KindInvalid, "WORKSPACE_EXECUTION_BASE_UNSUPPORTED"},
 		{
 			"workspace create",
 			fmt.Errorf("spawn mer-1: %w: git worktree add failed", sessionmanager.ErrWorkspaceCreate),

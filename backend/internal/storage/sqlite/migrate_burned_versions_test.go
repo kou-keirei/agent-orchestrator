@@ -169,6 +169,7 @@ var shippedMigrations = map[int64]string{
 	221: "0221_work_item_admission.sql",
 	222: "0222_work_item_parent.sql",
 	223: "0223_conversation_dispatch_boundary.sql",
+	224: "0224_session_source_ref.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

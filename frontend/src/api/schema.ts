@@ -3059,6 +3059,7 @@ export interface components {
             displayName?: string;
             /** @enum {string} */
             displayStatus: "Working" | "Blocked" | "Exited" | "No signal" | "Awaiting PR" | "Fixing CI failures" | "Addressing comments" | "Needs review" | "Review scheduled" | "Reviewing" | "Review pending" | "Draft" | "CI failing" | "Commented" | "Changes requested" | "Needs human review" | "Mergeable" | "Approved" | "Merged" | "Closed without merge" | "Terminated";
+            executionBaseSha?: string;
             harness?: string;
             /** Format: date-time */
             hiddenAt?: null | string;
@@ -3088,6 +3089,7 @@ export interface components {
             reviewerHarness?: "claude-code" | "codex" | "copilot" | "cursor" | "kilocode" | "opencode" | "kiro" | "pi" | "agy" | "devin" | "droid" | "kimi" | "kimchi" | "muse" | "amp" | "aider" | "grok" | "crush" | "auggie" | "cline" | "autohand";
             /** @enum {string} */
             scmStatus?: "pr_open" | "draft" | "ci_failed" | "review_pending" | "changes_requested" | "approved" | "mergeable" | "merged";
+            sourceRef?: string;
             /** @enum {string} */
             status: "working" | "pr_open" | "draft" | "ci_failed" | "review_pending" | "changes_requested" | "approved" | "mergeable" | "merged" | "needs_input" | "exited" | "idle" | "terminated" | "no_signal";
             /** @enum {string} */
@@ -3097,6 +3099,7 @@ export interface components {
             terminateOnPrMerge: boolean;
             /** Format: date-time */
             updatedAt: string;
+            worktreePath?: string;
         };
         ControllersSetSecurePairingRequest: {
             enabled: boolean;
@@ -4459,6 +4462,7 @@ export interface components {
             branch?: string;
             displayName?: string;
             effort?: null | string;
+            executionBaseSha?: string;
             /** @enum {string} */
             harness?: "claude-code" | "codex" | "aider" | "opencode" | "grok" | "droid" | "amp" | "agy" | "crush" | "cursor" | "qwen" | "copilot" | "goose" | "auggie" | "continue" | "devin" | "cline" | "kimi" | "muse" | "kiro" | "kilocode" | "vibe" | "pi" | "kimchi" | "omp" | "prime-agent" | "autohand";
             issueId?: string;
@@ -4472,6 +4476,7 @@ export interface components {
             permissions?: "default" | "read-only" | "accept-edits" | "auto" | "bypass-permissions";
             projectId?: string;
             prompt?: string;
+            sourceRef?: string;
             /** @enum {string} */
             trackerProvider?: "github" | "gitlab";
         };

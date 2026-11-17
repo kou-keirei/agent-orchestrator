@@ -38,7 +38,10 @@ type SpawnConfig struct {
 	// execution workspace. When present, the workspace adapter must materialize
 	// and admit the worktree at this commit before the agent launches.
 	ExecutionBaseSHA string
-	Prompt           string
+	// SourceRef optionally binds a named Git ref to ExecutionBaseSHA for this
+	// birth only. Destination Branch remains independent of source selection.
+	SourceRef string
+	Prompt    string
 	// AgentConfig overrides the resolved project/role agent config for this
 	// single spawn. Empty fields keep the project defaults.
 	AgentConfig AgentConfig

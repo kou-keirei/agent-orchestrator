@@ -299,7 +299,7 @@ func (c *SessionsController) spawn(w http.ResponseWriter, r *http.Request) {
 		// string. The session manager owns validation and default resolution.
 		agentConfig.Effort = *in.Effort
 	}
-	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments, AgentConfig: agentConfig, EffortOverride: in.Effort != nil})
+	sess, promptBytes, systemPromptBytes, err := c.Svc.Spawn(r.Context(), ports.SpawnConfig{ProjectID: in.ProjectID, IssueID: in.IssueID, ParentSessionID: in.ParentSessionID, TrackerProvider: in.TrackerProvider, Kind: in.Kind, Harness: in.Harness, Branch: in.Branch, ExecutionBaseSHA: in.ExecutionBaseSHA, SourceRef: in.SourceRef, RequestedMode: in.Mode, Prompt: in.Prompt, DisplayName: displayName, Attachments: attachments, AgentConfig: agentConfig, EffortOverride: in.Effort != nil})
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
@@ -2061,6 +2061,9 @@ func sessionView(s domain.Session) SessionView {
 	view := SessionView{
 		Session:              s,
 		Branch:               s.Metadata.Branch,
+		ExecutionBaseSHA:     s.Metadata.ExecutionBaseSHA,
+		SourceRef:            s.Metadata.SourceRef,
+		WorktreePath:         s.Metadata.WorkspacePath,
 		ContinuationReadback: continuationReadback(s),
 		TerminalGeneration:   terminalGeneration,
 		PreviewURL:           s.Metadata.PreviewURL,
